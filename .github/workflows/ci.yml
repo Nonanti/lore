@@ -1,0 +1,76 @@
+# Lore CI: format + lint + test on every push/PR.
+# The neural feature is intentionally left out (it downloads the ONNX runtime, slow);
+# the default build is compiled and tested fully offline.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly: live-LLM smoke + dependency audit (Monday 06:00 UTC).
+    - cron: "0 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy (warning = error)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests (unit + integration + property)
+        run: cargo test
+
+  audit:
+    name: cargo audit (supply chain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  live-llm:
+    # Real LLM smoke: only on scheduled runs and when secrets are defined.
+    # Fork PRs can't see secrets — the job is silently skipped.
+    name: live-LLM smoke test (weekly)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Live smoke (skip if no secrets)
+        env:
+          LORE_LLM_BASE: ${{ secrets.LORE_LLM_BASE }}
+          LORE_LLM_MODEL: ${{ secrets.LORE_LLM_MODEL }}
+          LORE_LLM_KEY: ${{ secrets.LORE_LLM_KEY }}
+        run: |
+          if [ -z "$LORE_LLM_BASE" ]; then
+            echo "LORE_LLM_BASE secret missing — live test skipped"
+            exit 0
+          fi
+          cargo test live_llm -- --ignored --nocapture
+
+  neural-check:
+    # The neural feature's BUILDABILITY (not a test — no ONNX download/run
+    # here). Weekly insurance run: keep the neural code from drifting.
+    name: neural feature build check (weekly)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check --features neural
+        run: cargo check --features neural

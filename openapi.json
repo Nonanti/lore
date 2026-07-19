@@ -1,0 +1,849 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Lore API",
+    "description": "An identity + orchestration + memory core for AI agents. All endpoints (except health/ready/openapi) are protected by an optional API key: `X-API-Key` or `Authorization: Bearer`.",
+    "version": "0.1.0",
+    "license": {
+      "name": "MIT"
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "apiKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key"
+      },
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "AgentView": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "role",
+          "traits",
+          "version"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "ULID"
+          },
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "traits": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "version": {
+            "type": "integer",
+            "description": "Persona version (increments on every update)"
+          }
+        }
+      },
+      "PersonaPatch": {
+        "type": "object",
+        "description": "Partial update — only the given fields change. name/role cannot be empty (422).",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "traits": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "system_prompt": {
+            "type": "string"
+          }
+        }
+      },
+      "MemoryView": {
+        "type": "object",
+        "required": [
+          "id",
+          "score",
+          "summary"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "score": {
+            "type": "number"
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      },
+      "AskResp": {
+        "type": "object",
+        "required": [
+          "reply"
+        ],
+        "properties": {
+          "reply": {
+            "type": "string"
+          }
+        }
+      },
+      "ActResp": {
+        "type": "object",
+        "required": [
+          "result"
+        ],
+        "properties": {
+          "result": {
+            "type": "string"
+          }
+        }
+      },
+      "DeliberateReply": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "reply"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "reply": {
+            "type": "string"
+          },
+          "node": {
+            "type": "string",
+            "description": "URL of the peer node the reply came from (local if absent)"
+          }
+        }
+      },
+      "DeliberateResp": {
+        "type": "object",
+        "required": [
+          "replies"
+        ],
+        "properties": {
+          "replies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DeliberateReply"
+            }
+          },
+          "synthesis": {
+            "type": "string",
+            "description": "Supervisor synthesis (only if a synthesizer was provided)"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    {
+      "apiKey": []
+    },
+    {
+      "bearer": []
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Liveness",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "summary": "Readiness (store access is verified)",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "ready"
+          },
+          "503": {
+            "description": "store unreachable"
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "This spec",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3.1 document"
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Prometheus metrics (per-route latency histogram, retrieval/consolidation counters)",
+        "responses": {
+          "200": {
+            "description": "text/plain metrics"
+          }
+        }
+      }
+    },
+    "/agents": {
+      "get": {
+        "summary": "List agents",
+        "responses": {
+          "200": {
+            "description": "list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AgentView"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create an agent",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "role"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "role": {
+                    "type": "string"
+                  },
+                  "traits": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentView"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "name/role empty",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agents/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "patch": {
+        "summary": "Update persona (version increments)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PersonaPatch"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such agent"
+          },
+          "422": {
+            "description": "invalid field"
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete the agent (including the persona file)",
+        "responses": {
+          "204": {
+            "description": "deleted"
+          },
+          "404": {
+            "description": "no such agent"
+          }
+        }
+      }
+    },
+    "/agents/{id}/ask": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Ask the agent (with the memory recall + record loop)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "message"
+                ],
+                "properties": {
+                  "message": {
+                    "type": "string"
+                  },
+                  "session": {
+                    "type": "string",
+                    "description": "Conversation window key (≤128 bytes); the same session remembers previous turns"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "reply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AskResp"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such agent"
+          },
+          "422": {
+            "description": "session name too long"
+          }
+        }
+      }
+    },
+    "/agents/{id}/ask/stream": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Get the reply as an SSE token stream (`data: <chunk>` … `data: [DONE]`)",
+        "responses": {
+          "200": {
+            "description": "text/event-stream"
+          }
+        }
+      }
+    },
+    "/agents/{id}/act": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Run a tool if one matches, otherwise reply",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "input"
+                ],
+                "properties": {
+                  "input": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActResp"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agents/{id}/solve": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "ReAct loop: think → tool → observe (multi-step)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "input"
+                ],
+                "properties": {
+                  "input": {
+                    "type": "string"
+                  },
+                  "max_steps": {
+                    "type": "integer",
+                    "description": "default 5, cap 10"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "final reply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActResp"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agents/{id}/message": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Inter-agent message: ask → returns a reply, tell → 204 (written to the recipient's memory)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "content"
+                ],
+                "properties": {
+                  "from": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "ask",
+                      "tell"
+                    ]
+                  },
+                  "content": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "ask reply"
+          },
+          "204": {
+            "description": "tell delivered"
+          }
+        }
+      }
+    },
+    "/agents/{id}/experience": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Add an episodic memory (explicit record — standard importance)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "title",
+                  "body"
+                ],
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  },
+                  "body": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "memory recorded"
+          }
+        }
+      }
+    },
+    "/agents/{id}/recall": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "q",
+          "in": "query",
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "limit",
+          "in": "query",
+          "schema": {
+            "type": "integer",
+            "maximum": 1000
+          }
+        },
+        {
+          "name": "semantic",
+          "in": "query",
+          "schema": {
+            "type": "boolean"
+          },
+          "description": "Semantic recall (including morphology) — retrieves even when the keyword doesn't match"
+        }
+      ],
+      "get": {
+        "summary": "Recall from memory (hybrid retrieval)",
+        "responses": {
+          "200": {
+            "description": "scored records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/MemoryView"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/deliberate": {
+      "post": {
+        "summary": "Collective reasoning: the whole team replies (+optional supervisor synthesis, +federation)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "question"
+                ],
+                "properties": {
+                  "question": {
+                    "type": "string"
+                  },
+                  "local": {
+                    "type": "boolean",
+                    "description": "true: peer fanout is skipped (depth-1 guarantee — also holds with a synthesizer)"
+                  },
+                  "synthesizer": {
+                    "type": "string",
+                    "description": "This agent doesn't join the poll; it synthesizes the replies"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "replies",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeliberateResp"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/deliberate/live": {
+      "get": {
+        "summary": "WebSocket live deliberate: the first text frame is the question (≤64KB, within 30 s); replies stream as DeliberateReply JSON frames as they become ready, with [DONE] at the end",
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade"
+          }
+        }
+      }
+    },
+    "/board": {
+      "parameters": [
+        {
+          "name": "limit",
+          "in": "query",
+          "schema": {
+            "type": "integer",
+            "maximum": 1000
+          }
+        }
+      ],
+      "get": {
+        "summary": "Read the shared board (World)",
+        "responses": {
+          "200": {
+            "description": "scored records",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/MemoryView"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/agents/{id}/reinforce": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Memory reinforcement: feeding the decay/Wilson signals. Scope-validated — only the agent's own record or World can be reinforced (another agent's returns 404).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "memory_id",
+                  "outcome"
+                ],
+                "properties": {
+                  "memory_id": {
+                    "type": "string",
+                    "description": "Memory record ULID (the id from the recall output)"
+                  },
+                  "outcome": {
+                    "type": "string",
+                    "enum": [
+                      "accessed",
+                      "success",
+                      "failure"
+                    ],
+                    "description": "accessed: access (refreshes decay) · success/failure: procedural Wilson feeding"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "reinforced"
+          },
+          "404": {
+            "description": "agent or record not found (another agent's record also returns 404)"
+          },
+          "422": {
+            "description": "invalid outcome or body"
+          }
+        }
+      }
+    },
+    "/agents/{id}/reflect": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Reflection: distills frequently recalled (access ≥ 2) episodic memories via the model and promotes them to the semantic tier; the originals are archived via soft-delete.",
+        "responses": {
+          "200": {
+            "description": "number of distilled memories",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "distilled"
+                  ],
+                  "properties": {
+                    "distilled": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "agent not found"
+          }
+        }
+      }
+    }
+  }
+}

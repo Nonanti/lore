@@ -1,0 +1,52 @@
+//! # Lore
+//!
+//! **Identity + orchestration + memory** core for AI agents.
+//!
+//! Lore is fully standalone: it does not depend on external services, HTTP, or APIs.
+//! The memory engine is written from scratch in native Rust within this crate.
+//!
+//! ## Subsystems
+//! - [`id`] — `AgentId`, `MemoryId` (ULID-based)
+//! - [`memory`] — three-tier memory (`Episodic`/`Semantic`/`Procedural`),
+//!   [`memory::MemoryStore`] trait and native stores
+//!   ([`memory::InMemoryStore`], [`memory::SqliteStore`] — FTS5-indexed),
+//!   hybrid retrieval (keyword + cosine + recency/importance/Wilson),
+//!   consolidation (decay + near-duplicate merge)
+//! - [`agent`] — [`agent::Agent`] (identity + memory + model) and [`agent::Persona`]
+//! - [`model`] — [`model::Model`] trait, [`model::MockModel`] and
+//!   [`model::OpenAiModel`] (OpenAI-compatible: including Ollama, streaming + `<think>` extraction)
+//! - [`orchestrator`] — [`orchestrator::Orchestrator`] (supervisor + mailbox + messaging)
+//! - [`server`] — HTTP/WS API (auth + rate limit + federation + observability)
+//! - [`tool`] — tool registry + router (`KeywordRouter`, `LlmRouter`)
+
+pub mod agent;
+pub mod error;
+pub mod id;
+pub mod memory;
+pub mod model;
+pub mod orchestrator;
+pub mod server;
+pub mod tool;
+
+pub use agent::{Agent, Conversation, Persona};
+pub use error::{LoreError, Result};
+pub use id::{AgentId, MemoryId};
+#[cfg(feature = "neural")]
+pub use memory::NeuralEmbedder;
+pub use memory::{
+    ConsolidationReport, Embedder, FiveW, ForgetPolicy, HashingEmbedder, InMemoryStore, Memory,
+};
+pub use memory::{
+    MemoryGraph, MemoryKind, MemoryStore, NativeReranker, Outcome, Query, Reranker, Scope, Scored,
+    SemanticCat, Signal, SqliteStore, Tier,
+};
+pub use model::{Completion, MockModel, Model, OpenAiModel, Prompt, Role, Turn};
+pub use orchestrator::{Delivery, Envelope, MessageKind, Orchestrator, Party, Recipient, Registry};
+pub use server::{
+    ActResp, AgentView, AppState, AskResp, DeliberateReply, DeliberateResp, MemoryView,
+    PersonaPatch,
+};
+pub use tool::{
+    parse_tool_call, CalcTool, FileReadTool, KeywordRouter, LlmRouter, TimeTool, Tool, ToolCall,
+    ToolContext, ToolRegistry, ToolRouter, WebFetchTool,
+};

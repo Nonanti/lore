@@ -1,0 +1,15 @@
+# Keep the Docker build context small: the build only needs src + manifest.
+.git
+target
+.fastembed_cache
+.pi-subagents
+lore-data
+*.md
+!README.md
+review.md
+TEST_REPORT.md
+DESIGN.md
+CHANGELOG.md
+scripts
+benches
+tests

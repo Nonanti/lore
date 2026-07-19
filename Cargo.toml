@@ -1,0 +1,57 @@
+[package]
+name = "lore"
+version = "0.1.0"
+edition = "2021"
+description = "Lore — self-hosted AI infrastructure: a lightweight core for orchestrating agents and models"
+license = "MIT"
+authors = ["nonantiy <nonantiy1@gmail.com>"]
+repository = "https://github.com/nonantiy/lore"
+readme = "README.md"
+keywords = ["ai", "agent", "memory", "llm", "orchestration"]
+categories = ["command-line-utilities", "web-programming::http-server"]
+
+[dependencies]
+# Only the features we actually use (not "full"): faster builds + smaller binary.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "sync",
+    "signal",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "1"
+chrono = { version = "0.4", features = ["serde"] }
+ulid = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+axum = { version = "0.7", features = ["ws"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+fastembed = { version = "4", optional = true, default-features = false, features = [
+    "ort-download-binaries",
+    "hf-hub-rustls-tls",
+] }
+
+[features]
+# Optional neural embedder (fastembed/ONNX). The default build stays fully offline.
+neural = ["dep:fastembed"]
+
+[dev-dependencies]
+tokio-tungstenite = "0.21"
+criterion = { version = "0.5", default-features = false }
+proptest = "1"
+
+[[bench]]
+name = "perf"
+harness = false
+
+[[bin]]
+name = "lore"
+path = "src/main.rs"
