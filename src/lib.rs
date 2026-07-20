@@ -43,7 +43,8 @@ pub use memory::{
     SemanticCat, Signal, SqliteStore, Tier,
 };
 pub use model::{
-    AnthropicAuth, AnthropicModel, Completion, MockModel, Model, OpenAiModel, Prompt, Role, Turn,
+    AnthropicAuth, AnthropicModel, CodexModel, Completion, MockModel, Model, OpenAiModel, Prompt,
+    Role, Turn,
 };
 pub use orchestrator::{Delivery, Envelope, MessageKind, Orchestrator, Party, Recipient, Registry};
 pub use server::{

@@ -8,8 +8,9 @@
 mod oauth;
 
 pub use oauth::{
-    anthropic_authorize_url, exchange_anthropic_code, refresh_anthropic, split_manual_code,
-    AuthFlow, OAuthOutcome, ANTHROPIC_CLIENT_ID, ANTHROPIC_MANUAL_REDIRECT,
+    anthropic_authorize_url, exchange_anthropic_code, exchange_openai_code, openai_authorize_url,
+    refresh_anthropic, refresh_openai, split_manual_code, AuthFlow, OAuthOutcome,
+    ANTHROPIC_CLIENT_ID, ANTHROPIC_MANUAL_REDIRECT, OPENAI_CLIENT_ID,
 };
 
 use crate::error::{LoreError, Result};
@@ -247,6 +248,36 @@ fn restrict_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Decodes URL-safe base64 (padding optional). Used to read JWT id-token
+/// claims (e.g. the ChatGPT account id). Returns `None` on an invalid byte.
+pub(crate) fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for &c in s.as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        buf = (buf << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// URL-safe base64 without padding (RFC 4648 §5). Used for PKCE.
 pub(crate) fn b64url_nopad(input: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -310,6 +341,19 @@ mod tests {
         assert_eq!(b64url_nopad(b"foob"), "Zm9vYg");
         assert_eq!(b64url_nopad(b"fooba"), "Zm9vYmE");
         assert_eq!(b64url_nopad(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn b64url_decode_roundtrips() {
+        for v in [&b""[..], b"f", b"fo", b"foo", b"foobar", b"hello world!"] {
+            let enc = b64url_nopad(v);
+            assert_eq!(
+                b64url_decode(&enc).as_deref(),
+                Some(v),
+                "roundtrip for {v:?}"
+            );
+        }
+        assert!(b64url_decode("not base64!!").is_none());
     }
 
     #[test]

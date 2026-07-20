@@ -17,6 +17,14 @@ const ANTHROPIC_TOKEN: &str = "https://console.anthropic.com/v1/oauth/token";
 pub const ANTHROPIC_MANUAL_REDIRECT: &str = "https://console.anthropic.com/oauth/code/callback";
 const ANTHROPIC_SCOPE: &str = "org:create_api_key user:profile user:inference";
 
+/// OpenAI (Codex/ChatGPT) public OAuth client id — ChatGPT Plus/Pro login.
+pub const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_AUTHORIZE: &str = "https://auth.openai.com/oauth/authorize";
+const OPENAI_TOKEN: &str = "https://auth.openai.com/oauth/token";
+const OPENAI_SCOPE: &str = "openid profile email offline_access";
+/// Claim namespace holding the ChatGPT account id inside the id-token JWT.
+const OPENAI_AUTH_CLAIMS: &str = "https://api.openai.com/auth";
+
 /// Which login UX to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthFlow {
@@ -35,6 +43,8 @@ pub struct OAuthOutcome {
     pub refresh: String,
     /// Absolute expiry, unix milliseconds.
     pub expires_ms: i64,
+    /// Provider account id, when derivable (OpenAI id-token claim).
+    pub account_id: Option<String>,
 }
 
 /// Minimal percent-encoding for query values (encodes everything outside the
@@ -120,7 +130,103 @@ async fn post_token(body: serde_json::Value) -> Result<OAuthOutcome> {
         access: tr.access_token,
         refresh,
         expires_ms: expires_ms_from(tr.expires_in),
+        account_id: None,
     })
+}
+
+/// Builds the OpenAI (Codex) authorize URL. Pure/testable.
+pub fn openai_authorize_url(pkce: &Pkce, redirect_uri: &str, state: &str) -> String {
+    format!(
+        "{OPENAI_AUTHORIZE}?client_id={cid}&response_type=code&redirect_uri={redir}\
+         &scope={scope}&code_challenge={chal}&code_challenge_method=S256&state={state}\
+         &id_token_add_organizations=true",
+        cid = OPENAI_CLIENT_ID,
+        redir = urlencode(redirect_uri),
+        scope = urlencode(OPENAI_SCOPE),
+        chal = urlencode(&pkce.challenge),
+        state = urlencode(state),
+    )
+}
+
+#[derive(Deserialize)]
+struct OpenAiTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<i64>,
+    #[serde(default)]
+    id_token: Option<String>,
+}
+
+/// Extracts `chatgpt_account_id` from an id-token JWT (no signature check —
+/// local claim read only).
+fn chatgpt_account_id(id_token: &str) -> Option<String> {
+    let payload = id_token.split('.').nth(1)?;
+    let bytes = super::b64url_decode(payload)?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v[OPENAI_AUTH_CLAIMS]["chatgpt_account_id"]
+        .as_str()
+        .map(str::to_string)
+}
+
+async fn openai_post_token(form: &[(&str, &str)]) -> Result<OAuthOutcome> {
+    let resp = client()
+        .post(OPENAI_TOKEN)
+        .header("Accept", "application/json")
+        .form(form)
+        .send()
+        .await
+        .map_err(LoreError::Http)?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(LoreError::Http)?;
+    if !status.is_success() {
+        return Err(LoreError::Model(format!(
+            "openai oauth token endpoint returned {status}"
+        )));
+    }
+    let tr: OpenAiTokenResponse = serde_json::from_str(&text)?;
+    let refresh = tr
+        .refresh_token
+        .ok_or_else(|| LoreError::Model("openai oauth response missing refresh_token".into()))?;
+    let account_id = tr.id_token.as_deref().and_then(chatgpt_account_id);
+    Ok(OAuthOutcome {
+        access: tr.access_token,
+        refresh,
+        expires_ms: expires_ms_from(tr.expires_in),
+        account_id,
+    })
+}
+
+/// Exchanges an OpenAI authorization code for tokens (PKCE, form-encoded).
+pub async fn exchange_openai_code(
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<OAuthOutcome> {
+    openai_post_token(&[
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("client_id", OPENAI_CLIENT_ID),
+        ("code_verifier", verifier),
+    ])
+    .await
+}
+
+/// Refreshes an OpenAI access token (keeps the existing refresh token if the
+/// response omits a rotated one).
+pub async fn refresh_openai(refresh_token: &str) -> Result<OAuthOutcome> {
+    let mut out = openai_post_token(&[
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", OPENAI_CLIENT_ID),
+    ])
+    .await?;
+    if out.refresh.is_empty() {
+        out.refresh = refresh_token.to_string();
+    }
+    Ok(out)
 }
 
 /// Exchanges an authorization code for tokens (PKCE).
@@ -194,6 +300,28 @@ mod tests {
     fn urlencode_unreserved_passthrough() {
         assert_eq!(urlencode("aZ0-._~"), "aZ0-._~");
         assert_eq!(urlencode("a b/c:d"), "a%20b%2Fc%3Ad");
+    }
+
+    #[test]
+    fn openai_authorize_url_has_params() {
+        let p = pkce();
+        let url = openai_authorize_url(&p, "http://localhost:1455/auth/callback", "st");
+        assert!(url.starts_with("https://auth.openai.com/oauth/authorize?"));
+        assert!(url.contains(&format!("client_id={OPENAI_CLIENT_ID}")));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("scope=openid%20profile%20email%20offline_access"));
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
+    }
+
+    #[test]
+    fn account_id_from_jwt_claim() {
+        let payload = crate::auth::b64url_nopad(
+            br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acc-xyz"}}"#,
+        );
+        let jwt = format!("header.{payload}.sig");
+        assert_eq!(chatgpt_account_id(&jwt).as_deref(), Some("acc-xyz"));
+        assert!(chatgpt_account_id("not-a-jwt").is_none());
+        assert!(chatgpt_account_id("a.b.c").is_none());
     }
 
     #[test]

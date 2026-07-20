@@ -96,7 +96,8 @@ LORE_LLM_BASE=http://localhost:11434/v1 LORE_LLM_MODEL=llama3.2 cargo run
 
 Lore ships **its own** provider auth — fully self-contained, no external
 credential store is read. You can drive an agent with a metered **API key** or a
-consumer **subscription** (Claude Pro/Max today; ChatGPT Plus/Pro is Phase 2).
+consumer **subscription** — **Anthropic** (Claude Pro/Max) and **OpenAI**
+(ChatGPT Plus/Pro, Codex).
 
 ```bash
 # Anthropic with a subscription (Claude Pro/Max) — native PKCE OAuth login.
@@ -105,12 +106,24 @@ lore auth                       # show configured credentials + expiry
 LORE_PROVIDER=anthropic LORE_LLM_MODEL=claude-sonnet-4-5-20250929 \
   lore ask <agent> "..."        # tokens auto-refresh on use
 
-# Anthropic with a metered API key.
+# OpenAI with a subscription (ChatGPT Plus/Pro) — Codex Responses API.
+lore login openai               # browser loopback (redirect http://localhost:1455/auth/callback)
+LORE_PROVIDER=openai LORE_LLM_MODEL=gpt-5 lore ask <agent> "..."
+
+# Metered API keys.
 LORE_PROVIDER=anthropic LORE_AUTH=key ANTHROPIC_API_KEY=sk-ant-... \
   LORE_LLM_MODEL=claude-sonnet-4-5-20250929 lore ask <agent> "..."
+LORE_PROVIDER=openai LORE_AUTH=key OPENAI_API_KEY=sk-... \
+  LORE_LLM_MODEL=gpt-4o lore ask <agent> "..."
 
-lore logout anthropic           # remove the stored credential
+lore logout <anthropic|openai>  # remove the stored credential
 ```
+
+> **Verification status:** the Anthropic subscription path is validated
+> end-to-end against the live API. The OpenAI/Codex subscription path is wired
+> and reaches the live ChatGPT backend (auth/endpoint confirmed) but a full
+> completion was **not** live-verified in this build (no live ChatGPT token was
+> available); its request shape follows the Codex CLI references.
 
 OAuth tokens are stored under `LORE_DATA/auth/<provider>.json` (`0600`, atomic
 write) and refreshed by Lore itself. `LORE_AUTH=key|subs` forces a mode; with it
@@ -232,7 +245,8 @@ cargo run -- message <kai> "sprint tomorrow" --from <aria> --kind tell   # inter
 cargo run -- deliberate "what should we do tomorrow"     # the whole team responds
 cargo run -- deliberate "make a decision" --synthesizer <id>   # the supervisor synthesizes
 cargo run -- board                              # shared board
-cargo run -- login anthropic                     # subscription OAuth login (native)
+cargo run -- login anthropic                     # subscription OAuth login (Claude Pro/Max)
+cargo run -- login openai                        # subscription OAuth login (ChatGPT/Codex)
 cargo run -- auth                                # show provider credentials + status
 cargo run -- logout anthropic                    # remove a stored credential
 cargo run -- serve --addr 127.0.0.1:3777

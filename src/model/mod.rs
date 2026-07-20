@@ -5,10 +5,12 @@
 //! OpenAI-compatible client (including Ollama) will sit behind this trait in M4.
 
 mod anthropic;
+mod codex;
 mod mock;
 mod openai;
 
 pub use anthropic::{AnthropicAuth, AnthropicModel};
+pub use codex::CodexModel;
 pub use mock::MockModel;
 pub use openai::OpenAiModel;
 

@@ -5,9 +5,9 @@
 
 use clap::{Parser, Subcommand};
 use lore::{
-    Agent, AgentId, AnthropicAuth, AnthropicModel, AppState, CalcTool, Credential, FileReadTool,
-    HashingEmbedder, InMemoryStore, KeywordRouter, Memory, MemoryGraph, MemoryStore, MessageKind,
-    MockModel, Model, OpenAiModel, Orchestrator, Party, Persona, PersonaPatch, Query,
+    Agent, AgentId, AnthropicAuth, AnthropicModel, AppState, CalcTool, CodexModel, Credential,
+    FileReadTool, HashingEmbedder, InMemoryStore, KeywordRouter, Memory, MemoryGraph, MemoryStore,
+    MessageKind, MockModel, Model, OpenAiModel, Orchestrator, Party, Persona, PersonaPatch, Query,
     RefreshingToken, Scope, SemanticCat, SqliteStore, TimeTool, TokenStore, ToolContext,
     ToolRegistry, WebFetchTool,
 };
@@ -141,18 +141,18 @@ enum Cmd {
     },
     /// Introductory demo (identity + orchestration + memory).
     Demo,
-    /// Log in to a provider with a subscription (OAuth). Provider: `anthropic`.
+    /// Log in to a provider with a subscription (OAuth): `anthropic` or `openai`.
     Login {
-        /// Provider name (`anthropic`).
+        /// Provider name (`anthropic` | `openai`).
         provider: String,
-        /// Use the paste-the-code flow instead of the browser loopback flow
-        /// (SSH/headless friendly).
+        /// Anthropic only: paste-the-code flow instead of the browser loopback
+        /// flow (SSH/headless friendly).
         #[arg(long)]
         device: bool,
     },
     /// Remove a stored credential for a provider.
     Logout {
-        /// Provider name (`anthropic`).
+        /// Provider name (`anthropic` | `openai`).
         provider: String,
     },
     /// Show configured provider credentials and their status.
@@ -203,6 +203,69 @@ fn env_timeout() -> Option<std::time::Duration> {
 /// Refresh closure for Anthropic subscription tokens.
 fn anthropic_refresh_fn() -> lore::auth::RefreshFn {
     Box::new(|rt: String| Box::pin(async move { lore::auth::refresh_anthropic(&rt).await }))
+}
+
+/// Refresh closure for OpenAI (Codex) subscription tokens.
+fn openai_refresh_fn() -> lore::auth::RefreshFn {
+    Box::new(|rt: String| Box::pin(async move { lore::auth::refresh_openai(&rt).await }))
+}
+
+/// Builds an OpenAI provider: subscription (Codex Responses) or metered API key
+/// (Chat Completions via `OpenAiModel`).
+fn build_openai(data: &str) -> Arc<dyn Model> {
+    let name = std::env::var("LORE_LLM_MODEL").unwrap_or_else(|_| "gpt-5".into());
+    let store = TokenStore::new(data);
+    let stored = store.load("openai").ok().flatten();
+    let mode = std::env::var("LORE_AUTH").ok();
+    let want_key = mode.as_deref() == Some("key");
+    let want_subs = mode.as_deref() == Some("subs");
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .or_else(|_| std::env::var("LORE_LLM_KEY"))
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+
+    // Subscription (Codex) path.
+    if !want_key {
+        if let Some(cred @ Credential::OAuth { account_id, .. }) = &stored {
+            let account_id = account_id.clone();
+            let refreshing =
+                RefreshingToken::new(store, "openai", cred.clone(), openai_refresh_fn());
+            let mut m = CodexModel::new(name, Arc::new(refreshing), account_id);
+            if let Some(d) = env_timeout() {
+                m = m.with_timeout(d);
+            }
+            return Arc::new(m);
+        }
+        if want_subs {
+            tracing::warn!(
+                "LORE_AUTH=subs but no OpenAI subscription credential; run `lore login openai`"
+            );
+        }
+    }
+    // Metered API-key path (official Chat Completions).
+    let key = api_key.or_else(|| match &stored {
+        Some(Credential::ApiKey { key }) => Some(key.clone()),
+        _ => None,
+    });
+    match key {
+        Some(k) => {
+            let mut m = OpenAiModel::new("https://api.openai.com/v1", name).with_api_key(k);
+            if let Some(n) = env_max_tokens() {
+                m = m.with_max_tokens(n);
+            }
+            if let Some(d) = env_timeout() {
+                m = m.with_timeout(d);
+            }
+            Arc::new(m)
+        }
+        None => {
+            tracing::warn!(
+                "LORE_PROVIDER=openai but no credential found \
+                 (run `lore login openai` or set OPENAI_API_KEY); using MockModel"
+            );
+            Arc::new(MockModel::new())
+        }
+    }
 }
 
 /// Resolves Anthropic auth: `LORE_AUTH=key|subs` (default: subs if a stored
@@ -264,8 +327,10 @@ fn build_anthropic(data: &str) -> Arc<dyn Model> {
 /// (subscription/API key); otherwise `LORE_LLM_BASE` uses the OpenAI-compatible
 /// path (incl. Ollama); with neither set, `MockModel`.
 fn build_model(data: &str) -> Arc<dyn Model> {
-    if std::env::var("LORE_PROVIDER").ok().as_deref() == Some("anthropic") {
-        return build_anthropic(data);
+    match std::env::var("LORE_PROVIDER").ok().as_deref() {
+        Some("anthropic") => return build_anthropic(data),
+        Some("openai") => return build_openai(data),
+        _ => {}
     }
     match std::env::var("LORE_LLM_BASE") {
         Ok(base) => {
@@ -849,30 +914,75 @@ async fn run_demo(data: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Interactive subscription login. Phase 1 supports Anthropic (Claude Pro/Max).
+/// Interactive subscription login. Supports Anthropic (Claude Pro/Max) and
+/// OpenAI (ChatGPT Plus/Pro, Codex).
 async fn login(data: &str, provider: &str, device: bool) -> anyhow::Result<()> {
-    if provider != "anthropic" {
-        anyhow::bail!("unknown provider '{provider}' (supported: anthropic)");
-    }
     let pkce = lore::auth::pkce();
     let state = ulid::Ulid::new().to_string();
-    let outcome = if device {
-        login_anthropic_manual(&pkce, &state).await?
-    } else {
-        login_anthropic_loopback(&pkce, &state).await?
+    let (outcome, hint) = match provider {
+        "anthropic" => {
+            let o = if device {
+                login_anthropic_manual(&pkce, &state).await?
+            } else {
+                login_anthropic_loopback(&pkce, &state).await?
+            };
+            (
+                o,
+                "LORE_PROVIDER=anthropic LORE_LLM_MODEL=claude-sonnet-4-5-20250929",
+            )
+        }
+        "openai" => {
+            let o = login_openai_loopback(&pkce, &state).await?;
+            (o, "LORE_PROVIDER=openai LORE_LLM_MODEL=gpt-5")
+        }
+        _ => anyhow::bail!("unknown provider '{provider}' (supported: anthropic, openai)"),
     };
     let cred = Credential::OAuth {
         access: outcome.access,
         refresh: outcome.refresh,
         expires_ms: outcome.expires_ms,
-        account_id: None,
+        account_id: outcome.account_id,
     };
     TokenStore::new(data).save(provider, &cred)?;
     println!(
-        "✅ logged in to {provider} (subscription).\n   Use it: LORE_PROVIDER=anthropic \
-         LORE_LLM_MODEL=claude-sonnet-4-5 lore ask <agent> \"...\""
+        "✅ logged in to {provider} (subscription).\n   Use it: {hint} lore ask <agent> \"...\""
     );
     Ok(())
+}
+
+/// OpenAI (Codex) browser loopback login. The redirect must match the client's
+/// registered URI (`http://localhost:1455/auth/callback`).
+async fn login_openai_loopback(
+    pkce: &lore::auth::Pkce,
+    state: &str,
+) -> anyhow::Result<lore::auth::OAuthOutcome> {
+    use std::io::{Read, Write};
+    let redirect = "http://localhost:1455/auth/callback";
+    let listener = std::net::TcpListener::bind("127.0.0.1:1455").map_err(|e| {
+        anyhow::anyhow!("could not bind 127.0.0.1:1455 for the OpenAI callback: {e}")
+    })?;
+    let url = lore::auth::openai_authorize_url(pkce, redirect, state);
+    println!("Opening browser for authorization…\nIf it doesn't open, visit:\n\n{url}\n");
+    open_browser(&url);
+    println!("Waiting for the redirect on {redirect} …");
+    let (mut sock, _) = listener.accept()?;
+    let mut buf = [0u8; 8192];
+    let n = sock.read(&mut buf)?;
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let parsed = parse_callback_query(&req);
+    let body = match &parsed {
+        Some(_) => "<html><body>Lore: login complete. You can close this tab.</body></html>",
+        None => "<html><body>Lore: could not read the authorization code.</body></html>",
+    };
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = sock.write_all(resp.as_bytes());
+    let (code, _state) =
+        parsed.ok_or_else(|| anyhow::anyhow!("could not parse code from redirect"))?;
+    Ok(lore::auth::exchange_openai_code(&code, &pkce.verifier, redirect).await?)
 }
 
 /// Paste-the-code flow (SSH/headless friendly).

@@ -6,10 +6,19 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
 ## [Unreleased]
 
 ### Added
-- **Native provider auth (Anthropic; OpenAI subs is Phase 2)**: Lore now has its
+- **Native provider auth (Anthropic + OpenAI)**: Lore now has its
   **own** self-contained credential subsystem (`src/auth/`) — it reads no other
   tool's credentials. An agent can be driven by a metered **API key** or a
-  consumer **subscription** (Claude Pro/Max).
+  consumer **subscription** (Claude Pro/Max; ChatGPT Plus/Pro via Codex).
+  - `CodexModel` (`src/model/codex.rs`): OpenAI **Responses** API over the
+    ChatGPT subscription backend (`/backend-api/codex/responses`), `Bearer` +
+    `ChatGPT-Account-Id` (account id decoded from the login id-token JWT),
+    SSE `response.output_text.delta` streaming. OpenAI OAuth uses the
+    `auth.openai.com` endpoints (form-encoded) with the Codex client id.
+    `lore login openai` (browser loopback on `localhost:1455`).
+    *Wired and reaches the live backend (auth/endpoint confirmed); a full
+    completion was not live-verified in this build.* The metered OpenAI API-key
+    path uses `OpenAiModel` (Chat Completions) unchanged.
   - `AnthropicModel` (`src/model/anthropic.rs`): Anthropic Messages API
     (`/v1/messages`) with real SSE streaming and the shared idle-timeout
     discipline. Two auth modes: `x-api-key` (official) and subscription
