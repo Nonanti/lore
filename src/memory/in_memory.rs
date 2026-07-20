@@ -156,6 +156,11 @@ impl MemoryStore for InMemoryStore {
                     continue;
                 }
             }
+            if let Some(min_imp) = query.min_importance {
+                if mem.importance < min_imp {
+                    continue;
+                }
+            }
 
             let (score, signals) = scorer.score(mem, query, q_emb.as_deref(), now);
             // With-text query: filter out irrelevant hits (score 0).
@@ -519,6 +524,35 @@ mod tests {
         let res = store.recall(&scope, &Query::new("")).await.unwrap();
         assert_eq!(res.len(), 2);
         assert!(res[0].item.summary().contains("high"));
+    }
+
+    #[tokio::test]
+    async fn min_importance_excludes_low_value_traces() {
+        let store = InMemoryStore::new();
+        let (_a, scope) = agent_scope();
+        store
+            .remember(
+                Memory::episodic(scope.clone(), "responded to 'x':", "echo about rust")
+                    .with_importance(Memory::AUTO_IMPORTANCE),
+            )
+            .await
+            .unwrap();
+        store
+            .remember(Memory::episodic(scope.clone(), "favori dil", "rust")) // default 0.5
+            .await
+            .unwrap();
+        // Without a floor both match; with a 0.35 floor the auto trace is dropped.
+        let all = store
+            .recall(&scope, &Query::new("rust").semantic())
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+        let floored = store
+            .recall(&scope, &Query::new("rust").semantic().min_importance(0.35))
+            .await
+            .unwrap();
+        assert_eq!(floored.len(), 1);
+        assert!(floored[0].item.recall_context().contains("favori dil"));
     }
 
     #[tokio::test]

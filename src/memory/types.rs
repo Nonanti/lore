@@ -308,6 +308,10 @@ pub struct Query {
     pub embed_text: Option<String>,
     /// Re-rank first-pass candidates with the native reranker.
     pub rerank: bool,
+    /// Minimum importance a record must have to be returned (None = no floor).
+    /// Used to keep low-value automatic traces (exchange/tool/board logs, born
+    /// at [`Memory::AUTO_IMPORTANCE`]) out of prompt context.
+    pub min_importance: Option<f32>,
 }
 
 impl Query {
@@ -320,6 +324,7 @@ impl Query {
             include_deleted: false,
             semantic: false,
             diverse: false,
+            min_importance: None,
             embed_text: None,
             rerank: false,
         }
@@ -346,6 +351,12 @@ impl Query {
     /// Enables semantic recall (builder): matches via embedding cosine without keywords.
     pub fn semantic(mut self) -> Self {
         self.semantic = true;
+        self
+    }
+
+    /// Sets a minimum-importance floor (builder): records below `v` are excluded.
+    pub fn min_importance(mut self, v: f32) -> Self {
+        self.min_importance = Some(v);
         self
     }
 

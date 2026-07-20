@@ -28,6 +28,11 @@ const RESPOND_RECALL_LIMIT: usize = 5;
 /// Max characters per recalled context line injected into a prompt (keeps the
 /// prompt lean when a recalled body is long, e.g. a prior exchange reply).
 const RECALL_CONTEXT_CHARS: usize = 400;
+/// Importance floor for memories injected as prompt context: keeps low-value
+/// automatic traces (exchange/tool/board logs at `AUTO_IMPORTANCE` = 0.2) out,
+/// while admitting explicit `remember`/`experience` (0.5) and distilled facts.
+/// Recent conversation is already supplied separately via `history`.
+const CONTEXT_MIN_IMPORTANCE: f32 = 0.35;
 
 /// Maximum length (characters) of reasoning fallback replies stored in memory.
 /// Raw CoT can be thousands of characters; the memory summary is kept short.
@@ -617,7 +622,12 @@ impl Agent {
         history: Vec<Turn>,
     ) -> Result<Prompt> {
         let recalled = self
-            .recall(&Query::new(input).limit(RESPOND_RECALL_LIMIT).semantic())
+            .recall(
+                &Query::new(input)
+                    .limit(RESPOND_RECALL_LIMIT)
+                    .semantic()
+                    .min_importance(CONTEXT_MIN_IMPORTANCE),
+            )
             .await?;
         let mut context: Vec<String> = extra.to_vec();
         // Inject the FULL recalled content (title + body / statement / steps), not

@@ -13,6 +13,13 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
   episodic body / semantic statement / procedural steps (capped per line to keep
   the prompt lean). `remember`/`experience` knowledge is now actually used in
   answers; `summary()` stays the compact one-liner for CLI/board listings.
+- **Conversation echoes no longer pollute recall context**: automatic exchange
+  traces (born at `AUTO_IMPORTANCE` = 0.2) were matching later similar questions
+  and crowding out real memories. `Query::min_importance()` adds an importance
+  floor (applied in both stores); `ask`/`respond` inject only records ≥ 0.35
+  (explicit knowledge + distilled facts), while recent turns still arrive via
+  `history`. Auto traces are no longer reinforced by these recalls, so decay can
+  reclaim them as intended.
 
 ### Added
 - **Native provider auth (Anthropic + OpenAI)**: Lore now has its

@@ -658,6 +658,11 @@ impl MemoryStore for SqliteStore {
                         continue;
                     }
                 }
+                if let Some(min_imp) = query.min_importance {
+                    if mem.importance < min_imp {
+                        continue;
+                    }
+                }
                 let (score, signals) = scorer.score(&mem, &query, q_emb.as_deref(), now);
                 if has_text && score <= 0.0 {
                     continue;
