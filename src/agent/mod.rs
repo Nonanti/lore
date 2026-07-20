@@ -25,6 +25,9 @@ use std::sync::Arc;
 
 /// Number of memories included in the prompt during the `respond` loop (top-N most relevant).
 const RESPOND_RECALL_LIMIT: usize = 5;
+/// Max characters per recalled context line injected into a prompt (keeps the
+/// prompt lean when a recalled body is long, e.g. a prior exchange reply).
+const RECALL_CONTEXT_CHARS: usize = 400;
 
 /// Maximum length (characters) of reasoning fallback replies stored in memory.
 /// Raw CoT can be thousands of characters; the memory summary is kept short.
@@ -617,7 +620,17 @@ impl Agent {
             .recall(&Query::new(input).limit(RESPOND_RECALL_LIMIT).semantic())
             .await?;
         let mut context: Vec<String> = extra.to_vec();
-        context.extend(recalled.iter().map(|s| s.item.summary()));
+        // Inject the FULL recalled content (title + body / statement / steps), not
+        // just a title — otherwise remembered facts never reach the model. Long
+        // bodies are capped so a single memory can't bloat the prompt.
+        context.extend(recalled.iter().map(|s| {
+            let line = s.item.recall_context();
+            if line.chars().count() > RECALL_CONTEXT_CHARS {
+                line.chars().take(RECALL_CONTEXT_CHARS).collect::<String>() + "…"
+            } else {
+                line
+            }
+        }));
         Ok(Prompt {
             system: self.persona.identity_prompt(),
             context,

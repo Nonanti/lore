@@ -5,6 +5,15 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
 
 ## [Unreleased]
 
+### Fixed
+- **Recalled memories now reach the model**: prompt context injection used
+  `Memory::summary()` — which for an **episodic** record is only its *title*, so
+  the body (the actual remembered content) never reached the model. `ask`/
+  `respond` now inject a new `Memory::recall_context()` that includes the
+  episodic body / semantic statement / procedural steps (capped per line to keep
+  the prompt lean). `remember`/`experience` knowledge is now actually used in
+  answers; `summary()` stays the compact one-liner for CLI/board listings.
+
 ### Added
 - **Native provider auth (Anthropic + OpenAI)**: Lore now has its
   **own** self-contained credential subsystem (`src/auth/`) — it reads no other

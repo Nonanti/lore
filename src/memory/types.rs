@@ -255,6 +255,37 @@ impl Memory {
             } => format!("[procedural] {title} ({successes}✓/{failures}✗)"),
         }
     }
+
+    /// Full content for injecting into a model prompt. Unlike [`summary`](Self::summary)
+    /// (a compact one-liner for listings), this includes the episodic **body**,
+    /// the semantic statement, or the procedural steps — so recalled knowledge
+    /// actually reaches the model.
+    pub fn recall_context(&self) -> String {
+        match &self.kind {
+            MemoryKind::Episodic { title, body, .. } => {
+                let t = title.trim();
+                let b = body.trim();
+                if b.is_empty() {
+                    t.to_string()
+                } else if t.is_empty() {
+                    b.to_string()
+                } else if t.ends_with(':') {
+                    // Exchange traces already end with a colon ("responded to 'x': ").
+                    format!("{t} {b}")
+                } else {
+                    format!("{t}: {b}")
+                }
+            }
+            MemoryKind::Semantic { statement, .. } => statement.clone(),
+            MemoryKind::Procedural { title, steps, .. } => {
+                if steps.is_empty() {
+                    title.clone()
+                } else {
+                    format!("{title}: {}", steps.join(" → "))
+                }
+            }
+        }
+    }
 }
 
 /// A memory query.
@@ -383,4 +414,42 @@ pub struct ConsolidationReport {
     pub merged: usize,
     /// Number of records forgotten.
     pub forgotten: usize,
+}
+
+#[cfg(test)]
+mod recall_context_tests {
+    use super::*;
+
+    #[test]
+    fn episodic_recall_context_includes_body() {
+        let m = Memory::episodic(Scope::World, "favori dil", "Rust, ownership için");
+        assert_eq!(m.recall_context(), "favori dil: Rust, ownership için");
+        // summary stays compact (title only).
+        assert_eq!(m.summary(), "[episodic] favori dil");
+    }
+
+    #[test]
+    fn exchange_trace_context_reads_naturally() {
+        // Exchange traces have a title ending in ':'.
+        let m = Memory::episodic(Scope::World, "responded to 'hi':", "hello there");
+        assert_eq!(m.recall_context(), "responded to 'hi': hello there");
+    }
+
+    #[test]
+    fn semantic_and_procedural_recall_context() {
+        let s = Memory::semantic(Scope::World, "Rust is memory-safe", SemanticCat::Fact);
+        assert_eq!(s.recall_context(), "Rust is memory-safe");
+        let p = Memory::procedural(
+            Scope::World,
+            "solve math",
+            vec!["parse".into(), "compute".into()],
+        );
+        assert_eq!(p.recall_context(), "solve math: parse → compute");
+    }
+
+    #[test]
+    fn empty_body_falls_back_to_title() {
+        let m = Memory::episodic(Scope::World, "just a title", "");
+        assert_eq!(m.recall_context(), "just a title");
+    }
 }
