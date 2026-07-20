@@ -26,7 +26,7 @@ const ANTHROPIC_OAUTH_BETA: &str =
 /// Server-enforced identity prefix for OAuth (subscription) tokens. The first
 /// system block must begin with this or the API returns HTTP 400.
 const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
-const DEFAULT_MAX_TOKENS: u32 = 1024;
+const DEFAULT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 

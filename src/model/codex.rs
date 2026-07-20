@@ -165,6 +165,8 @@ impl CodexModel {
 enum SseEvent {
     Token(String),
     Done,
+    /// The backend reported a failed/incomplete response; carries its message.
+    Failed(String),
 }
 
 /// Pulls the next complete `\n`-terminated line from the buffer (UTF-8 safe).
@@ -175,8 +177,8 @@ fn next_line(buf: &mut Vec<u8>) -> Option<String> {
 }
 
 /// Parses one Responses SSE `data:` line. Emits `output_text` deltas; signals
-/// done on `response.completed`; treats `response.failed` as done (body carries
-/// the error).
+/// done on `response.completed`; surfaces `response.failed`/`incomplete` as an
+/// error (so a failed run is not silently truncated).
 fn parse_sse_line(line: &str) -> Option<SseEvent> {
     let payload = line.strip_prefix("data:")?.trim();
     if payload == "[DONE]" {
@@ -191,7 +193,14 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
             }
             Some(SseEvent::Token(t.to_string()))
         }
-        "response.completed" | "response.failed" | "response.incomplete" => Some(SseEvent::Done),
+        "response.completed" => Some(SseEvent::Done),
+        "response.failed" | "response.incomplete" => {
+            let msg = v["response"]["error"]["message"]
+                .as_str()
+                .or_else(|| v["error"]["message"].as_str())
+                .unwrap_or("codex response failed");
+            Some(SseEvent::Failed(msg.to_string()))
+        }
         _ => None,
     }
 }
@@ -209,6 +218,7 @@ async fn drive_stream<F: FnMut(String)>(
             match parse_sse_line(&line) {
                 Some(SseEvent::Done) => return Ok(()),
                 Some(SseEvent::Token(t)) => on_token(t),
+                Some(SseEvent::Failed(m)) => return Err(LoreError::Model(m)),
                 None => {}
             }
         }
@@ -252,6 +262,9 @@ impl Model for CodexModel {
                         match parse_sse_line(&line) {
                             Some(SseEvent::Done) => return None,
                             Some(SseEvent::Token(t)) => return Some((Ok(t), (body, buf, false))),
+                            Some(SseEvent::Failed(m)) => {
+                                return Some((Err(LoreError::Model(m)), (body, buf, true)))
+                            }
                             None => {}
                         }
                     }
@@ -333,6 +346,9 @@ mod tests {
             parse_sse_line("data: [DONE]"),
             Some(SseEvent::Done)
         ));
+        // failed surfaces the error message instead of a silent stop.
+        let failed = r#"data: {"type":"response.failed","response":{"error":{"message":"boom"}}}"#;
+        assert!(matches!(parse_sse_line(failed), Some(SseEvent::Failed(m)) if m == "boom"));
         // reasoning/other events skipped; non-data lines skipped.
         assert!(parse_sse_line(r#"data: {"type":"response.created"}"#).is_none());
         assert!(parse_sse_line("event: response.completed").is_none());

@@ -34,6 +34,14 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
     when unset); `LORE_LLM_BASE` (OpenAI-compatible) path is unchanged.
   - New dependency: `sha2` (PKCE challenge). Fragility of the unofficial
     subscription OAuth constants is documented in the README.
+  - **Review hardening**: OAuth `state` is verified on the callback (CSRF
+    guard); loopback login binds IPv4 **and** IPv6 and uses a matching redirect
+    (no hang on IPv6-first hosts) with a 5-minute timeout instead of a blocking
+    accept; the token store dir is `0700` and files `0600` (with a warning on
+    non-Unix); `RefreshingToken` re-reads disk before minting to narrow the
+    multi-process refresh race; `CodexModel` surfaces `response.failed` as an
+    error instead of a silent truncation; Anthropic default `max_tokens` raised
+    to 4096.
 
 - **Learning loop (reflect)**: frequently recalled episodic memories (access ≥ 2)
   are distilled by the model into one-sentence persistent knowledge and promoted

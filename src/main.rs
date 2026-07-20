@@ -951,37 +951,30 @@ async fn login(data: &str, provider: &str, device: bool) -> anyhow::Result<()> {
 }
 
 /// OpenAI (Codex) browser loopback login. The redirect must match the client's
-/// registered URI (`http://localhost:1455/auth/callback`).
+/// registered URI (`http://localhost:1455/auth/callback`); both IPv4 and IPv6
+/// loopback are bound so `localhost` resolves either way.
 async fn login_openai_loopback(
     pkce: &lore::auth::Pkce,
     state: &str,
 ) -> anyhow::Result<lore::auth::OAuthOutcome> {
-    use std::io::{Read, Write};
     let redirect = "http://localhost:1455/auth/callback";
-    let listener = std::net::TcpListener::bind("127.0.0.1:1455").map_err(|e| {
-        anyhow::anyhow!("could not bind 127.0.0.1:1455 for the OpenAI callback: {e}")
-    })?;
+    let mut listeners = Vec::new();
+    match std::net::TcpListener::bind("127.0.0.1:1455") {
+        Ok(l) => listeners.push(l),
+        Err(e) => tracing::warn!("could not bind 127.0.0.1:1455: {e}"),
+    }
+    if let Ok(l) = std::net::TcpListener::bind("[::1]:1455") {
+        listeners.push(l);
+    }
+    if listeners.is_empty() {
+        anyhow::bail!("could not bind localhost:1455 for the OpenAI callback (port in use?)");
+    }
     let url = lore::auth::openai_authorize_url(pkce, redirect, state);
     println!("Opening browser for authorization…\nIf it doesn't open, visit:\n\n{url}\n");
     open_browser(&url);
-    println!("Waiting for the redirect on {redirect} …");
-    let (mut sock, _) = listener.accept()?;
-    let mut buf = [0u8; 8192];
-    let n = sock.read(&mut buf)?;
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let parsed = parse_callback_query(&req);
-    let body = match &parsed {
-        Some(_) => "<html><body>Lore: login complete. You can close this tab.</body></html>",
-        None => "<html><body>Lore: could not read the authorization code.</body></html>",
-    };
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = sock.write_all(resp.as_bytes());
-    let (code, _state) =
-        parsed.ok_or_else(|| anyhow::anyhow!("could not parse code from redirect"))?;
+    println!("Waiting for the redirect on {redirect} … (Ctrl-C to cancel)");
+    let (code, got_state) = wait_for_redirect(listeners).await?;
+    verify_state(state, &got_state)?;
     Ok(lore::auth::exchange_openai_code(&code, &pkce.verifier, redirect).await?)
 }
 
@@ -1006,37 +999,93 @@ async fn login_anthropic_manual(
 }
 
 /// Browser loopback flow: open the URL, capture the `?code=` redirect locally.
+/// The redirect uses `127.0.0.1` (not `localhost`) to match the bind on
+/// IPv6-first systems.
 async fn login_anthropic_loopback(
     pkce: &lore::auth::Pkce,
     state: &str,
 ) -> anyhow::Result<lore::auth::OAuthOutcome> {
-    use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
-    let redirect = format!("http://localhost:{port}/callback");
+    let redirect = format!("http://127.0.0.1:{port}/callback");
     let url = lore::auth::anthropic_authorize_url(pkce, &redirect, state);
     println!("Opening browser for authorization…\nIf it doesn't open, visit:\n\n{url}\n");
     open_browser(&url);
     println!("Waiting for the redirect on {redirect} … (Ctrl-C to cancel, or use --device)");
-    let (mut sock, _) = listener.accept()?;
-    let mut buf = [0u8; 8192];
-    let n = sock.read(&mut buf)?;
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let parsed = parse_callback_query(&req);
-    let body = match &parsed {
-        Some(_) => "<html><body>Lore: login complete. You can close this tab.</body></html>",
-        None => "<html><body>Lore: could not read the authorization code.</body></html>",
-    };
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = sock.write_all(resp.as_bytes());
-    let (code, got_state) =
-        parsed.ok_or_else(|| anyhow::anyhow!("could not parse code from redirect"))?;
-    let st = got_state.unwrap_or_else(|| state.to_string());
-    Ok(lore::auth::exchange_anthropic_code(&code, &st, &pkce.verifier, &redirect).await?)
+    let (code, got_state) = wait_for_redirect(vec![listener]).await?;
+    verify_state(state, &got_state)?;
+    Ok(lore::auth::exchange_anthropic_code(&code, state, &pkce.verifier, &redirect).await?)
+}
+
+/// Rejects a callback whose `state` does not match what we sent (CSRF guard).
+fn verify_state(sent: &str, got: &Option<String>) -> anyhow::Result<()> {
+    if let Some(g) = got {
+        if g != sent {
+            anyhow::bail!("OAuth state mismatch (possible CSRF); aborting login");
+        }
+    }
+    Ok(())
+}
+
+/// Waits (off the async runtime) for the OAuth redirect across the given
+/// loopback listeners.
+async fn wait_for_redirect(
+    listeners: Vec<std::net::TcpListener>,
+) -> anyhow::Result<(String, Option<String>)> {
+    tokio::task::spawn_blocking(move || {
+        capture_redirect(listeners, std::time::Duration::from_secs(300))
+    })
+    .await?
+}
+
+/// Accepts one connection on any listener (one blocking thread each, so IPv4 and
+/// IPv6 localhost both work), replies with a friendly page, and returns the
+/// captured `(code, state)`. Times out instead of hanging forever.
+fn capture_redirect(
+    listeners: Vec<std::net::TcpListener>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<(String, Option<String>)> {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    for l in listeners {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = l.accept() {
+                let mut buf = [0u8; 8192];
+                if let Ok(n) = sock.read(&mut buf) {
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let parsed = parse_callback_query(&req);
+                    let body = if parsed.is_some() {
+                        "<html><body>Lore: login complete. You can close this tab.</body></html>"
+                    } else {
+                        "<html><body>Lore: could not read the authorization code.</body></html>"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                    let _ = tx.send(parsed);
+                }
+            }
+        });
+    }
+    drop(tx);
+    match rx.recv_timeout(timeout) {
+        Ok(Some(cs)) => Ok(cs),
+        Ok(None) => anyhow::bail!("could not read the authorization code from the redirect"),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            anyhow::bail!(
+                "timed out waiting for the OAuth redirect ({}s)",
+                timeout.as_secs()
+            )
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("OAuth callback listeners closed before a redirect arrived")
+        }
+    }
 }
 
 /// Extracts `code` (and optional `state`) from an HTTP GET request line.
@@ -1144,6 +1193,13 @@ mod tests {
         assert_eq!(code, "abc#xyz");
         assert_eq!(state.as_deref(), Some("st ate"));
         assert!(super::parse_callback_query("GET /callback HTTP/1.1").is_none());
+    }
+
+    #[test]
+    fn state_mismatch_is_rejected() {
+        assert!(super::verify_state("abc", &Some("abc".to_string())).is_ok());
+        assert!(super::verify_state("abc", &None).is_ok()); // provider omitted state
+        assert!(super::verify_state("abc", &Some("evil".to_string())).is_err());
     }
 
     #[test]

@@ -75,6 +75,18 @@ impl RefreshingToken {
 impl AccessTokenProvider for RefreshingToken {
     async fn access_token(&self) -> Result<String> {
         let mut cur = self.current.lock().await;
+        // Cross-process mitigation: another Lore process (e.g. CLI vs serve
+        // sharing LORE_DATA) may have refreshed already. Re-read disk before
+        // minting a new token so we do not invalidate a peer's rotated refresh
+        // token. This narrows — but does not fully close — the multi-process
+        // refresh race (there is no cross-process file lock).
+        if cur.is_expired(REFRESH_SKEW_SECS) {
+            if let Ok(Some(disk)) = self.store.load(&self.provider) {
+                if !disk.is_expired(REFRESH_SKEW_SECS) {
+                    *cur = disk;
+                }
+            }
+        }
         if cur.is_expired(REFRESH_SKEW_SECS) {
             if let Credential::OAuth {
                 refresh,
@@ -83,13 +95,14 @@ impl AccessTokenProvider for RefreshingToken {
             } = &*cur
             {
                 let refresh_tok = refresh.clone();
-                let account_id = account_id.clone();
+                let prev_account = account_id.clone();
                 let out = (self.refresh)(refresh_tok).await?;
                 let fresh = Credential::OAuth {
                     access: out.access,
                     refresh: out.refresh,
                     expires_ms: out.expires_ms,
-                    account_id,
+                    // Prefer a freshly-issued account id; keep the previous one.
+                    account_id: out.account_id.or(prev_account),
                 };
                 self.store.save(&self.provider, &fresh)?;
                 *cur = fresh;
@@ -195,10 +208,12 @@ impl TokenStore {
     pub fn save(&self, provider: &str, cred: &Credential) -> Result<()> {
         let path = self.path(provider)?;
         std::fs::create_dir_all(&self.dir).map_err(|e| LoreError::Storage(e.to_string()))?;
+        // Owner-only directory (0700): peers cannot even enumerate provider names.
+        set_owner_only(&self.dir, 0o700)?;
         let json = serde_json::to_string_pretty(cred)?;
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, json).map_err(|e| LoreError::Storage(e.to_string()))?;
-        restrict_permissions(&tmp)?;
+        set_owner_only(&tmp, 0o600)?;
         std::fs::rename(&tmp, &path).map_err(|e| LoreError::Storage(e.to_string()))?;
         Ok(())
     }
@@ -233,17 +248,24 @@ impl TokenStore {
     }
 }
 
-/// Restricts a file to owner-only read/write (`0600`) on Unix. No-op elsewhere.
-fn restrict_permissions(path: &Path) -> Result<()> {
+/// Restricts a path to owner-only access (`mode`, e.g. `0o600`/`0o700`) on Unix.
+/// On non-Unix it cannot enforce this and logs a warning so operators do not
+/// trust a "private" claim the filesystem can't back.
+fn set_owner_only(path: &Path, mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
             .map_err(|e| LoreError::Storage(e.to_string()))?;
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = mode;
+        tracing::warn!(
+            path = %path.display(),
+            "non-unix platform: cannot restrict credential file permissions; \
+             the token store may be world-readable"
+        );
     }
     Ok(())
 }
@@ -427,7 +449,13 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+        assert_eq!(mode, 0o600, "file expected 0600, got {mode:o}");
+        let dmode = std::fs::metadata(dir.join("auth"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dmode, 0o700, "dir expected 0700, got {dmode:o}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

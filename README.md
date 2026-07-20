@@ -125,10 +125,13 @@ lore logout <anthropic|openai>  # remove the stored credential
 > completion was **not** live-verified in this build (no live ChatGPT token was
 > available); its request shape follows the Codex CLI references.
 
-OAuth tokens are stored under `LORE_DATA/auth/<provider>.json` (`0600`, atomic
-write) and refreshed by Lore itself. `LORE_AUTH=key|subs` forces a mode; with it
-unset, Lore auto-detects (subscription if a stored OAuth credential exists, else
-an API key from `ANTHROPIC_API_KEY`/`LORE_LLM_KEY`).
+OAuth tokens are stored under `LORE_DATA/auth/<provider>.json` (`0600` files in a
+`0700` dir, atomic write) and refreshed by Lore itself (with `state` verified on
+the callback). `LORE_AUTH=key|subs` forces a mode; with it unset, Lore
+auto-detects (subscription if a stored OAuth credential exists, else an API key
+from `ANTHROPIC_API_KEY`/`LORE_LLM_KEY`). Note: refresh uses an in-process lock
+only — running two Lore processes against one `LORE_DATA` narrows but does not
+fully close the token-refresh race (single-operator use is assumed).
 
 > **Fragility note:** subscription OAuth relies on provider constants (client id,
 > endpoints, the Claude Code identity/beta headers) that are **not officially
