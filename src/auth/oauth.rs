@@ -74,7 +74,8 @@ pub fn anthropic_authorize_url(pkce: &Pkce, redirect_uri: &str, state: &str) -> 
          &code_challenge_method=S256&state={state}",
         cid = ANTHROPIC_CLIENT_ID,
         redir = urlencode(redirect_uri),
-        scope = urlencode(ANTHROPIC_SCOPE),
+        // Match the reference client byte-for-byte: spaces as `+` (URLSearchParams).
+        scope = urlencode(ANTHROPIC_SCOPE).replace("%20", "+"),
         chal = urlencode(&pkce.challenge),
         state = urlencode(state),
     )
@@ -150,7 +151,7 @@ pub fn openai_authorize_url(pkce: &Pkce, redirect_uri: &str, state: &str) -> Str
          &id_token_add_organizations=true&codex_cli_simplified_flow=true&originator={orig}",
         cid = OPENAI_CLIENT_ID,
         redir = urlencode(redirect_uri),
-        scope = urlencode(OPENAI_SCOPE),
+        scope = urlencode(OPENAI_SCOPE).replace("%20", "+"),
         chal = urlencode(&pkce.challenge),
         state = urlencode(state),
         orig = OPENAI_ORIGINATOR,
@@ -285,8 +286,8 @@ mod tests {
         assert!(url.contains(&format!("code_challenge={}", p.challenge)));
         assert!(url.contains("state=st4te"));
         assert!(url.contains("response_type=code"));
-        // scope space is encoded; extended scopes present.
-        assert!(url.contains("scope=org%3Acreate_api_key%20user%3Aprofile"));
+        // scope spaces encoded as '+'; extended scopes present.
+        assert!(url.contains("scope=org%3Acreate_api_key+user%3Aprofile"));
         assert!(url.contains("user%3Asessions%3Aclaude_code"));
         // registered loopback redirect encoded.
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback"));
@@ -318,7 +319,7 @@ mod tests {
         assert!(url.starts_with("https://auth.openai.com/oauth/authorize?"));
         assert!(url.contains(&format!("client_id={OPENAI_CLIENT_ID}")));
         assert!(url.contains("code_challenge_method=S256"));
-        assert!(url.contains("scope=openid%20profile%20email%20offline_access"));
+        assert!(url.contains("scope=openid+profile+email+offline_access"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
         assert!(url.contains("codex_cli_simplified_flow=true"));
         assert!(url.contains("originator=codex_cli_rs"));
