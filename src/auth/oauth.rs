@@ -12,10 +12,13 @@ use serde::Deserialize;
 /// Anthropic (Claude Code) public OAuth client id — Claude Pro/Max login.
 pub const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_AUTHORIZE: &str = "https://claude.ai/oauth/authorize";
-const ANTHROPIC_TOKEN: &str = "https://console.anthropic.com/v1/oauth/token";
-/// Redirect used by the manual (paste-the-code) flow.
-pub const ANTHROPIC_MANUAL_REDIRECT: &str = "https://console.anthropic.com/oauth/code/callback";
-const ANTHROPIC_SCOPE: &str = "org:create_api_key user:profile user:inference";
+const ANTHROPIC_TOKEN: &str = "https://platform.claude.com/v1/oauth/token";
+/// Registered loopback redirect for the Claude Code client (fixed port).
+pub const ANTHROPIC_REDIRECT: &str = "http://localhost:53692/callback";
+/// The port `ANTHROPIC_REDIRECT` binds.
+pub const ANTHROPIC_CALLBACK_PORT: u16 = 53692;
+const ANTHROPIC_SCOPE: &str = "org:create_api_key user:profile user:inference \
+     user:sessions:claude_code user:mcp_servers user:file_upload";
 
 /// OpenAI (Codex/ChatGPT) public OAuth client id — ChatGPT Plus/Pro login.
 pub const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -134,17 +137,23 @@ async fn post_token(body: serde_json::Value) -> Result<OAuthOutcome> {
     })
 }
 
-/// Builds the OpenAI (Codex) authorize URL. Pure/testable.
+/// OAuth originator; matches the Codex CLI (also sent on the Responses API).
+pub const OPENAI_ORIGINATOR: &str = "codex_cli_rs";
+
+/// Builds the OpenAI (Codex) authorize URL. Pure/testable. Mirrors the Codex
+/// CLI flow (`codex_cli_simplified_flow`, `id_token_add_organizations`,
+/// `originator`).
 pub fn openai_authorize_url(pkce: &Pkce, redirect_uri: &str, state: &str) -> String {
     format!(
-        "{OPENAI_AUTHORIZE}?client_id={cid}&response_type=code&redirect_uri={redir}\
+        "{OPENAI_AUTHORIZE}?response_type=code&client_id={cid}&redirect_uri={redir}\
          &scope={scope}&code_challenge={chal}&code_challenge_method=S256&state={state}\
-         &id_token_add_organizations=true",
+         &id_token_add_organizations=true&codex_cli_simplified_flow=true&originator={orig}",
         cid = OPENAI_CLIENT_ID,
         redir = urlencode(redirect_uri),
         scope = urlencode(OPENAI_SCOPE),
         chal = urlencode(&pkce.challenge),
         state = urlencode(state),
+        orig = OPENAI_ORIGINATOR,
     )
 }
 
@@ -155,12 +164,10 @@ struct OpenAiTokenResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     expires_in: Option<i64>,
-    #[serde(default)]
-    id_token: Option<String>,
 }
 
-/// Extracts `chatgpt_account_id` from an id-token JWT (no signature check —
-/// local claim read only).
+/// Extracts `chatgpt_account_id` from a JWT (the access token) — no signature
+/// check, local claim read only.
 fn chatgpt_account_id(id_token: &str) -> Option<String> {
     let payload = id_token.split('.').nth(1)?;
     let bytes = super::b64url_decode(payload)?;
@@ -189,7 +196,8 @@ async fn openai_post_token(form: &[(&str, &str)]) -> Result<OAuthOutcome> {
     let refresh = tr
         .refresh_token
         .ok_or_else(|| LoreError::Model("openai oauth response missing refresh_token".into()))?;
-    let account_id = tr.id_token.as_deref().and_then(chatgpt_account_id);
+    // The ChatGPT account id is a claim inside the access-token JWT.
+    let account_id = chatgpt_account_id(&tr.access_token);
     Ok(OAuthOutcome {
         access: tr.access_token,
         refresh,
@@ -270,17 +278,18 @@ mod tests {
     #[test]
     fn authorize_url_has_required_params() {
         let p = pkce();
-        let url = anthropic_authorize_url(&p, ANTHROPIC_MANUAL_REDIRECT, "st4te");
+        let url = anthropic_authorize_url(&p, ANTHROPIC_REDIRECT, "st4te");
         assert!(url.starts_with("https://claude.ai/oauth/authorize?"));
         assert!(url.contains(&format!("client_id={ANTHROPIC_CLIENT_ID}")));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains(&format!("code_challenge={}", p.challenge)));
         assert!(url.contains("state=st4te"));
         assert!(url.contains("response_type=code"));
-        // scope space is encoded.
-        assert!(url.contains("scope=org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference"));
-        // redirect encoded.
-        assert!(url.contains("redirect_uri=https%3A%2F%2Fconsole.anthropic.com"));
+        // scope space is encoded; extended scopes present.
+        assert!(url.contains("scope=org%3Acreate_api_key%20user%3Aprofile"));
+        assert!(url.contains("user%3Asessions%3Aclaude_code"));
+        // registered loopback redirect encoded.
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback"));
     }
 
     #[test]
@@ -311,6 +320,8 @@ mod tests {
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("scope=openid%20profile%20email%20offline_access"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
+        assert!(url.contains("codex_cli_simplified_flow=true"));
+        assert!(url.contains("originator=codex_cli_rs"));
     }
 
     #[test]

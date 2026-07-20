@@ -921,12 +921,13 @@ async fn login(data: &str, provider: &str, device: bool) -> anyhow::Result<()> {
     let state = ulid::Ulid::new().to_string();
     let (outcome, hint) = match provider {
         "anthropic" => {
-            // Anthropic's public (Claude Code) client only accepts its console
-            // redirect, so a localhost/loopback redirect fails with "Invalid
-            // request format". The paste-the-code flow uses the registered
-            // redirect and is the reliable path.
-            let _ = device;
-            let o = login_anthropic_manual(&pkce, &state).await?;
+            // Anthropic uses a fixed registered loopback redirect (port 53692)
+            // and the PKCE verifier as the OAuth state.
+            let o = if device {
+                login_anthropic_manual(&pkce).await?
+            } else {
+                login_anthropic_loopback(&pkce).await?
+            };
             (
                 o,
                 "LORE_PROVIDER=anthropic LORE_LLM_MODEL=claude-sonnet-4-5-20250929",
@@ -982,14 +983,48 @@ async fn login_openai_loopback(
     Ok(lore::auth::exchange_openai_code(&code, &pkce.verifier, redirect).await?)
 }
 
-/// Paste-the-code flow (SSH/headless friendly).
+/// Anthropic browser loopback login on the registered port 53692 (IPv4+IPv6).
+/// Anthropic uses the PKCE verifier as the OAuth `state`.
+async fn login_anthropic_loopback(
+    pkce: &lore::auth::Pkce,
+) -> anyhow::Result<lore::auth::OAuthOutcome> {
+    let redirect = lore::auth::ANTHROPIC_REDIRECT;
+    let port = lore::auth::ANTHROPIC_CALLBACK_PORT;
+    let mut listeners = Vec::new();
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => listeners.push(l),
+        Err(e) => tracing::warn!("could not bind 127.0.0.1:{port}: {e}"),
+    }
+    if let Ok(l) = std::net::TcpListener::bind(("::1", port)) {
+        listeners.push(l);
+    }
+    if listeners.is_empty() {
+        anyhow::bail!(
+            "could not bind localhost:{port} for the Anthropic callback \
+             (port in use? try --device)"
+        );
+    }
+    let url = lore::auth::anthropic_authorize_url(pkce, redirect, &pkce.verifier);
+    println!("Opening browser for authorization…\nIf it doesn't open, visit:\n\n{url}\n");
+    open_browser(&url);
+    println!("Waiting for the redirect on {redirect} … (Ctrl-C to cancel, or use --device)");
+    let (code, got_state) = wait_for_redirect(listeners).await?;
+    verify_state(&pkce.verifier, &got_state)?;
+    Ok(
+        lore::auth::exchange_anthropic_code(&code, &pkce.verifier, &pkce.verifier, redirect)
+            .await?,
+    )
+}
+
+/// Paste-the-code flow (SSH/headless): user copies the `code#state` shown.
 async fn login_anthropic_manual(
     pkce: &lore::auth::Pkce,
-    state: &str,
 ) -> anyhow::Result<lore::auth::OAuthOutcome> {
-    let redirect = lore::auth::ANTHROPIC_MANUAL_REDIRECT;
-    let url = lore::auth::anthropic_authorize_url(pkce, redirect, state);
-    println!("Open this URL, authorize, then paste the code shown:\n\n{url}\n");
+    let redirect = lore::auth::ANTHROPIC_REDIRECT;
+    let url = lore::auth::anthropic_authorize_url(pkce, redirect, &pkce.verifier);
+    println!(
+        "Open this URL, authorize, then paste the code shown (looks like `code#state`):\n\n{url}\n"
+    );
     print!("code: ");
     std::io::Write::flush(&mut std::io::stdout())?;
     let mut line = String::new();
@@ -998,8 +1033,11 @@ async fn login_anthropic_manual(
     if code.is_empty() {
         anyhow::bail!("no code entered");
     }
-    let st = pasted_state.unwrap_or_else(|| state.to_string());
-    Ok(lore::auth::exchange_anthropic_code(&code, &st, &pkce.verifier, redirect).await?)
+    verify_state(&pkce.verifier, &pasted_state)?;
+    Ok(
+        lore::auth::exchange_anthropic_code(&code, &pkce.verifier, &pkce.verifier, redirect)
+            .await?,
+    )
 }
 
 /// Rejects a callback whose `state` does not match what we sent (CSRF guard).

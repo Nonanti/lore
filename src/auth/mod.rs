@@ -10,7 +10,7 @@ mod oauth;
 pub use oauth::{
     anthropic_authorize_url, exchange_anthropic_code, exchange_openai_code, openai_authorize_url,
     refresh_anthropic, refresh_openai, split_manual_code, AuthFlow, OAuthOutcome,
-    ANTHROPIC_CLIENT_ID, ANTHROPIC_MANUAL_REDIRECT, OPENAI_CLIENT_ID,
+    ANTHROPIC_CALLBACK_PORT, ANTHROPIC_CLIENT_ID, ANTHROPIC_REDIRECT, OPENAI_CLIENT_ID,
 };
 
 use crate::error::{LoreError, Result};
