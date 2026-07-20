@@ -6,6 +6,26 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
 ## [Unreleased]
 
 ### Added
+- **Native provider auth (Anthropic; OpenAI subs is Phase 2)**: Lore now has its
+  **own** self-contained credential subsystem (`src/auth/`) — it reads no other
+  tool's credentials. An agent can be driven by a metered **API key** or a
+  consumer **subscription** (Claude Pro/Max).
+  - `AnthropicModel` (`src/model/anthropic.rs`): Anthropic Messages API
+    (`/v1/messages`) with real SSE streaming and the shared idle-timeout
+    discipline. Two auth modes: `x-api-key` (official) and subscription
+    `Authorization: Bearer` (adds the Claude Code beta headers and forces the
+    server-required Claude Code identity as the first system block).
+  - `src/auth/`: PKCE (S256) helpers, a `0600` atomic `TokenStore` under
+    `LORE_DATA/auth/<provider>.json`, and an `AccessTokenProvider` that
+    auto-refreshes OAuth tokens on use (persisting the rotation) — so a
+    long-running server survives token expiry mid-session.
+  - CLI: `lore login <provider> [--device]` (browser loopback or paste-the-code
+    flow), `lore logout <provider>`, `lore auth` (status + expiry).
+  - Selection: `LORE_PROVIDER=anthropic` + `LORE_AUTH=key|subs` (auto-detected
+    when unset); `LORE_LLM_BASE` (OpenAI-compatible) path is unchanged.
+  - New dependency: `sha2` (PKCE challenge). Fragility of the unofficial
+    subscription OAuth constants is documented in the README.
+
 - **Learning loop (reflect)**: frequently recalled episodic memories (access ≥ 2)
   are distilled by the model into one-sentence persistent knowledge and promoted
   to the semantic tier (`Agent::reflect`, `POST /agents/:id/reflect`, `lore reflect`);

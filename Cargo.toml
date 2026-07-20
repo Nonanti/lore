@@ -27,6 +27,7 @@ anyhow = "1"
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 ulid = "1"
+sha2 = "0.10"  # PKCE S256 challenge for native OAuth (subscription login)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 axum = { version = "0.7", features = ["ws"] }

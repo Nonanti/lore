@@ -20,6 +20,7 @@
 //! - [`tool`] — tool registry + router (`KeywordRouter`, `LlmRouter`)
 
 pub mod agent;
+pub mod auth;
 pub mod error;
 pub mod id;
 pub mod memory;
@@ -29,6 +30,7 @@ pub mod server;
 pub mod tool;
 
 pub use agent::{Agent, Conversation, Persona};
+pub use auth::{AccessTokenProvider, Credential, RefreshingToken, StaticToken, TokenStore};
 pub use error::{LoreError, Result};
 pub use id::{AgentId, MemoryId};
 #[cfg(feature = "neural")]
@@ -40,7 +42,9 @@ pub use memory::{
     MemoryGraph, MemoryKind, MemoryStore, NativeReranker, Outcome, Query, Reranker, Scope, Scored,
     SemanticCat, Signal, SqliteStore, Tier,
 };
-pub use model::{Completion, MockModel, Model, OpenAiModel, Prompt, Role, Turn};
+pub use model::{
+    AnthropicAuth, AnthropicModel, Completion, MockModel, Model, OpenAiModel, Prompt, Role, Turn,
+};
 pub use orchestrator::{Delivery, Envelope, MessageKind, Orchestrator, Party, Recipient, Registry};
 pub use server::{
     ActResp, AgentView, AppState, AskResp, DeliberateReply, DeliberateResp, MemoryView,

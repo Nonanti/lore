@@ -92,6 +92,37 @@ For a real model (if not offline):
 LORE_LLM_BASE=http://localhost:11434/v1 LORE_LLM_MODEL=llama3.2 cargo run
 ```
 
+### Providers & auth (OpenAI / Anthropic — API key *or* subscription)
+
+Lore ships **its own** provider auth — fully self-contained, no external
+credential store is read. You can drive an agent with a metered **API key** or a
+consumer **subscription** (Claude Pro/Max today; ChatGPT Plus/Pro is Phase 2).
+
+```bash
+# Anthropic with a subscription (Claude Pro/Max) — native PKCE OAuth login.
+lore login anthropic            # browser loopback flow (or: --device to paste a code)
+lore auth                       # show configured credentials + expiry
+LORE_PROVIDER=anthropic LORE_LLM_MODEL=claude-sonnet-4-5-20250929 \
+  lore ask <agent> "..."        # tokens auto-refresh on use
+
+# Anthropic with a metered API key.
+LORE_PROVIDER=anthropic LORE_AUTH=key ANTHROPIC_API_KEY=sk-ant-... \
+  LORE_LLM_MODEL=claude-sonnet-4-5-20250929 lore ask <agent> "..."
+
+lore logout anthropic           # remove the stored credential
+```
+
+OAuth tokens are stored under `LORE_DATA/auth/<provider>.json` (`0600`, atomic
+write) and refreshed by Lore itself. `LORE_AUTH=key|subs` forces a mode; with it
+unset, Lore auto-detects (subscription if a stored OAuth credential exists, else
+an API key from `ANTHROPIC_API_KEY`/`LORE_LLM_KEY`).
+
+> **Fragility note:** subscription OAuth relies on provider constants (client id,
+> endpoints, the Claude Code identity/beta headers) that are **not officially
+> published for third-party use** and can change or be revoked. The metered
+> API-key path is the stable one. Anthropic's OAuth is scoped to Claude
+> Code/claude.ai — using it elsewhere may violate provider terms.
+
 ## HTTP service
 
 ```bash
@@ -160,7 +191,8 @@ internet = the trio of reverse proxy + `LORE_API_KEY` + rate limit.
   trust. Questions go to peers as `local:true`: they stay at depth 1, no loops.
 - **Log hygiene** — user text enters logs after newline sanitization (no log forging);
   internal errors are not leaked to the client (500 + generic message).
-- **Supply chain** — `cargo audit` on every CI run; 15 runtime dependencies.
+- **Supply chain** — `cargo audit` on every CI run; 16 runtime dependencies
+  (`sha2` added for the PKCE challenge in native OAuth login).
 
 | Endpoint | Description |
 |----------|----------|
@@ -200,6 +232,9 @@ cargo run -- message <kai> "sprint tomorrow" --from <aria> --kind tell   # inter
 cargo run -- deliberate "what should we do tomorrow"     # the whole team responds
 cargo run -- deliberate "make a decision" --synthesizer <id>   # the supervisor synthesizes
 cargo run -- board                              # shared board
+cargo run -- login anthropic                     # subscription OAuth login (native)
+cargo run -- auth                                # show provider credentials + status
+cargo run -- logout anthropic                    # remove a stored credential
 cargo run -- serve --addr 127.0.0.1:3777
 cargo run -- export --out backup.json           # export memory
 cargo run -- import backup.json                 # restore (ids preserved)

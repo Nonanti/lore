@@ -4,9 +4,11 @@
 //! the end-to-end loop with the deterministic [`MockModel`]; the real
 //! OpenAI-compatible client (including Ollama) will sit behind this trait in M4.
 
+mod anthropic;
 mod mock;
 mod openai;
 
+pub use anthropic::{AnthropicAuth, AnthropicModel};
 pub use mock::MockModel;
 pub use openai::OpenAiModel;
 

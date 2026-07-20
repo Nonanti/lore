@@ -5,10 +5,11 @@
 
 use clap::{Parser, Subcommand};
 use lore::{
-    Agent, AgentId, AppState, CalcTool, FileReadTool, HashingEmbedder, InMemoryStore,
-    KeywordRouter, Memory, MemoryGraph, MemoryStore, MessageKind, MockModel, Model, OpenAiModel,
-    Orchestrator, Party, Persona, PersonaPatch, Query, Scope, SemanticCat, SqliteStore, TimeTool,
-    ToolContext, ToolRegistry, WebFetchTool,
+    Agent, AgentId, AnthropicAuth, AnthropicModel, AppState, CalcTool, Credential, FileReadTool,
+    HashingEmbedder, InMemoryStore, KeywordRouter, Memory, MemoryGraph, MemoryStore, MessageKind,
+    MockModel, Model, OpenAiModel, Orchestrator, Party, Persona, PersonaPatch, Query,
+    RefreshingToken, Scope, SemanticCat, SqliteStore, TimeTool, TokenStore, ToolContext,
+    ToolRegistry, WebFetchTool,
 };
 use std::sync::Arc;
 
@@ -140,6 +141,22 @@ enum Cmd {
     },
     /// Introductory demo (identity + orchestration + memory).
     Demo,
+    /// Log in to a provider with a subscription (OAuth). Provider: `anthropic`.
+    Login {
+        /// Provider name (`anthropic`).
+        provider: String,
+        /// Use the paste-the-code flow instead of the browser loopback flow
+        /// (SSH/headless friendly).
+        #[arg(long)]
+        device: bool,
+    },
+    /// Remove a stored credential for a provider.
+    Logout {
+        /// Provider name (`anthropic`).
+        provider: String,
+    },
+    /// Show configured provider credentials and their status.
+    Auth,
     /// Export memory as JSON (live records; backup/migration).
     Export {
         /// Output file (defaults to stdout).
@@ -155,8 +172,101 @@ enum Cmd {
     Reembed,
 }
 
-/// Sets up the model: if LORE_LLM_BASE is set, uses OpenAI-compatible (Ollama); otherwise MockModel.
-fn build_model() -> Arc<dyn Model> {
+/// Optional response token cap (`LORE_LLM_MAX_TOKENS`).
+fn env_max_tokens() -> Option<u32> {
+    match std::env::var("LORE_LLM_MAX_TOKENS") {
+        Ok(mt) => match mt.parse::<u32>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                tracing::warn!(value = %mt, "LORE_LLM_MAX_TOKENS invalid, ignored");
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+/// Optional request timeout in seconds (`LORE_LLM_TIMEOUT`).
+fn env_timeout() -> Option<std::time::Duration> {
+    match std::env::var("LORE_LLM_TIMEOUT") {
+        Ok(to) => match to.parse::<u64>() {
+            Ok(n) if n > 0 => Some(std::time::Duration::from_secs(n)),
+            _ => {
+                tracing::warn!(value = %to, "LORE_LLM_TIMEOUT invalid, ignored");
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+/// Refresh closure for Anthropic subscription tokens.
+fn anthropic_refresh_fn() -> lore::auth::RefreshFn {
+    Box::new(|rt: String| Box::pin(async move { lore::auth::refresh_anthropic(&rt).await }))
+}
+
+/// Resolves Anthropic auth: `LORE_AUTH=key|subs` (default: subs if a stored
+/// OAuth credential exists, else an API key from `ANTHROPIC_API_KEY`/`LORE_LLM_KEY`).
+fn resolve_anthropic_auth(data: &str) -> Option<AnthropicAuth> {
+    let store = TokenStore::new(data);
+    let stored = store.load("anthropic").ok().flatten();
+    let mode = std::env::var("LORE_AUTH").ok();
+    let want_key = mode.as_deref() == Some("key");
+    let want_subs = mode.as_deref() == Some("subs");
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .or_else(|_| std::env::var("LORE_LLM_KEY"))
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+
+    // Explicit API-key mode, or a stored api-key credential.
+    if want_key {
+        return api_key.map(AnthropicAuth::ApiKey);
+    }
+    if let Some(Credential::ApiKey { key }) = &stored {
+        if !want_subs {
+            return Some(AnthropicAuth::ApiKey(key.clone()));
+        }
+    }
+    // Subscription (OAuth) from the token store.
+    if let Some(cred @ Credential::OAuth { .. }) = stored {
+        let refreshing = RefreshingToken::new(store, "anthropic", cred, anthropic_refresh_fn());
+        return Some(AnthropicAuth::OAuth(Arc::new(refreshing)));
+    }
+    // Fall back to an API key from the environment.
+    api_key.map(AnthropicAuth::ApiKey)
+}
+
+/// Builds an Anthropic model (subscription or API key).
+fn build_anthropic(data: &str) -> Arc<dyn Model> {
+    let name = std::env::var("LORE_LLM_MODEL").unwrap_or_else(|_| "claude-sonnet-4-5".into());
+    match resolve_anthropic_auth(data) {
+        Some(auth) => {
+            let mut m = AnthropicModel::new(name, auth);
+            if let Some(n) = env_max_tokens() {
+                m = m.with_max_tokens(n);
+            }
+            if let Some(d) = env_timeout() {
+                m = m.with_timeout(d);
+            }
+            Arc::new(m)
+        }
+        None => {
+            tracing::warn!(
+                "LORE_PROVIDER=anthropic but no credential found \
+                 (run `lore login anthropic` or set ANTHROPIC_API_KEY); using MockModel"
+            );
+            Arc::new(MockModel::new())
+        }
+    }
+}
+
+/// Sets up the model. `LORE_PROVIDER=anthropic` selects the Anthropic provider
+/// (subscription/API key); otherwise `LORE_LLM_BASE` uses the OpenAI-compatible
+/// path (incl. Ollama); with neither set, `MockModel`.
+fn build_model(data: &str) -> Arc<dyn Model> {
+    if std::env::var("LORE_PROVIDER").ok().as_deref() == Some("anthropic") {
+        return build_anthropic(data);
+    }
     match std::env::var("LORE_LLM_BASE") {
         Ok(base) => {
             let name = std::env::var("LORE_LLM_MODEL").unwrap_or_else(|_| "llama3.2".into());
@@ -166,19 +276,13 @@ fn build_model() -> Arc<dyn Model> {
             }
             // Optional response token limit. Low values on reasoning models may
             // spend the budget on thinking — use deliberately.
-            if let Ok(mt) = std::env::var("LORE_LLM_MAX_TOKENS") {
-                match mt.parse::<u32>() {
-                    Ok(n) if n > 0 => m = m.with_max_tokens(n),
-                    _ => tracing::warn!(value = %mt, "LORE_LLM_MAX_TOKENS invalid, ignored"),
-                }
+            if let Some(n) = env_max_tokens() {
+                m = m.with_max_tokens(n);
             }
             // Optional request timeout (seconds). Slow local models (e.g. 14B+
-            // on CPU) may exceed the default 120 s — can be increased. Invalid/0 is ignored.
-            if let Ok(to) = std::env::var("LORE_LLM_TIMEOUT") {
-                match to.parse::<u64>() {
-                    Ok(n) if n > 0 => m = m.with_timeout(std::time::Duration::from_secs(n)),
-                    _ => tracing::warn!(value = %to, "LORE_LLM_TIMEOUT invalid, ignored"),
-                }
+            // on CPU) may exceed the default 120 s — can be increased.
+            if let Some(d) = env_timeout() {
+                m = m.with_timeout(d);
             }
             Arc::new(m)
         }
@@ -249,7 +353,7 @@ fn build_state(data: &str) -> anyhow::Result<AppState> {
         ),
     };
     let mut app =
-        AppState::persistent(format!("{data}/agents"), store, build_model())?.with_tools(tools);
+        AppState::persistent(format!("{data}/agents"), store, build_model(data))?.with_tools(tools);
     // Security: if LORE_API_KEY is set, auth is mandatory; LORE_RATE_LIMIT caps requests per minute.
     if let Some(key) = parse_api_key(std::env::var("LORE_API_KEY").ok()) {
         app = app.with_api_key(key);
@@ -549,7 +653,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("[{:.3}] {}", m.score, m.summary);
             }
         }
-        Cmd::Demo => run_demo().await?,
+        Cmd::Demo => run_demo(&cli.data).await?,
+        Cmd::Login { provider, device } => login(&cli.data, &provider, device).await?,
+        Cmd::Logout { provider } => {
+            TokenStore::new(&cli.data).delete(&provider)?;
+            println!("🚪 logged out: {provider}");
+        }
+        Cmd::Auth => show_auth(&cli.data)?,
         Cmd::Export { out } => {
             let store = SqliteStore::open(&format!("{}/lore.db", cli.data))?;
             let mut mems = store.export().await?;
@@ -594,11 +704,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Introductory demo showcasing identity + orchestration + memory + tools + graph.
-async fn run_demo() -> anyhow::Result<()> {
+async fn run_demo(data: &str) -> anyhow::Result<()> {
     // Native embedder attached → recall is hybrid (keyword + cosine).
     let store: Arc<dyn MemoryStore> =
         Arc::new(InMemoryStore::new().with_embedder(Arc::new(HashingEmbedder::new())));
-    let model = build_model();
+    let model = build_model(data);
     match std::env::var("LORE_LLM_BASE") {
         Ok(base) => println!("🔌 Real model: {base}"),
         Err(_) => println!("🧪 MockModel (LORE_LLM_BASE not set)"),
@@ -739,8 +849,201 @@ async fn run_demo() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Interactive subscription login. Phase 1 supports Anthropic (Claude Pro/Max).
+async fn login(data: &str, provider: &str, device: bool) -> anyhow::Result<()> {
+    if provider != "anthropic" {
+        anyhow::bail!("unknown provider '{provider}' (supported: anthropic)");
+    }
+    let pkce = lore::auth::pkce();
+    let state = ulid::Ulid::new().to_string();
+    let outcome = if device {
+        login_anthropic_manual(&pkce, &state).await?
+    } else {
+        login_anthropic_loopback(&pkce, &state).await?
+    };
+    let cred = Credential::OAuth {
+        access: outcome.access,
+        refresh: outcome.refresh,
+        expires_ms: outcome.expires_ms,
+        account_id: None,
+    };
+    TokenStore::new(data).save(provider, &cred)?;
+    println!(
+        "✅ logged in to {provider} (subscription).\n   Use it: LORE_PROVIDER=anthropic \
+         LORE_LLM_MODEL=claude-sonnet-4-5 lore ask <agent> \"...\""
+    );
+    Ok(())
+}
+
+/// Paste-the-code flow (SSH/headless friendly).
+async fn login_anthropic_manual(
+    pkce: &lore::auth::Pkce,
+    state: &str,
+) -> anyhow::Result<lore::auth::OAuthOutcome> {
+    let redirect = lore::auth::ANTHROPIC_MANUAL_REDIRECT;
+    let url = lore::auth::anthropic_authorize_url(pkce, redirect, state);
+    println!("Open this URL, authorize, then paste the code shown:\n\n{url}\n");
+    print!("code: ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let (code, pasted_state) = lore::auth::split_manual_code(&line);
+    if code.is_empty() {
+        anyhow::bail!("no code entered");
+    }
+    let st = pasted_state.unwrap_or_else(|| state.to_string());
+    Ok(lore::auth::exchange_anthropic_code(&code, &st, &pkce.verifier, redirect).await?)
+}
+
+/// Browser loopback flow: open the URL, capture the `?code=` redirect locally.
+async fn login_anthropic_loopback(
+    pkce: &lore::auth::Pkce,
+    state: &str,
+) -> anyhow::Result<lore::auth::OAuthOutcome> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let redirect = format!("http://localhost:{port}/callback");
+    let url = lore::auth::anthropic_authorize_url(pkce, &redirect, state);
+    println!("Opening browser for authorization…\nIf it doesn't open, visit:\n\n{url}\n");
+    open_browser(&url);
+    println!("Waiting for the redirect on {redirect} … (Ctrl-C to cancel, or use --device)");
+    let (mut sock, _) = listener.accept()?;
+    let mut buf = [0u8; 8192];
+    let n = sock.read(&mut buf)?;
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let parsed = parse_callback_query(&req);
+    let body = match &parsed {
+        Some(_) => "<html><body>Lore: login complete. You can close this tab.</body></html>",
+        None => "<html><body>Lore: could not read the authorization code.</body></html>",
+    };
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = sock.write_all(resp.as_bytes());
+    let (code, got_state) =
+        parsed.ok_or_else(|| anyhow::anyhow!("could not parse code from redirect"))?;
+    let st = got_state.unwrap_or_else(|| state.to_string());
+    Ok(lore::auth::exchange_anthropic_code(&code, &st, &pkce.verifier, &redirect).await?)
+}
+
+/// Extracts `code` (and optional `state`) from an HTTP GET request line.
+fn parse_callback_query(req: &str) -> Option<(String, Option<String>)> {
+    let first = req.lines().next()?;
+    let path = first.split_whitespace().nth(1)?;
+    let query = path.split_once('?')?.1;
+    let mut code = None;
+    let mut state = None;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            let val = urldecode(v);
+            match k {
+                "code" => code = Some(val),
+                "state" => state = Some(val),
+                _ => {}
+            }
+        }
+    }
+    Some((code?, state))
+}
+
+/// Minimal percent-decoding for redirect query values.
+fn urldecode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                let hex = |c: u8| (c as char).to_digit(16);
+                match (hex(b[i + 1]), hex(b[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push((hi * 16 + lo) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Best-effort: opens `url` in the platform browser.
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "windows")]
+    let cmd = "explorer";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let cmd = "xdg-open";
+    let _ = std::process::Command::new(cmd)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Prints configured provider credentials and their status.
+fn show_auth(data: &str) -> anyhow::Result<()> {
+    let store = TokenStore::new(data);
+    let providers = store.list()?;
+    if providers.is_empty() {
+        println!("(no credentials — run `lore login anthropic`)");
+        return Ok(());
+    }
+    for p in &providers {
+        if let Some(c) = store.load(p)? {
+            let (kind, status) = match &c {
+                Credential::ApiKey { .. } => ("api-key", "configured".to_string()),
+                Credential::OAuth { expires_ms, .. } => {
+                    let mins = (*expires_ms - chrono::Utc::now().timestamp_millis()) / 60_000;
+                    let s = if c.is_expired(0) {
+                        "expired (auto-refresh on use)".to_string()
+                    } else {
+                        format!("valid (~{mins}m left)")
+                    };
+                    ("subscription", s)
+                }
+            };
+            println!("{p:<14} {kind:<14} {status}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn callback_query_parsing() {
+        let req = "GET /callback?code=abc%23xyz&state=st%20ate HTTP/1.1\r\nHost: x\r\n\r\n";
+        let (code, state) = super::parse_callback_query(req).unwrap();
+        assert_eq!(code, "abc#xyz");
+        assert_eq!(state.as_deref(), Some("st ate"));
+        assert!(super::parse_callback_query("GET /callback HTTP/1.1").is_none());
+    }
+
+    #[test]
+    fn urldecode_basics() {
+        assert_eq!(super::urldecode("a%2Bb"), "a+b");
+        assert_eq!(super::urldecode("a+b"), "a b");
+        assert_eq!(super::urldecode("plain"), "plain");
+        assert_eq!(super::urldecode("trailing%"), "trailing%");
+    }
+
     #[test]
     fn empty_api_key_is_rejected_not_open_door() {
         // L1: LORE_API_KEY="" was making auth an open door — passed with an empty header.
