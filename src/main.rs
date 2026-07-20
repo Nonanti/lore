@@ -921,17 +921,21 @@ async fn login(data: &str, provider: &str, device: bool) -> anyhow::Result<()> {
     let state = ulid::Ulid::new().to_string();
     let (outcome, hint) = match provider {
         "anthropic" => {
-            let o = if device {
-                login_anthropic_manual(&pkce, &state).await?
-            } else {
-                login_anthropic_loopback(&pkce, &state).await?
-            };
+            // Anthropic's public (Claude Code) client only accepts its console
+            // redirect, so a localhost/loopback redirect fails with "Invalid
+            // request format". The paste-the-code flow uses the registered
+            // redirect and is the reliable path.
+            let _ = device;
+            let o = login_anthropic_manual(&pkce, &state).await?;
             (
                 o,
                 "LORE_PROVIDER=anthropic LORE_LLM_MODEL=claude-sonnet-4-5-20250929",
             )
         }
         "openai" => {
+            if device {
+                anyhow::bail!("openai supports only the browser flow (drop --device)");
+            }
             let o = login_openai_loopback(&pkce, &state).await?;
             (o, "LORE_PROVIDER=openai LORE_LLM_MODEL=gpt-5")
         }
@@ -996,25 +1000,6 @@ async fn login_anthropic_manual(
     }
     let st = pasted_state.unwrap_or_else(|| state.to_string());
     Ok(lore::auth::exchange_anthropic_code(&code, &st, &pkce.verifier, redirect).await?)
-}
-
-/// Browser loopback flow: open the URL, capture the `?code=` redirect locally.
-/// The redirect uses `127.0.0.1` (not `localhost`) to match the bind on
-/// IPv6-first systems.
-async fn login_anthropic_loopback(
-    pkce: &lore::auth::Pkce,
-    state: &str,
-) -> anyhow::Result<lore::auth::OAuthOutcome> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    let redirect = format!("http://127.0.0.1:{port}/callback");
-    let url = lore::auth::anthropic_authorize_url(pkce, &redirect, state);
-    println!("Opening browser for authorization…\nIf it doesn't open, visit:\n\n{url}\n");
-    open_browser(&url);
-    println!("Waiting for the redirect on {redirect} … (Ctrl-C to cancel, or use --device)");
-    let (code, got_state) = wait_for_redirect(vec![listener]).await?;
-    verify_state(state, &got_state)?;
-    Ok(lore::auth::exchange_anthropic_code(&code, state, &pkce.verifier, &redirect).await?)
 }
 
 /// Rejects a callback whose `state` does not match what we sent (CSRF guard).
