@@ -118,6 +118,14 @@ impl Tool for CalcTool {
                 )))
             }
         };
+        // Non-finite results (inf, -inf, NaN) from overflow or invalid
+        // operations — returning the string "inf" would let an LLM treat it
+        // as a valid number.
+        if !result.is_finite() {
+            return Err(LoreError::InvalidInput(
+                "result is not a finite number".into(),
+            ));
+        }
         // If integer, write without decimal (if it fits in i64 range — float
         // representation on overflow).
         if result.fract() == 0.0 && result.abs() <= i64::MAX as f64 {
@@ -167,13 +175,19 @@ impl Tool for TimeTool {
     }
 }
 
+/// Maximum number of redirect hops the web tool will follow.
+const MAX_REDIRECT_HOPS: u32 = 5;
+
 /// Web tool: GETs a URL, returns the text with a size cap.
 /// HTTP(S) only; body is truncated at [`WEB_FETCH_CAP`]. Uses a shared client
 /// pool.
 ///
 /// SSRF protection: private/loopback/link-local addresses are blocked by
 /// default (preventing an LLM-driven tool from accessing the internal
-/// network/metadata endpoint).
+/// network/metadata endpoint).  **Every redirect hop** is re-checked —
+/// without this, `https://evil.com/jump → http://169.254.169.254/...` would
+/// bypass the initial-host check because reqwest follows redirects
+/// automatically.
 /// Use `with_private_allowed(true)` to fetch your own services.
 /// Note: DNS rebinding is out of scope (domain resolution belongs to reqwest);
 /// IP literals and known local names are blocked.
@@ -191,11 +205,13 @@ impl Default for WebFetchTool {
 
 impl WebFetchTool {
     /// New web tool (10s timeout, connection-pooled client;
-    /// private addresses blocked).
+    /// private addresses blocked; **redirects are followed manually** so
+    /// each hop can be SSRF-checked).
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("web tool client must be buildable"),
             allow_private: false,
@@ -207,9 +223,62 @@ impl WebFetchTool {
         self.allow_private = allow;
         self
     }
+
+    /// Validates that a URL's scheme and host pass SSRF checks.
+    fn validate_url(&self, url: &reqwest::Url) -> Result<()> {
+        if url.scheme() != "http" && url.scheme() != "https" {
+            return Err(LoreError::InvalidInput(
+                "only http(s) URLs can be fetched".into(),
+            ));
+        }
+        let host = url.host_str().unwrap_or("");
+        if !self.allow_private && is_private_host(host) {
+            return Err(LoreError::InvalidInput(
+                "private/local address blocked (SSRF protection)".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Follows redirects manually, checking each hop for SSRF.
+    /// Without this, a public URL could redirect to an internal endpoint
+    /// (e.g. `https://evil.com → http://169.254.169.254/`) and bypass the
+    /// initial-host check.
+    async fn follow_redirects(&self, start_url: reqwest::Url) -> Result<reqwest::Response> {
+        let mut current_url = start_url;
+        for _ in 0..MAX_REDIRECT_HOPS {
+            self.validate_url(&current_url)?;
+            let resp = self.client.get(current_url.clone()).send().await?;
+            let status = resp.status();
+            if !status.is_redirection() {
+                return Ok(resp);
+            }
+            // Extract Location header; relative URLs are resolved against
+            // the current URL via `Url::join`.
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| {
+                    LoreError::Model(format!("redirect without Location header ({status})"))
+                })?;
+            let next_url = current_url
+                .join(location)
+                .map_err(|e| LoreError::InvalidInput(format!("invalid redirect URL: {e}")))?;
+            current_url = next_url;
+        }
+        Err(LoreError::Model(format!(
+            "too many redirects (>{MAX_REDIRECT_HOPS})"
+        )))
+    }
 }
 
 /// Is the host private/loopback/link-local/reserved? (SSRF blocklist)
+///
+/// Covers: standard IPv4/IPv6 literals, `localhost`, decimal IPv4
+/// (`2130706433` = `127.0.0.1`), and IPv6-mapped v4.
+/// Domain names are not blocked — DNS resolution belongs to reqwest
+/// (rebinding is out of scope).
 fn is_private_host(host: &str) -> bool {
     let h = host.trim_matches(['[', ']']).to_ascii_lowercase();
     if h == "localhost" || h.ends_with(".localhost") {
@@ -232,19 +301,26 @@ fn is_private_host(host: &str) -> bool {
                     m.is_loopback() || m.is_private() || m.is_link_local()
                 })
         }
-        Err(_) => false, // domain name: resolution is in reqwest (see SSRF note)
-    }
-}
-
-/// Extracts the host component from a URL (userinfo/port/path are discarded).
-fn url_host(url: &str) -> &str {
-    let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    let after_auth = after_scheme.rsplit('@').next().unwrap_or(after_scheme);
-    if let Some(rest) = after_auth.strip_prefix('[') {
-        let end = rest.find(']').unwrap_or(rest.len());
-        &rest[..end]
-    } else {
-        after_auth.split([':', '/']).next().unwrap_or("")
+        Err(_) => {
+            // Host is not a parseable IP literal — could be a domain name
+            // or a non-standard IP representation.  Decimal IPv4 forms
+            // (e.g. `2130706433` = `127.0.0.1`) are resolved by system
+            // resolvers but bypass `parse::<IpAddr>()`.  Block them when
+            // the host consists entirely of ASCII digits.
+            if h.chars().all(|c| c.is_ascii_digit()) && !h.is_empty() {
+                if let Ok(d) = h.parse::<u32>() {
+                    let v4 = std::net::Ipv4Addr::from(d);
+                    return v4.is_loopback()
+                        || v4.is_private()
+                        || v4.is_link_local()
+                        || v4.is_unspecified()
+                        || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64;
+                }
+                // Overflow (e.g. >2^32) — treat as non-private domain;
+                // reqwest won't resolve it as an IP anyway.
+            }
+            false // domain name: resolution is in reqwest (see SSRF note)
+        }
     }
 }
 
@@ -263,21 +339,16 @@ impl Tool for WebFetchTool {
     }
 
     async fn run(&self, args: &str) -> Result<String> {
-        let url = args.trim();
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return Err(LoreError::InvalidInput(
-                "only http(s) URLs can be fetched".into(),
-            ));
-        }
-        if !self.allow_private && is_private_host(url_host(url)) {
-            return Err(LoreError::InvalidInput(
-                "private/local address blocked (SSRF protection)".into(),
-            ));
-        }
-        let resp = self.client.get(url).send().await?;
+        let url: reqwest::Url = args
+            .trim()
+            .parse()
+            .map_err(|e| LoreError::InvalidInput(format!("invalid URL: {e}")))?;
+        self.validate_url(&url)?;
+
+        let resp = self.follow_redirects(url).await?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(LoreError::NotFound(format!("web: 404 ({url})")));
+            return Err(LoreError::NotFound("web: 404".into()));
         }
         if !status.is_success() {
             return Err(LoreError::Model(format!("web: {status}")));
@@ -432,6 +503,14 @@ mod tests {
                     '*' => a * b,
                     _ => a / b,
                 };
+                // Skip test cases that produce non-finite results (now an
+                // error instead of a string like "inf").
+                if !expected.is_finite() {
+                    let args_str = format!("{a} {op} {b}");
+                    let res = rt.block_on(c.run(&args_str));
+                    prop_assert!(res.is_err(), "non-finite should error: {args_str}");
+                    return Ok(());
+                }
                 for args in [
                     format!("{a} {op} {b}"),
                     format!("{a}{op}{b}"),
@@ -456,8 +535,15 @@ mod tests {
         assert!(c.run("single number 5").await.is_err());
         // Two numbers without operator: explicit error instead of silent sum.
         assert!(c.run("5 5").await.is_err());
-        // Overflowing integer result: not saturated to i64::MAX, float value
-        // is written.
+        // Overflowing result: now returns an error (non-finite) instead of
+        // the string "inf" which an LLM could interpret as a number.
+        assert!(
+            c.run("1e308 * 10").await.is_err(),
+            "overflow must error, not return 'inf'"
+        );
+        // NaN from 0/0-style paths.
+        assert!(c.run("0 * 1e999").await.is_err(), "NaN must error");
+        // Finite large result still works (1e300 * 1e2 = 1e302).
         let big = c.run("1e300 * 1e2").await.unwrap();
         assert_ne!(big, i64::MAX.to_string(), "no saturation");
         assert!(big.len() > 20, "actual magnitude preserved: {big}");
@@ -516,6 +602,47 @@ mod native_tools_tests {
         );
     }
 
+    // ── WebFetchTool: SSRF redirect bypass ───────────────────────────────
+    // A test server redirects to a loopback address; without per-hop checks
+    // the redirect would bypass SSRF protection.
+    #[tokio::test]
+    async fn web_fetch_blocks_redirect_to_private() {
+        use axum::http::StatusCode;
+        use axum::{routing::get, Router};
+
+        // Target server on loopback that returns "secret metadata".
+        let target_app = Router::new().route("/secret", get(|| async { "secret metadata" }));
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(target_listener, target_app).await.unwrap() });
+
+        // Gateway server on loopback that 302-redirects to the target.
+        let redirect_url = format!("http://127.0.0.1:{}/secret", target_addr.port());
+        let gw_app = Router::new().route(
+            "/jump",
+            get(move || {
+                let loc = redirect_url.clone();
+                async move { (StatusCode::FOUND, [("location", loc)], "") }
+            }),
+        );
+        let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_addr = gw_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(gw_listener, gw_app).await.unwrap() });
+
+        // Without allow_private, both initial URL (loopback) and redirect
+        // target (loopback) must be blocked.
+        let t = WebFetchTool::new(); // allow_private = false
+        assert!(
+            t.run(&format!("http://{gw_addr}/jump")).await.is_err(),
+            "redirect to private must be blocked"
+        );
+
+        // With allow_private, both hops pass SSRF and we get content.
+        let t_priv = WebFetchTool::new().with_private_allowed(true);
+        let out = t_priv.run(&format!("http://{gw_addr}/jump")).await.unwrap();
+        assert!(out.contains("secret metadata"), "allowed: {out}");
+    }
+
     // ── FileReadTool ─────────────────────────────────────────────────────
     #[tokio::test]
     async fn file_read_sandboxed_to_root() {
@@ -562,5 +689,71 @@ mod file_root_tests {
         let out = t.run("a.txt").await.unwrap();
         assert!(out.contains("hello"));
         std::fs::remove_dir_all(root.ancestors().nth(3).unwrap()).ok();
+    }
+}
+
+#[cfg(test)]
+mod ssrf_unit_tests {
+    use super::*;
+
+    #[test]
+    fn is_private_host_blocks_decimal_ipv4() {
+        // 2130706433 = 127.0.0.1 in decimal form.
+        assert!(is_private_host("2130706433"));
+        // 2851995690 = 169.254.169.254 (AWS metadata endpoint).
+        assert!(is_private_host("2851995690"));
+        // 3232235521 = 192.168.0.1 (private).
+        assert!(is_private_host("3232235521"));
+        // 167772161 = 10.0.0.1 (private).
+        assert!(is_private_host("167772161"));
+        // A public decimal IP: 3627725953 ≈ 216.58.217.23.
+        assert!(!is_private_host("3627725953"));
+        // Regular domain names are not blocked.
+        assert!(!is_private_host("example.com"));
+        // Standard IP forms still work.
+        assert!(is_private_host("127.0.0.1"));
+        assert!(is_private_host("10.0.0.1"));
+        assert!(is_private_host("192.168.1.1"));
+        assert!(is_private_host("169.254.169.254"));
+        assert!(!is_private_host("8.8.8.8"));
+    }
+
+    #[test]
+    fn is_private_host_blocks_localhost_variants() {
+        assert!(is_private_host("localhost"));
+        assert!(is_private_host("sub.localhost"));
+        assert!(!is_private_host("example.com"));
+    }
+
+    #[test]
+    fn is_private_host_blocks_ipv6_private() {
+        assert!(is_private_host("::1"));
+        assert!(is_private_host("fc00::1"));
+        assert!(is_private_host("fe80::1"));
+        // IPv6-mapped IPv4 loopback.
+        assert!(is_private_host("::ffff:127.0.0.1"));
+    }
+
+    #[test]
+    fn calc_overflow_returns_error() {
+        let c = CalcTool::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        // 1e308 * 10 overflows to inf.
+        assert!(
+            rt.block_on(c.run("1e308 * 10")).is_err(),
+            "overflow must error"
+        );
+        // Negative overflow.
+        assert!(
+            rt.block_on(c.run("-1e308 * 10")).is_err(),
+            "negative overflow must error"
+        );
+        // NaN from 0 * inf (indirect path).
+        assert!(rt.block_on(c.run("0 * 1e999")).is_err(), "NaN must error");
+        // Normal large-but-finite result still works.
+        let big = rt.block_on(c.run("1e300 * 1e2")).unwrap();
+        assert!(big.len() > 20, "actual magnitude preserved: {big}");
     }
 }
