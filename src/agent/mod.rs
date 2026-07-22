@@ -339,7 +339,8 @@ impl Agent {
         let catalog = catalog(&ctx.registry);
 
         // Prior procedures: both dedup candidates and (if proven) hints.
-        let priors = self
+        // A recall failure is logged but not fatal — solve proceeds without priors.
+        let priors = match self
             .recall(
                 &Query::new(input)
                     .tier(Tier::Procedural)
@@ -347,7 +348,13 @@ impl Agent {
                     .limit(SOLVE_PRIOR_LIMIT),
             )
             .await
-            .unwrap_or_default();
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "solve: prior procedures could not be recalled");
+                Vec::new()
+            }
+        };
         let mut hints: Vec<String> = Vec::new();
         let mut injected: Vec<MemoryId> = Vec::new();
         for p in &priors {
@@ -567,14 +574,21 @@ impl Agent {
         // Reasoning fallback (empty content → chain of thought): the user sees
         // the full text, but raw CoT is NOT written to memory — it is stored trimmed
         // (preventing context pollution + prompt bloat on subsequent recalls).
+        // A memory write failure does NOT lose the response — logged and continued
+        // (consistent with think_stream, where post-stream memory errors are also
+        // non-fatal: the user already received the answer).
         if completion.reasoning_fallback {
             let mut capped: String = completion.text.chars().take(REASONING_MEMORY_CAP).collect();
             if completion.text.chars().count() > REASONING_MEMORY_CAP {
                 capped.push('…');
             }
-            self.remember_exchange(input, &capped).await?;
+            if let Err(e) = self.remember_exchange(input, &capped).await {
+                tracing::warn!(error = %e, "post-respond memory could not be saved");
+            }
         } else {
-            self.remember_exchange(input, &completion.text).await?;
+            if let Err(e) = self.remember_exchange(input, &completion.text).await {
+                tracing::warn!(error = %e, "post-respond memory could not be saved");
+            }
         }
         Ok(completion.text)
     }
@@ -1522,6 +1536,100 @@ mod reflect_category_tests {
         assert!(
             !statement.contains("PREFERENCE"),
             "marker line extracted from sentence: {statement}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod think_resilience_tests {
+    use super::*;
+    use crate::memory::InMemoryStore;
+    use crate::model::MockModel;
+
+    /// Memory store that accepts reads but fails all writes (remember/reinforce).
+    /// Simulates a persistent storage outage while retrieval still works.
+    struct FailWriteStore {
+        inner: InMemoryStore,
+    }
+    impl FailWriteStore {
+        fn new() -> Self {
+            Self {
+                inner: InMemoryStore::new(),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl MemoryStore for FailWriteStore {
+        async fn remember(&self, _mem: Memory) -> Result<MemoryId> {
+            Err(LoreError::Storage("write disabled".into()))
+        }
+        async fn recall(&self, scope: &Scope, query: &Query) -> Result<Vec<Scored<Memory>>> {
+            self.inner.recall(scope, query).await
+        }
+        async fn get(&self, id: &MemoryId) -> Result<Option<Memory>> {
+            self.inner.get(id).await
+        }
+        async fn forget(&self, _id: &MemoryId) -> Result<()> {
+            Err(LoreError::Storage("write disabled".into()))
+        }
+        async fn reinforce(&self, _id: &MemoryId, _outcome: Outcome) -> Result<()> {
+            Err(LoreError::Storage("write disabled".into()))
+        }
+        async fn reinforce_many(&self, _ids: &[MemoryId], _outcome: Outcome) -> Result<()> {
+            Err(LoreError::Storage("write disabled".into()))
+        }
+        async fn count(&self, scope: &Scope) -> Result<usize> {
+            self.inner.count(scope).await
+        }
+        async fn consolidate(&self) -> Result<crate::memory::ConsolidationReport> {
+            Err(LoreError::Storage("write disabled".into()))
+        }
+        async fn export(&self) -> Result<Vec<Memory>> {
+            self.inner.export().await
+        }
+    }
+
+    fn agent_with_fail_store(name: &str) -> Agent {
+        let store: Arc<dyn MemoryStore> = Arc::new(FailWriteStore::new());
+        let persona = Persona::new(name, "researcher").with_trait("curious");
+        Agent::new(persona, store, Arc::new(MockModel::new()))
+    }
+
+    #[tokio::test]
+    async fn respond_returns_answer_when_memory_write_fails() {
+        // A storage failure in remember_exchange must not lose the
+        // entire response: the answer is returned regardless — only a warn is logged.
+        let agent = agent_with_fail_store("Aria");
+        let reply = agent.respond("hello").await.unwrap();
+        assert!(
+            !reply.is_empty(),
+            "answer must be returned even when memory fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn respond_returns_answer_on_reasoning_fallback_when_memory_write_fails() {
+        // Reasoning-fallback branch too: capped CoT memory write fails,
+        // but the full text still reaches the user.
+        struct ReasoningModel;
+        #[async_trait::async_trait]
+        impl Model for ReasoningModel {
+            async fn complete(&self, _p: &Prompt) -> Result<crate::model::Completion> {
+                Ok(crate::model::Completion::reasoning_fallback(
+                    "full CoT text",
+                ))
+            }
+        }
+        let store: Arc<dyn MemoryStore> = Arc::new(FailWriteStore::new());
+        let agent = Agent::new(
+            Persona::new("Aria", "researcher").with_trait("curious"),
+            store,
+            Arc::new(ReasoningModel),
+        );
+        let reply = agent.respond("deep question").await.unwrap();
+        assert_eq!(
+            reply, "full CoT text",
+            "user sees full text despite memory failure"
         );
     }
 }

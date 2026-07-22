@@ -811,7 +811,7 @@ async fn run_demo(data: &str) -> anyhow::Result<()> {
 
     // Kai knows something.
     orch.agent(&kai_id)
-        .unwrap()
+        .ok_or_else(|| anyhow::anyhow!("agent not found: {kai_id}"))?
         .experience(
             "learned the async model",
             "async tasks are spawned with tokio, messaging via mpsc",
@@ -851,7 +851,7 @@ async fn run_demo(data: &str) -> anyhow::Result<()> {
         println!("\n🗂️  {name}'s mind:");
         for r in orch
             .agent(id)
-            .unwrap()
+            .ok_or_else(|| anyhow::anyhow!("agent not found: {id}"))?
             .recall(&Query::new("").limit(4))
             .await?
         {
@@ -861,7 +861,7 @@ async fn run_demo(data: &str) -> anyhow::Result<()> {
 
     // --- Semantic recall: keyword tutmasa da morfolojiyi yakala ---
     orch.agent(&kai_id)
-        .unwrap()
+        .ok_or_else(|| anyhow::anyhow!("agent not found: {kai_id}"))?
         .remember(Memory::semantic(
             Scope::World, // remember() pulls into Kai's scope
             "interest in mathematics",
@@ -871,7 +871,7 @@ async fn run_demo(data: &str) -> anyhow::Result<()> {
     println!("\n🔎 Kai semantic recall(\"mathematics\") — no keyword match, cosine catches it:");
     for r in orch
         .agent(&kai_id)
-        .unwrap()
+        .ok_or_else(|| anyhow::anyhow!("agent not found: {kai_id}"))?
         .recall(&Query::new("matematik").semantic())
         .await?
     {
@@ -903,7 +903,9 @@ async fn run_demo(data: &str) -> anyhow::Result<()> {
     );
 
     // --- Knowledge graph: relationships in Kai's memory ---
-    let kai_ref = orch.agent(&kai_id).unwrap();
+    let kai_ref = orch
+        .agent(&kai_id)
+        .ok_or_else(|| anyhow::anyhow!("agent not found: {kai_id}"))?;
     let kg = MemoryGraph::from_store(kai_ref.memory.as_ref(), &kai_ref.scope()).await?;
     println!(
         "\n🕸️  Kai knowledge graph: {} nodes, {} entities",
