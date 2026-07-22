@@ -8,6 +8,12 @@ Lore gives AI agents a persistent **identity** (persona) and a personal **memory
 **manages them together** in a community. The two things that make an agent *that* agent —
 who it is and what it has experienced — come together here.
 
+![Lore demo — identity, orchestration, memory](demo.gif)
+
+*Create an agent → teach it a fact → it answers using its memory → semantic recall
+(`lore recall --semantic`). Recorded against a local Ollama model; `lore demo` also
+runs fully offline on the built-in MockModel — no API key needed.*
+
 ## Why?
 
 A stateless LLM starts every conversation from scratch. By giving the agent a memory that
