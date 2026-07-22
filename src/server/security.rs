@@ -20,9 +20,36 @@ const DEFAULT_RETRY_AFTER_SECS: u64 = 60;
 
 /// Auth + rate-limit middleware. Error responses have JSON bodies and standard
 /// headers (`WWW-Authenticate` / `Retry-After`).
+///
+/// Failed auth is rate-limited BEFORE the 401 response — brute-force attempts
+/// on the API key are throttled per client IP ("fail:{ip}" key in the hits table).
+/// This prevents an attacker from sending unlimited invalid keys, which would
+/// bypass the normal key-based rate limit entirely.
 pub(super) async fn security_mw(State(st): State<AppState>, req: Request, next: Next) -> Response {
     let provided = extract_key(req.headers());
+    // Failed auth: apply IP-based fail-rate BEFORE returning 401.
+    // Without this, an attacker could brute-force the API key with unlimited
+    // requests (the normal rate limit never fires because auth rejects early).
     if !st.authorized(provided.as_deref()) {
+        let ip = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip().to_string())
+            .unwrap_or_else(|| "anon".to_string());
+        let fail_key = format!("fail:{ip}");
+        if !st.allow_fail(&fail_key) {
+            let retry = st
+                .fail_rate
+                .map(|r| r.per.as_secs())
+                .unwrap_or(DEFAULT_RETRY_AFTER_SECS)
+                .to_string();
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, retry)],
+                Json(serde_json::json!({ "error": "rate limit exceeded" })),
+            )
+                .into_response();
+        }
         return (
             StatusCode::UNAUTHORIZED,
             [(header::WWW_AUTHENTICATE, "Bearer")],

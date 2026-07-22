@@ -146,6 +146,10 @@ pub struct AppState {
     pub(super) api_key: Option<String>,
     /// If set, fixed-window rate limit per key/client.
     pub(super) rate: Option<RateLimit>,
+    /// Stricter rate limit for failed auth attempts (per client IP). Applied
+    /// BEFORE the 401 response so brute-force attacks cannot bypass the normal
+    /// rate limit by sending invalid keys. Defaults to 1/10 of the main rate.
+    pub(super) fail_rate: Option<RateLimit>,
     /// Federation peers (base URLs of other Lore nodes).
     pub(super) peers: Vec<String>,
     /// Session table hard cap (default [`MAX_SESSIONS`]; can be reduced in tests).
@@ -271,6 +275,7 @@ impl AppState {
             tools: None,
             api_key: None,
             rate: None,
+            fail_rate: None,
             peers: Vec::new(),
             session_cap: MAX_SESSIONS,
             max_agents: MAX_AGENTS,
@@ -321,8 +326,25 @@ impl AppState {
     }
 
     /// `max` requests / `per_secs` seconds fixed-window rate limit (builder).
+    /// Also sets a default fail-rate (1/10 of the main rate) to throttle
+    /// brute-force auth attempts — can be overridden with `with_fail_rate_limit`.
     pub fn with_rate_limit(mut self, max: u32, per_secs: u64) -> Self {
         self.rate = Some(RateLimit {
+            max,
+            per: Duration::from_secs(per_secs),
+        });
+        // Default fail-rate: 1/10 of main max, same window (clamped to >=1).
+        self.fail_rate = Some(RateLimit {
+            max: (max / 10).max(1),
+            per: Duration::from_secs(per_secs),
+        });
+        self
+    }
+
+    /// Explicit fail-rate override (builder). When set, failed auth attempts
+    /// from a single IP are throttled independently of the main rate limit.
+    pub fn with_fail_rate_limit(mut self, max: u32, per_secs: u64) -> Self {
+        self.fail_rate = Some(RateLimit {
             max,
             per: Duration::from_secs(per_secs),
         });
@@ -344,12 +366,12 @@ impl AppState {
     }
 
     /// Does the rate limit allow the request? (Always yes when not configured.)
-    pub(super) fn allow(&self, key: &str) -> bool {
-        let Some(rl) = self.rate else {
-            return true;
-        };
+    /// `rl` overrides the stored `self.rate` — allows checking the fail-rate
+    /// table with the same logic while using a different limit config.
+    pub(super) fn allow_with(&self, key: &str, rl: &RateLimit) -> bool {
         let now = Instant::now();
-        let mut hits = self.hits.lock().unwrap();
+        // Poison recovery: a panicked thread must not kill the entire service.
+        let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         // If the table has grown, evict expired windows (memory DoS mitigation).
         if hits.len() > HITS_EVICT_THRESHOLD {
             hits.retain(|_, w| now.duration_since(w.start) <= rl.per);
@@ -367,6 +389,22 @@ impl AppState {
         }
         w.count += 1;
         true
+    }
+
+    /// Convenience: check against the default rate limit.
+    pub(super) fn allow(&self, key: &str) -> bool {
+        let Some(rl) = self.rate else {
+            return true;
+        };
+        self.allow_with(key, &rl)
+    }
+
+    /// Convenience: check against the fail-rate limit.
+    pub(super) fn allow_fail(&self, key: &str) -> bool {
+        let Some(rl) = self.fail_rate else {
+            return true;
+        };
+        self.allow_with(key, &rl)
     }
 
     pub(super) fn view(a: &Agent) -> AgentView {
@@ -468,7 +506,7 @@ impl AppState {
 
     /// Records a request's route-based latency into the histogram.
     pub(super) fn record_latency(&self, route: &str, ms: u64) {
-        let mut map = self.latency.lock().expect("latency mutex");
+        let mut map = self.latency.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(route.to_string()).or_default().record(ms);
     }
 
@@ -542,7 +580,7 @@ impl AppState {
 
         out.push_str("# HELP lore_http_request_duration_ms HTTP request duration (per route)\n");
         out.push_str("# TYPE lore_http_request_duration_ms histogram\n");
-        let map = self.latency.lock().expect("latency mutex");
+        let map = self.latency.lock().unwrap_or_else(|e| e.into_inner());
         let mut routes: Vec<&String> = map.keys().collect();
         routes.sort(); // deterministic output (testable + diffable)
         for r in routes {

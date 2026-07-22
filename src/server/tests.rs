@@ -412,6 +412,31 @@ fn rate_limit_logic() {
     assert!(st.allow("b"), "other client independent");
 }
 
+#[test]
+fn fail_rate_limit_logic() {
+    // Fail-rate is independent of the main rate: a different max/window applies
+    // to "fail:{ip}" keys. Default is 1/10 of the main rate.
+    let st = state().with_rate_limit(20, 60);
+    // Default fail-rate: 20/10 = 2 per 60s.
+    let fail_key = "fail:127.0.0.1";
+    assert!(st.allow_fail(fail_key));
+    assert!(st.allow_fail(fail_key));
+    assert!(!st.allow_fail(fail_key), "3rd fail-rate request rejected");
+    // Main rate limit for valid keys is separate.
+    assert!(st.allow("valid-key"), "main limit unaffected");
+}
+
+#[test]
+fn explicit_fail_rate_override() {
+    // Builder allows overriding the default 1/10 ratio.
+    let st = state().with_rate_limit(100, 60).with_fail_rate_limit(5, 60);
+    let fail_key = "fail:127.0.0.1";
+    for _ in 0..5 {
+        assert!(st.allow_fail(fail_key));
+    }
+    assert!(!st.allow_fail(fail_key), "6th fail-rate request rejected");
+}
+
 #[tokio::test]
 async fn observability_request_id_ready_and_histogram() {
     // Phase 1 observability contract: every response carries x-request-id,
@@ -530,6 +555,55 @@ async fn http_auth_and_rate_limit() {
         .await
         .unwrap();
     assert_eq!(third.status().as_u16(), 429, "rate limit exceeded");
+}
+
+#[tokio::test]
+async fn failed_auth_is_rate_limited_per_ip() {
+    // Without the fail-rate, brute-force auth attempts would bypass the
+    // key-based rate limit entirely (401 returned before rate check).
+    // Failed auth from a single IP is throttled independently.
+    let st = state()
+        .with_api_key("secret")
+        .with_rate_limit(20, 60)
+        .with_fail_rate_limit(2, 60);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st);
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Two failed auth attempts -> 401 each (within fail-rate limit of 2).
+    for _ in 0..2 {
+        let resp = client
+            .get(format!("{base}/agents"))
+            .header("x-api-key", "wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 401, "failed auth returns 401");
+    }
+
+    // Third failed auth attempt from same IP -> 429 (fail-rate exceeded).
+    let blocked = client
+        .get(format!("{base}/agents"))
+        .header("x-api-key", "wrong")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status().as_u16(), 429, "fail-rate exceeded -> 429");
+
+    // Valid key still works: fail-rate is per IP for invalid attempts only;
+    // the normal key-based rate limit is separate.
+    let ok = client
+        .get(format!("{base}/agents"))
+        .header("x-api-key", "secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status().as_u16(), 200, "valid key still allowed");
 }
 
 #[tokio::test]

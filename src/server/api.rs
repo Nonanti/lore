@@ -281,7 +281,16 @@ async fn ask_stream_h(
     let events = chunks
         .map(|r| match r {
             // \r cannot be carried in SSE (axum panics) — stripped out.
-            Ok(t) => Event::default().data(t.replace('\r', "")),
+            Ok(t) => {
+                // \r cannot be carried in SSE (axum panics) — stripped only when
+                // present to avoid allocating a new String on every chunk (hot path).
+                let data = if t.contains('\r') {
+                    t.replace('\r', "")
+                } else {
+                    t
+                };
+                Event::default().data(data)
+            }
             Err(e) => {
                 tracing::error!(error = %e, "stream error");
                 Event::default().event("error").data("stream interrupted")
@@ -422,7 +431,11 @@ async fn deliberate_ws(st: AppState, mut socket: WebSocket) {
         _ => return,
     };
     if let Err(e) = st.board_note("Question", question.clone()).await {
+        // Inform the client why the connection is closing (silent drops are
+        // hard to debug from the client side).
         tracing::warn!(error = %e, "ws deliberate: board note could not be written");
+        let err_frame = serde_json::json!({"error": "board note failed"}).to_string();
+        let _ = socket.send(WsMsg::Text(err_frame)).await;
         return;
     }
     // Replies are collected IN PARALLEL and streamed as soon as ready — serial waiting
