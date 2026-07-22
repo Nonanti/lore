@@ -212,8 +212,27 @@ impl TokenStore {
         set_owner_only(&self.dir, 0o700)?;
         let json = serde_json::to_string_pretty(cred)?;
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, json).map_err(|e| LoreError::Storage(e.to_string()))?;
-        set_owner_only(&tmp, 0o600)?;
+        // Create the tmp file with restrictive permissions from the start —
+        // no umask window where the credential is world-readable.
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .map_err(|e| LoreError::Storage(e.to_string()))?;
+            f.write_all(json.as_bytes())
+                .map_err(|e| LoreError::Storage(e.to_string()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&tmp, json).map_err(|e| LoreError::Storage(e.to_string()))?;
+            set_owner_only(&tmp, 0o600)?;
+        }
         std::fs::rename(&tmp, &path).map_err(|e| LoreError::Storage(e.to_string()))?;
         Ok(())
     }

@@ -123,7 +123,16 @@ impl SqliteStore {
             while let Some(row) = rows.next().map_err(sqlite_err)? {
                 let id: String = row.get(0).map_err(sqlite_err)?;
                 let data: String = row.get(1).map_err(sqlite_err)?;
-                let mem: Memory = serde_json::from_str(&data)?;
+                // A single corrupt JSON row should not kill the entire
+                // migration — skip and warn, consistent with the persona
+                // policy where one bad record does not stop the service.
+                let mem: Memory = match serde_json::from_str(&data) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(id = %id, error = %e, "skipping corrupt row during v1→v2 migration");
+                        continue;
+                    }
+                };
                 let (slim, emb, stext) = Self::encode_row(&mem)?;
                 tx.execute(
                     "UPDATE memories SET data = ?1, search_text = ?2, emb = ?3 WHERE id = ?4",
@@ -207,7 +216,10 @@ impl SqliteStore {
     {
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || {
-            let mut conn = conn.lock().expect("mutex");
+            // Recover from poisoned mutex: a panic in a previous critical
+            // section leaves the data intact; abandoning the lock would make
+            // the store permanently unusable.
+            let mut conn = conn.lock().unwrap_or_else(|e| e.into_inner());
             f(&mut conn)
         })
         .await
@@ -221,7 +233,8 @@ impl SqliteStore {
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         let sig = embedder.signature();
         {
-            let conn = self.conn.lock().expect("mutex");
+            // Recover from poisoned mutex (see `blocking` for rationale).
+            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
             match Self::meta_get(&conn, "embedder") {
                 Ok(Some(stored)) if stored != sig => {
                     tracing::warn!(
@@ -304,7 +317,8 @@ impl SqliteStore {
 
     /// Total row count (including soft-deleted; for diagnostics/testing).
     pub fn total_rows(&self) -> Result<usize> {
-        let conn = self.conn.lock().expect("mutex");
+        // Recover from poisoned mutex (see `blocking` for rationale).
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
             .map_err(sqlite_err)?;
@@ -1267,6 +1281,66 @@ mod tests {
         );
         assert_eq!(store.total_rows().unwrap(), 1); // soft-delete: row stays
         assert_eq!(store.count(&s).await.unwrap(), 0); // live count: deleted dropped
+    }
+
+    #[tokio::test]
+    async fn v1_migration_skips_corrupt_rows_and_keeps_good() {
+        // A v1 DB with corrupt JSON in one row should NOT kill the migration.
+        // The corrupt row is skipped (warned); valid rows are preserved.
+        let tmp = TmpDb::new();
+        let _e = HashingEmbedder::new();
+        let s = scope();
+        {
+            let conn = Connection::open(&tmp.0).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE memories (
+                    id TEXT PRIMARY KEY, scope_agent TEXT, is_world INTEGER NOT NULL,
+                    tier TEXT NOT NULL, deleted INTEGER NOT NULL, data TEXT NOT NULL);
+                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+            // Good row: valid JSON memory.
+            let good = Memory::semantic(s.clone(), "Rust is fast", SemanticCat::Fact);
+            let agent = match &good.scope {
+                Scope::Agent(a) => Some(a.to_string()),
+                Scope::World => None,
+            };
+            conn.execute(
+                "INSERT INTO memories (id, scope_agent, is_world, tier, deleted, data)
+                 VALUES (?1, ?2, 0, 'Semantic', 0, ?3)",
+                params![
+                    good.id.to_string(),
+                    agent,
+                    serde_json::to_string(&good).unwrap()
+                ],
+            )
+            .unwrap();
+            // Corrupt row: invalid JSON that cannot deserialize to Memory.
+            conn.execute(
+                "INSERT INTO memories (id, scope_agent, is_world, tier, deleted, data)
+                 VALUES ('corrupt-id', 'bad-agent', 0, 'Semantic', 0, '{not valid json!!!')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Migration completes (does not panic / return Err).
+        let store = SqliteStore::open(&tmp.0).unwrap();
+        // Good row is preserved and searchable via FTS.
+        let hits = store.recall(&s, &Query::new("rust")).await.unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "valid row preserved after migration with corrupt neighbor"
+        );
+        // Corrupt row was NOT updated (still has old data, no search_text);
+        // it stays in the DB but decode_row will fail on recall — that is
+        // acceptable: the row is effectively inert (no FTS match).
+        assert_eq!(
+            store.total_rows().unwrap(),
+            2,
+            "both rows still exist in DB"
+        );
     }
 
     #[tokio::test]
