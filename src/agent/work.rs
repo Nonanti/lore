@@ -49,9 +49,18 @@ pub struct WorkReport {
 }
 
 impl WorkSpec {
-    /// New spec with explicit verify commands (required — empty verify means
-    /// "no verification"; use `solve` for single-shot tasks).
+    /// New spec with explicit verify commands.
+    ///
+    /// `verify` must be non-empty — a work loop without verification commands
+    /// cannot meaningfully declare success. Use `Agent::solve` for single-shot
+    /// tasks that don't need external verification. For auto-detected verify
+    /// commands (which may legitimately be empty), see `WorkSpec::for_workspace`.
     pub fn new(goal: impl Into<String>, workspace: PathBuf, verify: Vec<String>) -> Result<Self> {
+        if verify.is_empty() {
+            return Err(LoreError::InvalidInput(
+                "verify commands required for work loop; use solve for single-shot tasks".into(),
+            ));
+        }
         let workspace = workspace
             .canonicalize()
             .map_err(|e| LoreError::InvalidInput(format!("workspace does not exist: {e}")))?;
@@ -350,6 +359,10 @@ mod tests {
 
         // Verify always fails (exit 1) — we test that the failure tail
         // appears in the second solve input.
+        // Note: captured_inputs is indexed one entry per iteration because the
+        // scripted model makes exactly one complete() call per solve() invocation
+        // (no tool calls). If tests are extended with tool-using models, this
+        // assumption breaks.
         let spec = WorkSpec::new("do something", root.clone(), vec!["exit 1".to_string()])
             .unwrap()
             .with_max_iterations(2);
@@ -717,33 +730,48 @@ mod tests {
         cleanup(&root);
     }
 
-    /// Empty verify via `WorkSpec::new()`: the implementation treats empty
-    /// verify as vacuously true (all_passed = true), so work() succeeds on
-    /// first iteration. This documents the actual behavior — the spec says
-    /// `new` should reject empty verify with InvalidInput, but the
-    /// implementation intentionally allows it (matching `for_workspace`
-    /// which can produce empty verify).
+    /// Empty verify via `WorkSpec::new()` is now rejected with InvalidInput.
+    /// But `for_workspace` can legitimately produce empty verify (no project
+    /// files detected), and `work()` treats that as vacuously true.
     #[tokio::test]
-    async fn work_empty_verify_succeeds_vacuously() {
-        let root = make_temp_dir("empty-verify");
+    async fn work_empty_verify_from_for_workspace_succeeds_vacuously() {
+        let root = make_temp_dir("empty-verify-fw");
         let model = Arc::new(ScriptedModel::new(&["done"]));
         let agent = agent_with_model(model);
 
-        // WorkSpec::new with empty verify — currently accepted.
-        let spec = WorkSpec::new("task", root.clone(), vec![])
+        // for_workspace on a dir with no project files → empty verify → vacuously true.
+        let spec = WorkSpec::for_workspace("task", root.clone())
             .unwrap()
             .with_max_iterations(3);
+        assert!(spec.verify.is_empty(), "no project files → empty verify");
 
         let report = agent
             .work(&empty_ctx(), allow_gate(root.clone()), &spec)
             .await
             .unwrap();
-        assert!(report.success, "empty verify → vacuously true → success");
+        assert!(
+            report.success,
+            "empty verify from for_workspace → vacuously true → success"
+        );
         assert_eq!(
             report.iterations, 1,
             "single iteration with no verify commands"
         );
         assert_eq!(report.answer, "done");
+        cleanup(&root);
+    }
+
+    /// WorkSpec::new with empty verify is rejected with InvalidInput.
+    #[test]
+    fn work_spec_new_rejects_empty_verify() {
+        let root = make_temp_dir("empty-verify-new-reject");
+        let result = WorkSpec::new("task", root.clone(), Vec::new());
+        assert!(result.is_err(), "empty verify via new() → error");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, LoreError::InvalidInput(_)),
+            "must be InvalidInput: {err:?}"
+        );
         cleanup(&root);
     }
 
