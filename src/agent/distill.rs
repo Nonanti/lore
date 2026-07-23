@@ -2,8 +2,10 @@
 //!
 //! [`Agent::distill_work`] makes ONE model call (cheap prompt: final answer +
 //! verify-log tail, not the whole transcript) and stores up to 3 semantic
-//! memories via the normal `remember` path. Model/parse errors return `Ok(0)`
-//! with a `tracing::warn` — learning is best-effort, never fails the task.
+//! memories via [`Agent::remember`] (scope-enforced). Near-duplicate dedup
+//! happens at [`MemoryStore::consolidate`] time (daemon calls it per-task).
+//! Model/parse errors return `Ok(0)` with a `tracing::warn` — learning is
+//! best-effort, never fails the task.
 
 use crate::agent::Agent;
 use crate::error::Result;
@@ -84,8 +86,10 @@ impl Agent {
     ///
     /// Makes ONE model call with a cheap prompt (final answer + verify-log
     /// tail), asks for at most 3 items as JSON. Parsed items are stored as
-    /// `MemoryKind::Semantic` via [`Agent::remember`] (existing dedup/merge
-    /// machinery applies). Returns the count of stored items.
+    /// `MemoryKind::Semantic` via [`Agent::remember`] (scope-enforced, best-effort).
+    /// Near-duplicate dedup only happens at [`MemoryStore::consolidate`] time, which
+    /// the daemon calls after each task to prevent unbounded growth.
+    /// Returns the count of stored items.
     ///
     /// Model errors or unparseable JSON → `Ok(0)` with a tracing::warn;
     /// **never** fails the task — learning is best-effort.
@@ -215,7 +219,7 @@ mod tests {
         Agent::new(persona, store, model)
     }
 
-    fn spec_and_report() -> (WorkSpec, WorkReport) {
+    fn spec_and_report() -> (WorkSpec, WorkReport, PathBuf) {
         let ws = make_temp_dir("distill-spec");
         let spec = WorkSpec::new(
             "implement feature X",
@@ -229,7 +233,7 @@ mod tests {
             answer: "feature X implemented".to_string(),
             verify_log: "all tests passed".to_string(),
         };
-        (spec, report)
+        (spec, report, ws)
     }
 
     // ── 2-item JSON → 2 semantic memories of correct kinds ──────────
@@ -240,7 +244,7 @@ mod tests {
             r#"[{"kind":"convention","title":"use conventional commits","body":"project uses feat/fix/refactor prefixes"},{"kind":"fact","title":"test framework is cargo test","body":"Rust project verified via cargo test"}]"#,
         ]));
         let agent = agent_with_model(model);
-        let (spec, report) = spec_and_report();
+        let (spec, report, ws) = spec_and_report();
 
         let count = agent.distill_work(&spec, &report).await.unwrap();
         assert_eq!(count, 2, "two items should be stored");
@@ -271,8 +275,7 @@ mod tests {
             "should contain a Fact: {kinds:?}"
         );
 
-        let (_, report) = spec_and_report();
-        cleanup(&report.verify_log.into());
+        cleanup(&ws);
     }
 
     // ── garbage JSON → Ok(0), no error ──────────────────────────────
@@ -281,7 +284,7 @@ mod tests {
     async fn distill_work_garbage_json_returns_ok_zero() {
         let model = Arc::new(ScriptedModel::new(&["this is not JSON at all!!!"]));
         let agent = agent_with_model(model);
-        let (spec, report) = spec_and_report();
+        let (spec, report, ws) = spec_and_report();
 
         let count = agent.distill_work(&spec, &report).await.unwrap();
         assert_eq!(count, 0, "garbage JSON → Ok(0)");
@@ -292,6 +295,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sem.len(), 0, "no memories from garbage");
+        cleanup(&ws);
     }
 
     // ── empty list → Ok(0) ──────────────────────────────────────────
@@ -300,10 +304,11 @@ mod tests {
     async fn distill_work_empty_list_returns_ok_zero() {
         let model = Arc::new(ScriptedModel::new(&["[]"]));
         let agent = agent_with_model(model);
-        let (spec, report) = spec_and_report();
+        let (spec, report, ws) = spec_and_report();
 
         let count = agent.distill_work(&spec, &report).await.unwrap();
         assert_eq!(count, 0, "empty list → Ok(0)");
+        cleanup(&ws);
     }
 
     // ── wrapper format {"items":[...]} accepted ──────────────────────
@@ -314,7 +319,7 @@ mod tests {
             r#"{"items":[{"kind":"constraint","title":"no unwrap outside tests","body":"use ? operator in production code"}]}"#,
         ]));
         let agent = agent_with_model(model);
-        let (spec, report) = spec_and_report();
+        let (spec, report, ws) = spec_and_report();
 
         let count = agent.distill_work(&spec, &report).await.unwrap();
         assert_eq!(count, 1, "wrapper format → 1 item");
@@ -329,6 +334,7 @@ mod tests {
         } else {
             panic!("expected semantic");
         }
+        cleanup(&ws);
     }
 
     // ── model error → Ok(0) ─────────────────────────────────────────
@@ -347,10 +353,11 @@ mod tests {
         }
         let model: Arc<dyn Model> = Arc::new(FailModel);
         let agent = agent_with_model(model);
-        let (spec, report) = spec_and_report();
+        let (spec, report, ws) = spec_and_report();
 
         let count = agent.distill_work(&spec, &report).await.unwrap();
         assert_eq!(count, 0, "model error → Ok(0)");
+        cleanup(&ws);
     }
 
     // ── tail_cap helper ──────────────────────────────────────────────
@@ -462,7 +469,7 @@ mod tests {
         ]);
         let model = Arc::new(ScriptedModel::new(&[&items.to_string()]));
         let agent = agent_with_model(model);
-        let (spec, report) = spec_and_report();
+        let (spec, report, ws) = spec_and_report();
 
         let count = agent.distill_work(&spec, &report).await.unwrap();
         assert_eq!(count, 3, "only 3 items should be stored (max cap)");
@@ -472,6 +479,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sem.len(), 3, "3 semantic records in memory");
-        cleanup(&report.verify_log.into());
+        cleanup(&ws);
     }
 }

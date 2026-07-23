@@ -238,6 +238,7 @@ impl Agent {
 
     /// Recalls semantic conventions for seeding into the work goal.
     /// Returns `[project convention (category)] title — body` lines for prepend.
+    /// Uses human-readable Display labels for categories.
     /// A recall failure is logged but not fatal — work proceeds without priors.
     async fn seed_conventions(&self, goal: &str) -> Vec<String> {
         match self
@@ -252,13 +253,13 @@ impl Agent {
                         statement,
                         category,
                     } => Some(format!(
-                        "[project convention ({category:?})] {k} — {statement}"
+                        "[project convention ({category})] {k} — {statement}"
                     )),
                     MemoryKind::Semantic {
                         statement,
                         category,
                         ..
-                    } => Some(format!("[project convention ({category:?})] {statement}")),
+                    } => Some(format!("[project convention ({category})] {statement}")),
                     _ => None,
                 })
                 .collect(),
@@ -289,7 +290,7 @@ impl Agent {
         } else {
             Outcome::Failure
         };
-        match self.memory.remember(mem).await {
+        match self.remember(mem).await {
             Ok(id) => {
                 if let Err(e) = self.memory.reinforce(&id, outcome).await {
                     tracing::warn!(error = %e, "strategy reinforcement could not be processed");

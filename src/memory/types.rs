@@ -29,6 +29,17 @@ pub enum SemanticCat {
     Constraint,
 }
 
+impl std::fmt::Display for SemanticCat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SemanticCat::Fact => "fact",
+            SemanticCat::Preference => "preference",
+            SemanticCat::Convention => "convention",
+            SemanticCat::Constraint => "constraint",
+        })
+    }
+}
+
 /// 5W cues for episodic memory: who/what/where/when/why.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FiveW {

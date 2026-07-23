@@ -266,10 +266,9 @@ impl Agent {
     }
 
     /// Stores an arbitrary memory record (in own scope).
-    pub async fn remember(&self, mut mem: Memory) -> Result<()> {
+    pub async fn remember(&self, mut mem: Memory) -> Result<MemoryId> {
         mem.scope = self.scope();
-        self.memory.remember(mem).await?;
-        Ok(())
+        self.memory.remember(mem).await
     }
 
     /// **Reflection: episodic → semantic distillation.**
@@ -330,7 +329,7 @@ impl Agent {
             let mem = Memory::semantic(self.scope(), fact, category)
                 .with_importance(REFLECT_IMPORTANCE)
                 .with_key(format!("distilled:{}", cand.item.id));
-            if let Err(e) = self.memory.remember(mem).await {
+            if let Err(e) = self.remember(mem).await {
                 tracing::warn!(error = %e, "reflect: semantic record could not be written");
                 continue;
             }
@@ -584,7 +583,7 @@ impl Agent {
             .map(|c| format!("{}: {}", c.tool, c.args))
             .collect();
         let mem = Memory::procedural(self.scope(), format!("task '{input}'"), steps);
-        match self.memory.remember(mem).await {
+        match self.remember(mem).await {
             Ok(id) => {
                 if let Err(e) = self.memory.reinforce(&id, Outcome::Success).await {
                     tracing::warn!(error = %e, "procedure first success could not be processed");
