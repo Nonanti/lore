@@ -176,9 +176,14 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn make_temp_dir(label: &str) -> PathBuf {
+        // Unique per CALL, not per test name: several tests share one label
+        // (e.g. spec_and_report), and parallel cleanup of a shared dir
+        // raced WorkSpec::new's canonicalization (flaky "workspace does
+        // not exist" failures).
         let dir = std::env::temp_dir().join(format!(
-            "lore-distill-test-{label}-{pid}",
-            pid = std::process::id()
+            "lore-distill-test-{label}-{pid}-{uid}",
+            pid = std::process::id(),
+            uid = ulid::Ulid::new()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir

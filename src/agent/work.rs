@@ -327,9 +327,12 @@ mod tests {
 
     /// Create a unique temp dir (no external tempfile crate needed).
     fn make_temp_dir(label: &str) -> PathBuf {
+        // Unique per call (ulid) so parallel tests can never share a dir
+        // even if two tests pick the same label.
         let dir = std::env::temp_dir().join(format!(
-            "lore-work-test-{label}-{pid}",
-            pid = std::process::id()
+            "lore-work-test-{label}-{pid}-{uid}",
+            pid = std::process::id(),
+            uid = ulid::Ulid::new()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
