@@ -1,7 +1,7 @@
 # Lore — Native Provider Auth (OpenAI + Anthropic, API-key + Subscription)
 
 Date: 2026-07-20
-Author: Berkant (via pi agent)
+Author: Berkant
 Status: Approved (design), implementing
 
 ## Goal
@@ -10,7 +10,7 @@ Add first-class OpenAI and Anthropic providers to Lore, usable **both** with a
 metered API key **and** with a consumer subscription (ChatGPT Plus/Pro, Claude
 Pro/Max). Lore stays **fully self-contained**: it implements its own OAuth login,
 its own token store, and its own refresh — it does **not** read any other tool's
-credentials (no pi/Codex/Claude Code files).
+credentials (no Codex/Claude Code files).
 
 ## Non-goals
 
