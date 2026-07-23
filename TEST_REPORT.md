@@ -5,7 +5,7 @@
 | **Project** | `lore` — an identity + orchestration + memory core for AI agents (Rust) |
 | **Version** | 0.1.0 (M0–M31 done) |
 | **Test date** | 17 July 2026 |
-| **Tested by** | Berkant (pi agent) |
+| **Tested by** | Berkant |
 | **Test scope** | Quality gates, CLI, HTTP API, security, real LLM (2 providers), federation, WebSocket, memory behaviors |
 | **Result** | ✅ **108/108 tests passed · clippy clean · runtime works end-to-end** · 1 medium + 1 minor finding |
 
