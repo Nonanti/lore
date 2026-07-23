@@ -424,6 +424,22 @@ impl TaskStore {
         Ok(active_count == 0)
     }
 
+    /// Returns all task IDs currently in `WaitingSubtasks` status.
+    /// Used by daemon startup sweep to find stuck parents whose children
+    /// are all terminal (crash-recovery for C-1).
+    pub fn waiting_subtasks_tasks(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM tasks WHERE status = 'WaitingSubtasks'")
+            .map_err(sqlite_err)?;
+        let ids: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(sqlite_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_err)?;
+        Ok(ids)
+    }
+
     /// Enqueue a child task with a parent_id link.
     pub fn enqueue_child(&self, parent_id: &str, task: NewTask) -> Result<Task> {
         let child = NewTask {

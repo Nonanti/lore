@@ -6,7 +6,7 @@
 //! `Arc<dyn Model>` from any config.
 
 use crate::auth::{Credential, RefreshingToken, TokenStore};
-use crate::error::Result;
+use crate::error::{LoreError, Result};
 use crate::model::{AnthropicAuth, AnthropicModel, CodexModel, MockModel, Model, OpenAiModel};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -134,10 +134,20 @@ fn resolve_anthropic_auth(cfg: &ModelConfig, data_dir: &Path) -> Option<Anthropi
     let stored = store.load("anthropic").ok().flatten();
     let want_key = cfg.auth == Some(AuthKind::Key);
     let want_subs = cfg.auth == Some(AuthKind::Subs);
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| std::env::var("LORE_LLM_KEY"))
+    let anthropic_key = std::env::var("ANTHROPIC_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty());
+    let api_key = anthropic_key.or_else(|| {
+        let generic = std::env::var("LORE_LLM_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty());
+        if generic.is_some() {
+            tracing::warn!(
+                "LORE_LLM_KEY used as fallback for Anthropic — \\n                 may cause cross-provider auth failures with mixed agents"
+            );
+        }
+        generic
+    });
 
     if want_key {
         return api_key.map(AnthropicAuth::ApiKey);
@@ -179,10 +189,21 @@ fn resolve_openai_auth(cfg: &ModelConfig, data_dir: &Path) -> OpenAiAuthResult {
     }
 
     // Metered API-key path.
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .or_else(|_| std::env::var("LORE_LLM_KEY"))
+    let openai_key = std::env::var("OPENAI_API_KEY")
         .ok()
-        .filter(|k| !k.trim().is_empty())
+        .filter(|k| !k.trim().is_empty());
+    let api_key = openai_key
+        .or_else(|| {
+            let generic = std::env::var("LORE_LLM_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty());
+            if generic.is_some() {
+                tracing::warn!(
+                    "LORE_LLM_KEY used as fallback for OpenAI — \\n                     may cause cross-provider auth failures with mixed agents"
+                );
+            }
+            generic
+        })
         .or_else(|| match &stored {
             Some(Credential::ApiKey { key }) => Some(key.clone()),
             _ => None,
@@ -219,9 +240,21 @@ pub fn build_model(cfg: &ModelConfig, data_dir: &Path) -> Result<Arc<dyn Model>>
                 Ok(Arc::new(m))
             }
             None => {
+                // M-1: explicit auth configuration without credentials is an error,
+                // not a silent MockModel fallback.
+                if cfg.auth == Some(AuthKind::Key) {
+                    return Err(LoreError::Model(
+                        "anthropic provider with auth=key but no API key found                          (set ANTHROPIC_API_KEY or LORE_LLM_KEY)".to_string(),
+                    ));
+                }
+                if cfg.auth == Some(AuthKind::Subs) {
+                    return Err(LoreError::Model(
+                        "anthropic provider with auth=subs but no subscription credential                          (run `lore login anthropic`)".to_string(),
+                    ));
+                }
+                // Auto-detect with no credentials → MockModel (dev/test mode).
                 tracing::warn!(
-                    "anthropic provider but no credential found \
-                         (run `lore login anthropic` or set ANTHROPIC_API_KEY); using MockModel"
+                    "anthropic provider but no credential found                          (run `lore login anthropic` or set ANTHROPIC_API_KEY); using MockModel"
                 );
                 Ok(Arc::new(MockModel::new()))
             }
@@ -252,9 +285,20 @@ pub fn build_model(cfg: &ModelConfig, data_dir: &Path) -> Result<Arc<dyn Model>>
                         Ok(Arc::new(m))
                     }
                     None => {
+                        // M-1: explicit auth configuration without credentials is an error.
+                        if cfg.auth == Some(AuthKind::Key) {
+                            return Err(LoreError::Model(
+                                "openai provider with auth=key but no API key found                                  (set OPENAI_API_KEY or LORE_LLM_KEY)".to_string(),
+                            ));
+                        }
+                        if cfg.auth == Some(AuthKind::Subs) {
+                            return Err(LoreError::Model(
+                                "openai provider with auth=subs but no subscription credential                                  (run `lore login openai`)".to_string(),
+                            ));
+                        }
+                        // Auto-detect with no credentials → MockModel (dev/test mode).
                         tracing::warn!(
-                            "openai provider but no credential found \
-                             (run `lore login openai` or set OPENAI_API_KEY); using MockModel"
+                            "openai provider but no credential found                              (run `lore login openai` or set OPENAI_API_KEY); using MockModel"
                         );
                         Ok(Arc::new(MockModel::new()))
                     }
@@ -286,10 +330,13 @@ pub fn build_model(cfg: &ModelConfig, data_dir: &Path) -> Result<Arc<dyn Model>>
 
 /// Convenience: build the default model from env vars. Returns `MockModel` if
 /// no provider is configured (same as the old `build_model` in main.rs).
-pub fn build_model_from_env(data_dir: &Path) -> Arc<dyn Model> {
+/// Convenience: build the default model from env vars. Returns `MockModel` if
+/// no provider is configured (dev/test mode). Returns `Err` when auth is
+/// explicitly configured but credentials are absent (M-1: no silent fallback).
+pub fn build_model_from_env(data_dir: &Path) -> crate::error::Result<Arc<dyn Model>> {
     match ModelConfig::from_env() {
-        Some(cfg) => build_model(&cfg, data_dir).unwrap_or_else(|_| Arc::new(MockModel::new())),
-        None => Arc::new(MockModel::new()),
+        Some(cfg) => build_model(&cfg, data_dir),
+        None => Ok(Arc::new(MockModel::new())),
     }
 }
 
@@ -340,15 +387,6 @@ mod tests {
     }
 
     #[test]
-    fn from_env_no_vars_returns_none() {
-        // In a clean env, from_env returns None → MockModel.
-        // We can't easily clear env vars in a parallel test runner,
-        // so this test just checks the logic path when LORE_PROVIDER
-        // is not "anthropic" or "openai" and LORE_LLM_BASE is not set.
-        // Real env testing is done with unique var names below.
-    }
-
-    #[test]
     fn from_env_with_openai_compat_base() {
         let uid = ulid::Ulid::new().to_string();
         let base_key = format!("LORE_TEST_BASE_{uid}");
@@ -374,6 +412,54 @@ mod tests {
     }
 
     #[test]
+    fn build_model_auth_key_no_credential_returns_error() {
+        // M-1: auth=key with no API key → Err, not MockModel.
+        let cfg = ModelConfig {
+            provider: ProviderKind::Anthropic,
+            model: "claude-sonnet-4-5".to_string(),
+            auth: Some(AuthKind::Key),
+            base_url: None,
+        };
+        let dir = std::env::temp_dir();
+        let result = build_model(&cfg, &dir);
+        let err = match result {
+            Ok(_) => panic!("auth=key without credential should return Err, got Ok"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("anthropic") && err.contains("auth=key"),
+            "error should mention provider and auth mode: {err}"
+        );
+
+        // Same for OpenAI.
+        let cfg_openai = ModelConfig {
+            provider: ProviderKind::OpenAI,
+            model: "gpt-5".to_string(),
+            auth: Some(AuthKind::Key),
+            base_url: None,
+        };
+        let result_openai = build_model(&cfg_openai, &dir);
+        assert!(
+            result_openai.is_err(),
+            "auth=key without credential should return Err for OpenAI too"
+        );
+    }
+
+    #[test]
+    fn build_model_auto_detect_no_credential_returns_mock() {
+        // Auto-detect (auth=None) with no credentials → MockModel (dev/test mode).
+        let cfg = ModelConfig {
+            provider: ProviderKind::Anthropic,
+            model: "claude-sonnet-4-5".to_string(),
+            auth: None,
+            base_url: None,
+        };
+        let dir = std::env::temp_dir();
+        let model = build_model(&cfg, &dir).unwrap();
+        let _ = model;
+    }
+
+    #[test]
     fn build_model_mock_no_network() {
         let cfg = ModelConfig {
             provider: ProviderKind::Mock,
@@ -382,12 +468,7 @@ mod tests {
             base_url: None,
         };
         let dir = std::env::temp_dir();
-        let model = build_model(&cfg, &dir).unwrap();
-        // Verify it's a MockModel by completing a prompt (no network).
-        let _prompt = crate::model::Prompt::default();
-        // We can't call complete() without a runtime here, but we can
-        // verify it constructed without error.
-        let _ = model;
+        let _model = build_model(&cfg, &dir).unwrap();
     }
 
     #[tokio::test]

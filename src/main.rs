@@ -252,9 +252,9 @@ enum AgentCmd {
     List,
 }
 /// Sets up the model from env config (centralized in `lore::model::factory`).
-fn build_model_from_env_cli(data: &str) -> Arc<dyn Model> {
+fn build_model_from_env_cli(data: &str) -> Result<Arc<dyn Model>, anyhow::Error> {
     let path = std::path::Path::new(data);
-    build_model_from_env(path)
+    build_model_from_env(path).map_err(anyhow::Error::from)
 }
 
 /// Sets up the embedder: `LORE_EMBEDDER=neural` + `neural` feature → fastembed;
@@ -322,7 +322,7 @@ fn build_state(data: &str) -> anyhow::Result<AppState> {
     let mut app = AppState::persistent(
         format!("{data}/agents"),
         store,
-        build_model_from_env_cli(data),
+        build_model_from_env_cli(data)?,
     )?
     .with_tools(tools);
     // Security: if LORE_API_KEY is set, auth is mandatory; LORE_RATE_LIMIT caps requests per minute.
@@ -424,7 +424,7 @@ fn handle_agent(data: &str, cmd: AgentCmd) -> anyhow::Result<()> {
             let data_path = std::path::Path::new(data);
             let arc_model: Arc<dyn Model> = match &model_config {
                 Some(cfg) => build_model(cfg, data_path)?,
-                None => build_model_from_env(data_path),
+                None => build_model_from_env(data_path)?,
             };
 
             let agent = Agent::new(persona, Arc::new(lore::InMemoryStore::new()), arc_model);
@@ -1001,7 +1001,7 @@ async fn run_demo(data: &str) -> anyhow::Result<()> {
     // Native embedder attached → recall is hybrid (keyword + cosine).
     let store: Arc<dyn MemoryStore> =
         Arc::new(InMemoryStore::new().with_embedder(Arc::new(HashingEmbedder::new())));
-    let model = build_model_from_env_cli(data);
+    let model = build_model_from_env_cli(data)?;
     match std::env::var("LORE_LLM_BASE") {
         Ok(base) => println!("🔌 Real model: {base}"),
         Err(_) => println!("🧪 MockModel (LORE_LLM_BASE not set)"),

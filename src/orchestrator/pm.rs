@@ -85,9 +85,17 @@ pub async fn decompose_with_retry(
         }
         Err(_) => {
             // JSON parse failure → one corrective retry.
+            // M-3: include roster context so the model can assign valid agent names.
+            let roster_text = roster
+                .iter()
+                .map(|a| format!("- {}: {}", a.name, a.role))
+                .collect::<Vec<_>>()
+                .join("\n");
             let retry_prompt = Prompt {
                 system: "Your previous response was not valid JSON. Return ONLY a valid JSON array: [{\"agent\": \"<name>\", \"goal\": \"<description>\", \"verify\": [\"<criteria>\"]}]\n\
+                          Each agent field must exactly match a name from the roster below. Do not invent agent names.\n\
                           No prose, no code fences, no extra text. Just the JSON array.".to_string(),
+                context: vec![format!("Available agents (roster):\n{roster_text}")],
                 user: format!("Original goal: {goal}\n\nReturn the subtask decomposition as pure JSON now."),
                 ..Default::default()
             };
@@ -115,7 +123,28 @@ pub async fn decompose_with_retry(
 /// Accepts both a plain JSON array and a wrapped {"subtasks": [...]} object.
 /// Also tolerates prose-wrapped content (text before/after the JSON).
 fn parse_subtasks(text: &str) -> Result<Vec<SubtaskSpec>> {
-    // Try extracting the first complete JSON value from the text.
+    // S-3: try `[` first — plain arrays are the most common output format,
+    // and the `[` inside a wrapped {"subtasks": [...]} object is also matched.
+    for (start, _) in text.match_indices('[') {
+        let mut stream =
+            serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
+        let Some(Ok(v)) = stream.next() else {
+            continue;
+        };
+        if v.is_array() {
+            let specs: Vec<SubtaskSpec> = v
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect();
+            if !specs.is_empty() {
+                return Ok(specs);
+            }
+        }
+    }
+
+    // Then try `{` for wrapped {"subtasks": [...]} objects.
     for (start, _) in text.match_indices('{') {
         let mut stream =
             serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
@@ -135,26 +164,6 @@ fn parse_subtasks(text: &str) -> Result<Vec<SubtaskSpec>> {
         }
 
         // Accept a plain array if the JSON value itself is an array.
-        if v.is_array() {
-            let specs: Vec<SubtaskSpec> = v
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|item| serde_json::from_value(item.clone()).ok())
-                .collect();
-            if !specs.is_empty() {
-                return Ok(specs);
-            }
-        }
-    }
-
-    // Try starting from '[' for a plain array not inside an object.
-    for (start, _) in text.match_indices('[') {
-        let mut stream =
-            serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
-        let Some(Ok(v)) = stream.next() else {
-            continue;
-        };
         if v.is_array() {
             let specs: Vec<SubtaskSpec> = v
                 .as_array()
@@ -196,11 +205,13 @@ pub fn build_roster(data_dir: &Path) -> Result<Vec<AgentEntry>> {
         }
         let json = std::fs::read_to_string(&path).map_err(|e| LoreError::Storage(e.to_string()))?;
         let rec: serde_json::Value = serde_json::from_str(&json)?;
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-            .to_string();
+        let name = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => {
+                tracing::warn!(path = %path.display(), "agent file has non-UTF8 stem, skipping");
+                continue;
+            }
+        };
         let role = rec
             .get("persona")
             .and_then(|p| p.get("role"))

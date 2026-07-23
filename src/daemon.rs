@@ -226,7 +226,7 @@ pub async fn run_daemon(data_dir: &Path, db_path: &Path) -> Result<()> {
     tracing::info!("daemon starting — data: {}", data_dir.display());
 
     let store = TaskStore::open(db_path)?;
-    let model = build_model_from_env(data_dir);
+    let model = build_model_from_env(data_dir)?;
 
     // Crash recovery: sweep orphaned tasks left from a previous crash
     // or kill. Resets Running/WaitingApproval → Queued and denies
@@ -244,6 +244,10 @@ pub async fn run_daemon(data_dir: &Path, db_path: &Path) -> Result<()> {
         model,
         db_path: db_path.to_path_buf(),
     };
+
+    // C-1 recovery: finalize stuck WaitingSubtasks parents whose children
+    // are all terminal (crash left parent waiting with no active children).
+    let _stuck_recovered = recover_stuck_parents(&store, &deps).await?;
 
     // Graceful shutdown: listen for SIGTERM/SIGINT.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -358,7 +362,9 @@ fn build_per_task_model(
 }
 
 /// Build the model from env config (centralized in `lore::model::factory`).
-fn build_model_from_env(data_dir: &Path) -> Arc<dyn Model> {
+/// Returns `Err` when auth is explicitly configured but credentials are absent
+/// (M-1: no silent MockModel fallback).
+fn build_model_from_env(data_dir: &Path) -> Result<Arc<dyn Model>> {
     crate::model::build_model_from_env(data_dir)
 }
 
@@ -368,6 +374,18 @@ pub async fn decompose_team_task(store: &TaskStore, task_id: &str, deps: &TaskDe
     let task = store
         .get(task_id)?
         .ok_or_else(|| LoreError::NotFound(format!("task {task_id}")))?;
+
+    // Idempotency guard (C-3): if children already exist from a prior
+    // (crash-interrupted) decomposition, skip re-decomposing and just
+    // transition to WaitingSubtasks.
+    if !store.children_of(task_id)?.is_empty() {
+        tracing::info!(
+            task_id,
+            "skipping re-decomposition — children already exist from prior attempt"
+        );
+        store.set_status(task_id, TaskStatus::WaitingSubtasks)?;
+        return Ok(());
+    }
 
     let pm_model = build_per_task_model(&deps.data_dir, &task.agent, &deps.model)?;
     let roster = build_roster(&deps.data_dir)?;
@@ -443,18 +461,44 @@ pub async fn maybe_complete_parent(
         None => return Ok(false), // No parent — standalone task.
     };
 
-    // Check if parent exists and is still WaitingSubtasks.
-    let parent = store.get(&parent_id)?;
+    finalize_parent_if_ready(store, &parent_id, deps).await
+}
+
+/// Check if a `WaitingSubtasks` parent can be finalized (Completed or Failed).
+/// Core logic extracted from `maybe_complete_parent` so the startup sweep
+/// can call it directly by parent_id (C-1 recovery).
+async fn finalize_parent_if_ready(
+    store: &TaskStore,
+    parent_id: &str,
+    deps: &TaskDeps,
+) -> Result<bool> {
+    // Check parent exists and is still WaitingSubtasks.
+    let parent = store.get(parent_id)?;
     if parent.is_none_or(|p| p.status != TaskStatus::WaitingSubtasks) {
         return Ok(false); // Parent already finalized or not waiting.
     }
 
     // Not all children done yet? Wait.
-    if !store.all_children_done(&parent_id)? {
+    if !store.all_children_done(parent_id)? {
         return Ok(false);
     }
 
-    let children = store.children_of(&parent_id)?;
+    let children = store.children_of(parent_id)?;
+
+    // Edge case: no children at all → fail parent (decomposition should have
+    // either created children or already failed the parent).
+    if children.is_empty() {
+        let msg = "PM task stuck in WaitingSubtasks with no children";
+        tracing::error!(parent_id, "{msg}");
+        let report_json = serde_json::to_string(&WorkReport {
+            success: false,
+            iterations: 0,
+            answer: msg.to_string(),
+            verify_log: String::new(),
+        })?;
+        store.fail(parent_id, &report_json)?;
+        return Ok(true);
+    }
 
     // If any child Failed (other than the reviewer) → parent Failed.
     let non_review_failures = children
@@ -462,7 +506,7 @@ pub async fn maybe_complete_parent(
         .filter(|c| c.status == TaskStatus::Failed && c.agent != "reviewer")
         .count();
     if non_review_failures > 0 {
-        let reports = collect_child_reports(store, &parent_id)?;
+        let reports = collect_child_reports(store, parent_id)?;
         let failing_reports: Vec<String> = reports
             .iter()
             .filter(|r| r.status == "Failed" && r.agent != "reviewer")
@@ -478,7 +522,7 @@ pub async fn maybe_complete_parent(
             answer: msg,
             verify_log: String::new(),
         })?;
-        store.fail(&parent_id, &report_json)?;
+        store.fail(parent_id, &report_json)?;
         tracing::info!(
             parent_id,
             failed_children = non_review_failures,
@@ -489,9 +533,9 @@ pub async fn maybe_complete_parent(
 
     // All children succeeded. Check if a reviewer should be enqueued.
     let roster = build_roster(&deps.data_dir)?;
-    if has_reviewer(&roster) && !has_review_child(store, &parent_id)? {
+    if has_reviewer(&roster) && !has_review_child(store, parent_id)? {
         // Enqueue ONE review child.
-        let children_reports = collect_child_reports(store, &parent_id)?;
+        let children_reports = collect_child_reports(store, parent_id)?;
         let review_goal = format!(
             "Review the completed work:\n{}\nLook for gaps, contradictions, missing verification.",
             synthesis_prompt(&children_reports)
@@ -506,7 +550,7 @@ pub async fn maybe_complete_parent(
             verify: vec![],
             parent_id: None, // enqueue_child sets this
         };
-        store.enqueue_child(&parent_id, review_task)?;
+        store.enqueue_child(parent_id, review_task)?;
         tracing::info!(
             parent_id,
             "review child enqueued, parent stays WaitingSubtasks"
@@ -516,7 +560,7 @@ pub async fn maybe_complete_parent(
 
     // All children done + review done (or no reviewer) → PM synthesis.
     let pm_model = build_per_task_model(&deps.data_dir, "pm", &deps.model)?;
-    let children_reports = collect_child_reports(store, &parent_id)?;
+    let children_reports = collect_child_reports(store, parent_id)?;
     let synth_text = synthesis_prompt(&children_reports);
 
     let prompt = crate::model::Prompt {
@@ -526,7 +570,23 @@ pub async fn maybe_complete_parent(
         ..Default::default()
     };
 
-    let completion = pm_model.complete(&prompt).await?;
+    // C-2: catch PM synthesis model failure → fail parent (not wedge).
+    let completion = match pm_model.complete(&prompt).await {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("PM synthesis model call failed: {e}");
+            tracing::error!(parent_id, error = %e, "{msg}");
+            let report_json = serde_json::to_string(&WorkReport {
+                success: false,
+                iterations: 0,
+                answer: msg.clone(),
+                verify_log: String::new(),
+            })?;
+            store.fail(parent_id, &report_json)?;
+            tracing::info!(parent_id, "parent task Failed (PM synthesis error)");
+            return Ok(true);
+        }
+    };
     let combined_report = serde_json::json!({
         "success": true,
         "iterations": children.len(),
@@ -534,13 +594,47 @@ pub async fn maybe_complete_parent(
         "children_count": children.len(),
     });
     let report_json = serde_json::to_string(&combined_report)?;
-    store.complete(&parent_id, &report_json)?;
+    store.complete(parent_id, &report_json)?;
     tracing::info!(
         parent_id,
         children_count = children.len(),
         "parent task Completed via PM synthesis"
     );
     Ok(true)
+}
+
+/// Startup sweep: find `WaitingSubtasks` parents whose children are all
+/// terminal and finalize them. Recovers from the crash scenario where
+/// all children finished but `maybe_complete_parent` never ran (C-1).
+async fn recover_stuck_parents(store: &TaskStore, deps: &TaskDeps) -> Result<usize> {
+    let stuck = store.waiting_subtasks_tasks()?;
+    let mut finalized = 0;
+    for parent_id in &stuck {
+        match finalize_parent_if_ready(store, parent_id, deps).await {
+            Ok(true) => {
+                tracing::info!(
+                    parent_id,
+                    "stuck WaitingSubtasks parent finalized on startup"
+                );
+                finalized += 1;
+            }
+            Ok(false) => {} // Not ready yet (children still active).
+            Err(e) => {
+                tracing::error!(
+                    parent_id,
+                    error = %e,
+                    "failed to finalize stuck parent on startup"
+                );
+            }
+        }
+    }
+    if finalized > 0 {
+        tracing::info!(
+            count = finalized,
+            "finalized stuck WaitingSubtasks parents on startup"
+        );
+    }
+    Ok(finalized)
 }
 
 #[cfg(test)]
@@ -1338,5 +1432,205 @@ mod tests {
         // Parent task is marked Failed.
         let parent_loaded = store.get(&parent.id).unwrap().unwrap();
         assert_eq!(parent_loaded.status, TaskStatus::Failed);
+    }
+
+    // ── C-1: stuck WaitingSubtasks parent recovered on startup ────────
+
+    #[tokio::test]
+    async fn recover_stuck_parents_finalizes_on_startup() {
+        let store = TaskStore::in_memory().unwrap();
+        let db = TmpDb::new("c1-stuck-parent");
+
+        // Create pm persona (no reviewer).
+        save_persona(db.data_dir(), "pm");
+
+        let parent = store
+            .enqueue(NewTask {
+                agent: "pm".to_string(),
+                goal: "build app".to_string(),
+                workspace: PathBuf::from("/tmp"),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+        store
+            .set_status(&parent.id, TaskStatus::WaitingSubtasks)
+            .unwrap();
+
+        let c1 = store
+            .enqueue_child(
+                &parent.id,
+                NewTask {
+                    agent: "backend".to_string(),
+                    goal: "impl API".to_string(),
+                    workspace: PathBuf::from("/tmp"),
+                    verify: vec![],
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+
+        // Simulate crash: all children already terminal, parent stuck in WaitingSubtasks.
+        store
+            .complete(
+                &c1.id,
+                &serde_json::to_string(&serde_json::json!({"success":true,"answer":"API done"}))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        // Startup sweep: recover stuck parents.
+        let model = Arc::new(ScriptedModel::new(&["synthesized: done"]));
+        let deps = TaskDeps {
+            data_dir: db.data_dir().to_path_buf(),
+            model,
+            db_path: db.path().to_path_buf(),
+        };
+
+        let recovered = recover_stuck_parents(&store, &deps).await.unwrap();
+        assert_eq!(recovered, 1, "one stuck parent finalized");
+
+        let parent_loaded = store.get(&parent.id).unwrap().unwrap();
+        assert_eq!(
+            parent_loaded.status,
+            TaskStatus::Completed,
+            "stuck parent recovered on startup"
+        );
+    }
+
+    // ── C-2: PM synthesis error → parent Failed (not wedged) ──────────────
+
+    #[tokio::test]
+    async fn finalize_parent_synthesis_error_fails_parent() {
+        let store = TaskStore::in_memory().unwrap();
+        let db = TmpDb::new("c2-synth-err");
+
+        // Create pm persona (no reviewer).
+        save_persona(db.data_dir(), "pm");
+
+        let parent = store
+            .enqueue(NewTask {
+                agent: "pm".to_string(),
+                goal: "build app".to_string(),
+                workspace: PathBuf::from("/tmp"),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+        store
+            .set_status(&parent.id, TaskStatus::WaitingSubtasks)
+            .unwrap();
+
+        let c1 = store
+            .enqueue_child(
+                &parent.id,
+                NewTask {
+                    agent: "backend".to_string(),
+                    goal: "impl API".to_string(),
+                    workspace: PathBuf::from("/tmp"),
+                    verify: vec![],
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+        store
+            .complete(
+                &c1.id,
+                &serde_json::to_string(&serde_json::json!({"success":true,"answer":"API done"}))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        // Use ErrorModel so PM synthesis will fail.
+        let model = Arc::new(ErrorModel("synthesis failed: network error".into()));
+        let deps = TaskDeps {
+            data_dir: db.data_dir().to_path_buf(),
+            model,
+            db_path: db.path().to_path_buf(),
+        };
+
+        let completed = maybe_complete_parent(&store, &c1.id, &deps).await.unwrap();
+        assert!(
+            completed,
+            "parent should be finalized even on synthesis error"
+        );
+
+        let parent_loaded = store.get(&parent.id).unwrap().unwrap();
+        assert_eq!(
+            parent_loaded.status,
+            TaskStatus::Failed,
+            "synthesis error → parent Failed"
+        );
+
+        let report: serde_json::Value =
+            serde_json::from_str(parent_loaded.report.as_deref().unwrap()).unwrap();
+        assert!(
+            report["answer"].as_str().unwrap().contains("synthesis"),
+            "report should mention synthesis failure"
+        );
+    }
+
+    // ── C-3: idempotency guard — duplicate children skipped ────────────────
+
+    #[tokio::test]
+    async fn decompose_team_task_skips_if_children_exist() {
+        let store = TaskStore::in_memory().unwrap();
+        let db = TmpDb::new("c3-idempotent");
+
+        // Create pm + backend personas so roster is non-empty.
+        save_persona(db.data_dir(), "pm");
+        save_persona(db.data_dir(), "backend");
+
+        let parent = store
+            .enqueue(NewTask {
+                agent: "pm".to_string(),
+                goal: "build app".to_string(),
+                workspace: PathBuf::from("/tmp"),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+        store.set_status(&parent.id, TaskStatus::Running).unwrap();
+
+        // Pre-enqueue a child manually (simulating crash before set_status).
+        let existing_child = store
+            .enqueue_child(
+                &parent.id,
+                NewTask {
+                    agent: "backend".to_string(),
+                    goal: "impl API".to_string(),
+                    workspace: PathBuf::from("/tmp"),
+                    verify: vec![],
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+
+        let model = Arc::new(ScriptedModel::new(&["should not be called"]));
+        let deps = TaskDeps {
+            data_dir: db.data_dir().to_path_buf(),
+            model,
+            db_path: db.path().to_path_buf(),
+        };
+
+        // decompose_team_task should skip re-decomposing (children already exist).
+        let result = decompose_team_task(&store, &parent.id, &deps).await;
+        assert!(result.is_ok(), "idempotent decompose should succeed");
+
+        // Parent is now WaitingSubtasks, no duplicate children.
+        let parent_loaded = store.get(&parent.id).unwrap().unwrap();
+        assert_eq!(
+            parent_loaded.status,
+            TaskStatus::WaitingSubtasks,
+            "parent transitions to WaitingSubtasks"
+        );
+
+        let children = store.children_of(&parent.id).unwrap();
+        assert_eq!(
+            children.len(),
+            1,
+            "no duplicate children — only the pre-existing one"
+        );
+        assert_eq!(children[0].id, existing_child.id);
     }
 }
