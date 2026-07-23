@@ -59,8 +59,12 @@ pub struct Policy {
     pub roots: Vec<PathBuf>,
     /// Command prefixes allowed without approval (e.g. `"cargo test"`).
     pub auto_allow: Vec<String>,
-    /// Command substrings always denied (e.g. `"sudo"`, `"rm -rf /"`).
-    /// Checked first — deny-list wins.
+    /// Commands always denied (e.g. `"sudo"`, `"rm -rf /"`). Checked
+    /// first — deny-list wins. Bare-word entries (`"sudo"`, `"su"`, `"dd"`)
+    /// match whole tokens only (including path basenames, so
+    /// `/usr/bin/sudo` is caught while `ls results` is not denied by
+    /// `"su"`); entries with spaces or other non-word characters
+    /// (`"rm -rf /"`) match as substrings.
     pub deny: Vec<String>,
     /// Default verdict for exec commands matching neither list.
     pub default_exec: DefaultExec,
@@ -129,7 +133,8 @@ impl Policy {
     /// Evaluate an action against this policy (pure, no I/O).
     ///
     /// Evaluation order:
-    /// 1. Deny-list substring match → Deny (always wins).
+    /// 1. Deny-list match → Deny (always wins; bare words match whole
+    ///    tokens, phrases match substrings — see [`Policy::deny`]).
     /// 2. Exec: auto_allow prefix match → Allow; cwd outside roots → Deny;
     ///    else default_exec.
     /// 3. Write: path inside root → Allow (or Ask if ask_on_write);
@@ -137,9 +142,9 @@ impl Policy {
     pub fn evaluate(&self, action: &Action) -> Verdict {
         match action {
             Action::Exec { command, cwd } => {
-                // Deny-list wins (substring match).
+                // Deny-list wins.
                 for d in &self.deny {
-                    if command.contains(d) {
+                    if deny_matches(d, command) {
                         return Verdict::Deny {
                             reason: format!("command matches deny-list entry: \"{d}\""),
                         };
@@ -242,6 +247,28 @@ impl Policy {
     }
 }
 
+/// Whether a deny-list entry matches a command.
+///
+/// Bare-word entries (a single token such as `"sudo"`, `"su"`, `"dd"`)
+/// match whole whitespace-delimited tokens only — including the basename of
+/// a path token, so `/usr/bin/sudo ls` is caught while `ls results` is not
+/// denied by `"su"` and `git add .` is not denied by `"dd"`. Entries with
+/// whitespace or other non-word characters (`"rm -rf /"`,
+/// `"git push --force"`) keep plain substring matching.
+fn deny_matches(entry: &str, command: &str) -> bool {
+    let bare_word = !entry.is_empty()
+        && entry
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if bare_word {
+        command
+            .split_whitespace()
+            .any(|tok| tok == entry || tok.rsplit('/').next() == Some(entry))
+    } else {
+        command.contains(entry)
+    }
+}
+
 /// Check whether `path` is contained within `root`.
 ///
 /// Canonicalizes both sides; for `path` that doesn't yet exist, walks
@@ -335,6 +362,38 @@ mod tests {
             matches!(v, Verdict::Deny { .. }),
             "deny-list must win: {v:?}"
         );
+    }
+
+    #[test]
+    fn deny_bare_word_matches_tokens_not_substrings() {
+        let root = PathBuf::from("/tmp");
+        let p = Policy {
+            roots: vec![root.clone()],
+            auto_allow: vec!["ls".into()],
+            deny: vec!["su".into(), "dd".into(), "sudo".into()],
+            default_exec: DefaultExec::Ask,
+            ask_on_write: false,
+        };
+        let exec = |cmd: &str| {
+            p.evaluate(&Action::Exec {
+                command: cmd.into(),
+                cwd: root.clone(),
+            })
+        };
+        // Innocent commands containing "su"/"dd" as substrings pass.
+        assert!(
+            matches!(exec("ls results"), Verdict::Allow),
+            "'ls results' must not be denied by bare word 'su'"
+        );
+        assert!(
+            matches!(exec("git add file.rs"), Verdict::Ask { .. }),
+            "'git add' must not be denied by bare word 'dd'"
+        );
+        // Real uses of the denied binary are caught — bare and by path.
+        assert!(matches!(exec("su -c whoami"), Verdict::Deny { .. }));
+        assert!(matches!(exec("/bin/su -"), Verdict::Deny { .. }));
+        assert!(matches!(exec("/usr/bin/sudo ls"), Verdict::Deny { .. }));
+        assert!(matches!(exec("dd if=/dev/zero"), Verdict::Deny { .. }));
     }
 
     #[test]
