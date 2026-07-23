@@ -140,6 +140,7 @@ fn tail(s: &str, cap: usize) -> String {
 }
 
 use crate::agent::Agent;
+use crate::memory::{MemoryKind, Outcome, Query, Tier};
 
 impl Agent {
     /// Work loop: solve → verify → iterate until verification passes or budget exhausted.
@@ -147,6 +148,12 @@ impl Agent {
     /// Each iteration is a fresh `solve` call (bounded context). Cross-iteration
     /// state is only the bounded failure tail. Non-zero verify exit is data, not
     /// error — only policy denial or spawn failure aborts.
+    ///
+    /// Memory lifecycle:
+    /// - Before iteration 1, semantic conventions are recalled and prepended
+    ///   to the goal (seeding). `solve` handles procedural priors internally.
+    /// - After completion (success OR failure), a procedural strategy record
+    ///   is written via `remember` (existing dedup/merge/Wilson applies).
     pub async fn work(
         &self,
         ctx: &ToolContext,
@@ -156,17 +163,26 @@ impl Agent {
         let max_iterations = clamp_iterations(spec.max_iterations);
         let shell = ShellTool::new(gate, spec.workspace.clone());
 
+        // Seeding: recall semantic conventions before iteration 1.
+        // solve already handles procedural priors internally — do not duplicate.
+        let seed_lines = self.seed_conventions(&spec.goal).await;
+        let seeded_goal = if seed_lines.is_empty() {
+            spec.goal.clone()
+        } else {
+            format!("{}\n{}", seed_lines.join("\n"), spec.goal)
+        };
+
         let mut answer = String::new();
         let mut last_verify_log = String::new();
 
         for i in 0..max_iterations {
             // Build iteration input.
             let input = if i == 0 {
-                spec.goal.clone()
+                seeded_goal.clone()
             } else {
                 format!(
                     "{}\n\nPrevious attempt FAILED verification. Output (tail):\n{}\nFix the failure, then verify again.",
-                    spec.goal,
+                    seeded_goal,
                     last_verify_log
                 )
             };
@@ -194,24 +210,93 @@ impl Agent {
             last_verify_log = combined;
 
             if all_passed {
-                return Ok(WorkReport {
+                let report = WorkReport {
                     success: true,
                     iterations: i + 1,
                     answer,
                     verify_log: last_verify_log,
-                });
+                };
+                // Strategy memory: record success (procedural, via remember for dedup/merge).
+                self.record_strategy(spec, &report).await;
+                return Ok(report);
             }
 
             // Non-zero verify → next iteration (failure is data, not error).
         }
 
         // Budget exhausted.
-        Ok(WorkReport {
+        let report = WorkReport {
             success: false,
             iterations: max_iterations,
             answer,
             verify_log: last_verify_log,
-        })
+        };
+        // Strategy memory: record failure (procedural, via remember for dedup/merge).
+        self.record_strategy(spec, &report).await;
+        Ok(report)
+    }
+
+    /// Recalls semantic conventions for seeding into the work goal.
+    /// Returns `[project convention (category)] title — body` lines for prepend.
+    /// A recall failure is logged but not fatal — work proceeds without priors.
+    async fn seed_conventions(&self, goal: &str) -> Vec<String> {
+        match self
+            .recall(&Query::new(goal).tier(Tier::Semantic).semantic().limit(3))
+            .await
+        {
+            Ok(results) => results
+                .iter()
+                .filter_map(|s| match &s.item.kind {
+                    MemoryKind::Semantic {
+                        key: Some(k),
+                        statement,
+                        category,
+                    } => Some(format!(
+                        "[project convention ({category:?})] {k} — {statement}"
+                    )),
+                    MemoryKind::Semantic {
+                        statement,
+                        category,
+                        ..
+                    } => Some(format!("[project convention ({category:?})] {statement}")),
+                    _ => None,
+                })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "work: seeding conventions could not be recalled");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Writes a procedural strategy memory after work completion (success or failure).
+    /// Uses `remember` so existing dedup/merge/Wilson machinery applies.
+    /// A write failure is logged but never fails the task.
+    async fn record_strategy(&self, spec: &WorkSpec, report: &WorkReport) {
+        let goal_summary = &spec.goal[..spec.goal.len().min(80)];
+        let mem = crate::memory::Memory::procedural(
+            self.scope(),
+            format!("task: {goal_summary}"),
+            vec![
+                format!("workspace: {}", spec.workspace.display()),
+                format!("verify: {}", spec.verify.join(" && \n")),
+                format!("iterations used: {}", report.iterations),
+            ],
+        );
+        // Reinforce with the appropriate outcome for Wilson scoring.
+        let outcome = if report.success {
+            Outcome::Success
+        } else {
+            Outcome::Failure
+        };
+        match self.memory.remember(mem).await {
+            Ok(id) => {
+                if let Err(e) = self.memory.reinforce(&id, outcome).await {
+                    tracing::warn!(error = %e, "strategy reinforcement could not be processed");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "strategy memory could not be written"),
+        }
     }
 }
 
@@ -226,11 +311,10 @@ fn extract_exit_code(output: &str) -> Option<i32> {
     let end = rest.find(']')?;
     rest[..end].parse().ok()
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::InMemoryStore;
+    use crate::memory::{InMemoryStore, Memory, Scope};
     use crate::model::{Completion, Model, Prompt};
     use crate::policy::approval::{AllowAll, DenyAll, Gate};
     use crate::policy::{DefaultExec, Policy};
@@ -833,5 +917,264 @@ mod tests {
             matches!(err, LoreError::InvalidInput(_)),
             "nonexistent workspace → InvalidInput: {err:?}"
         );
+    }
+
+    // ── PHASE 5: strategy memory + seeding tests ────────────────────────
+
+    /// Work success writes one procedural memory with successes=1.
+    #[tokio::test]
+    async fn work_success_writes_procedural_strategy_with_successes_1() {
+        let root = make_temp_dir("strategy-success");
+        let store: Arc<dyn crate::memory::MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = Arc::new(ScriptedModel::new(&["done"]));
+        let persona = crate::agent::Persona::new("TestAgent", "worker");
+        let agent = Agent::new(persona, store.clone(), model);
+
+        let spec = WorkSpec::new("do something", root.clone(), vec!["exit 0".to_string()])
+            .unwrap()
+            .with_max_iterations(3);
+
+        let report = agent
+            .work(&empty_ctx(), allow_gate(root.clone()), &spec)
+            .await
+            .unwrap();
+        assert!(report.success, "should succeed");
+
+        // Query procedural tier for strategy records.
+        let procs = agent
+            .recall(
+                &Query::new("task: do something")
+                    .tier(Tier::Procedural)
+                    .limit(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(procs.len(), 1, "one strategy memory should exist");
+
+        if let MemoryKind::Procedural {
+            title,
+            successes,
+            failures,
+            ..
+        } = &procs[0].item.kind
+        {
+            assert!(
+                title.starts_with("task: do something"),
+                "title starts with goal: {title}"
+            );
+            assert_eq!(*successes, 1, "successes = 1 (via reinforce)");
+            assert_eq!(*failures, 0, "failures = 0");
+        } else {
+            panic!("expected procedural memory");
+        }
+        cleanup(&root);
+    }
+
+    /// Work failure writes one procedural memory with failures=1.
+    #[tokio::test]
+    async fn work_failure_writes_procedural_strategy_with_failures_1() {
+        let root = make_temp_dir("strategy-failure");
+        let store: Arc<dyn crate::memory::MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = Arc::new(ScriptedModel::new(&["a1", "a2"]));
+        let persona = crate::agent::Persona::new("TestAgent", "worker");
+        let agent = Agent::new(persona, store.clone(), model);
+
+        let spec = WorkSpec::new("impossible task", root.clone(), vec!["exit 1".to_string()])
+            .unwrap()
+            .with_max_iterations(2);
+
+        let report = agent
+            .work(&empty_ctx(), allow_gate(root.clone()), &spec)
+            .await
+            .unwrap();
+        assert!(!report.success, "should fail");
+
+        let procs = agent
+            .recall(
+                &Query::new("task: impossible")
+                    .tier(Tier::Procedural)
+                    .limit(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(procs.len(), 1, "one strategy memory should exist");
+
+        if let MemoryKind::Procedural {
+            title,
+            successes,
+            failures,
+            ..
+        } = &procs[0].item.kind
+        {
+            assert!(title.starts_with("task: impossible"), "title: {title}");
+            assert_eq!(*successes, 0, "successes = 0");
+            assert_eq!(*failures, 1, "failures = 1 (via reinforce)");
+        } else {
+            panic!("expected procedural memory");
+        }
+        cleanup(&root);
+    }
+
+    /// Repeated same-goal runs merge/strengthen via existing dedup
+    /// (count does not grow unboundedly; Wilson moves).
+    #[tokio::test]
+    async fn work_repeated_same_goal_merges_strategy() {
+        let root = make_temp_dir("strategy-merge");
+        let store: Arc<dyn crate::memory::MemoryStore> = Arc::new(
+            InMemoryStore::new().with_embedder(Arc::new(crate::memory::HashingEmbedder::new())),
+        );
+        let model = Arc::new(ScriptedModel::new(&["done1"]));
+        let persona = crate::agent::Persona::new("TestAgent", "worker");
+        let agent = Agent::new(persona, store.clone(), model.clone());
+
+        let spec = WorkSpec::new("same goal", root.clone(), vec!["exit 0".to_string()])
+            .unwrap()
+            .with_max_iterations(1);
+
+        // First run.
+        let r1 = agent
+            .work(&empty_ctx(), allow_gate(root.clone()), &spec)
+            .await
+            .unwrap();
+        assert!(r1.success);
+
+        // After first run: 1 procedural strategy record.
+        let procs = agent
+            .recall(&Query::new("task: same").tier(Tier::Procedural).limit(5))
+            .await
+            .unwrap();
+        assert_eq!(procs.len(), 1, "one strategy after first run");
+
+        // Second run with same goal — creates another procedural record.
+        let model2 = Arc::new(ScriptedModel::new(&["done3"]));
+        let persona2 = crate::agent::Persona::new("TestAgent", "worker");
+        let mut agent2 = Agent::new(persona2, store.clone(), model2);
+        // Use same id for scope match.
+        agent2.id = agent.id.clone();
+
+        let r2 = agent2
+            .work(&empty_ctx(), allow_gate(root.clone()), &spec)
+            .await
+            .unwrap();
+        assert!(r2.success);
+
+        // Before consolidation: 2 procedural records (not yet merged).
+        let procs_before = agent
+            .recall(&Query::new("task: same").tier(Tier::Procedural).limit(5))
+            .await
+            .unwrap();
+        assert_eq!(procs_before.len(), 2, "two records before consolidation");
+
+        // After consolidation: near-duplicate merge reduces to 1 record.
+        store.consolidate().await.unwrap();
+        let procs_after = agent
+            .recall(&Query::new("task: same").tier(Tier::Procedural).limit(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            procs_after.len(),
+            1,
+            "merged into one record after consolidation"
+        );
+
+        // The merged record has accumulated successes.
+        if let MemoryKind::Procedural { successes, .. } = &procs_after[0].item.kind {
+            assert!(*successes >= 1, "successes accumulated: {successes}");
+        } else {
+            panic!("expected procedural");
+        }
+        cleanup(&root);
+    }
+
+    /// Seeding: pre-stored convention appears in the scripted model's
+    /// captured first prompt.
+    #[tokio::test]
+    async fn work_seeding_convention_appears_in_first_prompt() {
+        let root = make_temp_dir("seeding-convention");
+        let store: Arc<dyn crate::memory::MemoryStore> = Arc::new(
+            InMemoryStore::new().with_embedder(Arc::new(crate::memory::HashingEmbedder::new())),
+        );
+        let model = Arc::new(ScriptedModel::new(&["done"]));
+        let persona = crate::agent::Persona::new("TestAgent", "worker");
+        let agent = Agent::new(persona, store.clone(), model.clone());
+
+        // Pre-store a convention in the agent's memory.
+        agent
+            .remember(Memory::semantic(
+                Scope::Agent(agent.id.clone()),
+                "Use conventional commits: feat/fix/refactor",
+                crate::memory::SemanticCat::Convention,
+            ))
+            .await
+            .unwrap();
+
+        let spec = WorkSpec::new("write a feature", root.clone(), vec!["exit 0".to_string()])
+            .unwrap()
+            .with_max_iterations(1);
+
+        let report = agent
+            .work(&empty_ctx(), allow_gate(root.clone()), &spec)
+            .await
+            .unwrap();
+        assert!(report.success);
+
+        // The scripted model's first prompt (solve call) should contain the
+        // convention line from seeding.
+        let captured = model.captured_inputs();
+        let first_input = captured
+            .iter()
+            .find(|i| i.contains("[project convention"))
+            .expect("at least one prompt should contain seeded convention");
+        assert!(
+            first_input.contains("conventional commits"),
+            "seeded convention should appear in input: {first_input}"
+        );
+        cleanup(&root);
+    }
+
+    /// Scope isolation: agent B's seeded context does NOT contain
+    /// agent A's convention (two agents, shared store, different scopes).
+    #[tokio::test]
+    async fn work_scope_isolation_agent_b_no_access_to_agent_a_convention() {
+        let root = make_temp_dir("scope-isolation");
+        let store: Arc<dyn crate::memory::MemoryStore> = Arc::new(InMemoryStore::new());
+
+        let model_a = Arc::new(ScriptedModel::new(&["done_a"]));
+        let persona_a = crate::agent::Persona::new("AgentA", "worker");
+        let agent_a = Agent::new(persona_a, store.clone(), model_a);
+
+        // Agent A stores a convention.
+        agent_a
+            .remember(Memory::semantic(
+                Scope::Agent(agent_a.id.clone()),
+                "Agent A's rule: always lint first",
+                crate::memory::SemanticCat::Convention,
+            ))
+            .await
+            .unwrap();
+
+        // Agent B with a DIFFERENT identity should NOT seed Agent A's convention.
+        let model_b = Arc::new(ScriptedModel::new(&["done_b"]));
+        let persona_b = crate::agent::Persona::new("AgentB", "worker");
+        let agent_b = Agent::new(persona_b, store.clone(), model_b.clone());
+
+        let spec_b = WorkSpec::new("do work", root.clone(), vec!["exit 0".to_string()])
+            .unwrap()
+            .with_max_iterations(1);
+
+        let report_b = agent_b
+            .work(&empty_ctx(), allow_gate(root.clone()), &spec_b)
+            .await
+            .unwrap();
+        assert!(report_b.success);
+
+        let inputs_b = model_b.captured_inputs();
+        // Agent B's prompts should NOT contain Agent A's convention.
+        let has_a_convention = inputs_b.iter().any(|i| i.contains("Agent A's rule"));
+        assert!(
+            !has_a_convention,
+            "agent B should NOT see agent A's convention"
+        );
+        cleanup(&root);
     }
 }

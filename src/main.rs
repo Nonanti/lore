@@ -247,6 +247,9 @@ enum AgentCmd {
         /// Base URL for OpenAI-compatible provider.
         #[arg(long)]
         base_url: Option<String>,
+        /// Disable post-task memory distillation (opt-out).
+        #[arg(long)]
+        no_distill: bool,
     },
     /// List agents (name, role, provider/model or '(env)').
     List,
@@ -366,6 +369,7 @@ fn handle_agent(data: &str, cmd: AgentCmd) -> anyhow::Result<()> {
             model,
             auth,
             base_url,
+            no_distill,
         } => {
             // Resolve role preset or use the role string as-is.
             let role_preset = preset(&role);
@@ -432,8 +436,11 @@ fn handle_agent(data: &str, cmd: AgentCmd) -> anyhow::Result<()> {
                 Some(cfg) => agent.with_model_config(cfg),
                 None => agent,
             };
-
-            // Save persona+model JSON under <data>/agents/<name>.json.
+            let agent = if no_distill {
+                agent.with_distill(false)
+            } else {
+                agent
+            };
             let path = std::path::PathBuf::from(&agents_dir).join(format!("{name}.json"));
             agent.save_to(&path)?;
 
@@ -1646,6 +1653,7 @@ mod tests {
                     model,
                     auth,
                     base_url,
+                    no_distill,
                 } => {
                     assert_eq!(name, "devbot");
                     assert_eq!(role, "backend");
@@ -1653,6 +1661,7 @@ mod tests {
                     assert!(model.is_none());
                     assert!(auth.is_none());
                     assert!(base_url.is_none());
+                    assert!(!no_distill);
                 }
                 other => panic!("expected Create, got {other:?}"),
             },
@@ -1687,6 +1696,7 @@ mod tests {
                     model,
                     auth,
                     base_url,
+                    no_distill,
                 } => {
                     assert_eq!(name, "devbot");
                     assert_eq!(role, "backend");
@@ -1694,6 +1704,7 @@ mod tests {
                     assert_eq!(model.as_deref(), Some("claude-sonnet-4-5-20250929"));
                     assert_eq!(auth.as_deref(), Some("subs"));
                     assert_eq!(base_url.as_deref(), Some("http://localhost:11434/v1"));
+                    assert!(!no_distill);
                 }
                 other => panic!("expected Create, got {other:?}"),
             },

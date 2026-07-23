@@ -207,6 +207,41 @@ pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Resu
         task.id, report.success, report.iterations
     ));
 
+    // Memory distillation: extract durable facts from the completed task.
+    // Agent opt-out: `should_distill()` returns false when distill field is Some(false).
+    // Distillation errors are logged and never fail the task.
+    if agent.should_distill() {
+        let distilled = agent.distill_work(&spec, &report).await;
+        match distilled {
+            Ok(n) if n > 0 => {
+                tracing::info!(task_id, distilled = n, "distillation completed");
+                log.write_line(&format!(
+                    "[daemon] task {} distilled {} memories",
+                    task.id, n
+                ));
+            }
+            Ok(_) => {
+                log.write_line(&format!(
+                    "[daemon] task {} distillation: nothing durable found",
+                    task.id
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(task_id, error = %e, "distillation error — task not affected");
+                log.write_line(&format!(
+                    "[daemon] task {} distillation error: {e}",
+                    task.id
+                ));
+            }
+        }
+    } else {
+        tracing::info!(task_id, "distillation skipped (agent opted out)");
+        log.write_line(&format!(
+            "[daemon] task {} distillation skipped (agent opted out)",
+            task.id
+        ));
+    }
+
     // Record result in the task store.
     let report_json = serde_json::to_string(&report)?;
     if report.success {
@@ -1632,5 +1667,60 @@ mod tests {
             "no duplicate children — only the pre-existing one"
         );
         assert_eq!(children[0].id, existing_child.id);
+    }
+
+    // ── daemon distill opt-out: agent with distill=false skips distillation ──
+
+    #[tokio::test]
+    async fn run_task_distill_opt_out_respected() {
+        let db = TmpDb::new("rt-distill-optout");
+        let workspace = make_temp_dir("rt-distill-optout-ws");
+        let store = TaskStore::open(db.path()).unwrap();
+
+        // Create persona file for agent "nodistill" with distill=false.
+        let agents_dir = db.data_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let persona = Persona::new("nodistill", "worker");
+        let mem: Arc<dyn crate::memory::MemoryStore> = Arc::new(InMemoryStore::new());
+        let agent = Agent::new(persona, mem, Arc::new(MockModel::new())).with_distill(false);
+        agent.save_to(agents_dir.join("nodistill.json")).unwrap();
+        // Verify the saved JSON includes distill=false.
+        let saved_json = std::fs::read_to_string(agents_dir.join("nodistill.json")).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&saved_json).unwrap();
+        assert_eq!(val["distill"], serde_json::Value::Bool(false));
+
+        save_permissive_policy(db.data_dir());
+
+        let task = store
+            .enqueue(NewTask {
+                agent: "nodistill".to_string(),
+                goal: "simple task".to_string(),
+                workspace: workspace.clone(),
+                verify: vec!["exit 0".to_string()],
+                parent_id: None,
+            })
+            .unwrap();
+        store.set_status(&task.id, TaskStatus::Running).unwrap();
+
+        // Model: only 1 reply needed (work solve; distill should NOT be called).
+        let model = Arc::new(ScriptedModel::new(&["done"]));
+        let deps = TaskDeps {
+            data_dir: db.data_dir().to_path_buf(),
+            model,
+            db_path: db.path().to_path_buf(),
+        };
+
+        let report = run_task(&store, &task.id, &deps).await.unwrap();
+        assert!(report.success);
+
+        // Log file should contain "distillation skipped".
+        let log_path = db.data_dir().join("logs").join(format!("{}.log", task.id));
+        let log_content = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            log_content.contains("distillation skipped (agent opted out)"),
+            "log should mention distillation skipped: {log_content}"
+        );
+
+        cleanup(&workspace);
     }
 }

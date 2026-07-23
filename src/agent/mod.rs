@@ -5,6 +5,7 @@
 //! via `Arc` handles — both are behind traits, swappable.
 
 mod conversation;
+pub mod distill;
 mod persona;
 pub mod roles;
 pub mod work;
@@ -79,6 +80,10 @@ struct AgentRecord {
     ///  This field is purely additive: loaded values are merged into persona.extra.)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     extra: Vec<String>,
+    /// Whether this agent distills knowledge after each task.
+    /// None (absent) = true (default). Set to Some(false) to opt out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    distill: Option<bool>,
 }
 
 /// An agent with identity, memory, and model.
@@ -94,6 +99,9 @@ pub struct Agent {
     pub model: Arc<dyn Model>,
     /// Per-agent model config (optional; absent → env fallback).
     model_config: Option<crate::model::ModelConfig>,
+    /// Whether this agent distills knowledge after each task.
+    /// None = true (default). Some(false) = opt-out.
+    distill: Option<bool>,
     /// Optional tool context (registry + router).
     tools: Option<Arc<ToolContext>>,
 }
@@ -107,6 +115,7 @@ impl Agent {
             memory,
             model,
             model_config: None,
+            distill: None, // None = true (default)
             tools: None,
         }
     }
@@ -124,6 +133,7 @@ impl Agent {
             memory,
             model,
             model_config: None,
+            distill: None,
             tools: None,
         }
     }
@@ -140,9 +150,21 @@ impl Agent {
         self
     }
 
+    /// Sets distill opt-out (builder pattern). `false` disables post-task distillation.
+    pub fn with_distill(mut self, v: bool) -> Self {
+        self.distill = Some(v);
+        self
+    }
+
     /// Returns the per-agent model config (None → env fallback).
     pub fn model_config(&self) -> Option<&crate::model::ModelConfig> {
         self.model_config.as_ref()
+    }
+
+    /// Whether this agent distills after each task. None/Some(true) → distill enabled;
+    /// Some(false) → opt-out.
+    pub fn should_distill(&self) -> bool {
+        self.distill.unwrap_or(true)
     }
 
     /// This agent's personal memory scope.
@@ -150,7 +172,7 @@ impl Agent {
         Scope::Agent(self.id.clone())
     }
 
-    /// Serializes identity (id + persona + model_config + extra) to JSON (Arc handles not included).
+    /// Serializes identity (id + persona + model_config + extra + distill) to JSON (Arc handles not included).
     pub fn to_json(&self) -> Result<String> {
         // Merge persona.extra into the record's extra field for backward compat.
         // persona.extra already holds these values; the record's extra is a
@@ -161,6 +183,7 @@ impl Agent {
             persona: self.persona.clone(),
             model: self.model_config.clone(),
             extra,
+            distill: self.distill,
         };
         Ok(serde_json::to_string_pretty(&rec)?)
     }
@@ -175,7 +198,6 @@ impl Agent {
         model: Arc<dyn Model>,
     ) -> Result<Self> {
         let rec: AgentRecord = serde_json::from_str(json)?;
-        // Merge record-level extra into persona.extra (additive: dedup by appending).
         let mut persona = rec.persona;
         for line in &rec.extra {
             if !persona.extra.contains(line) {
@@ -188,6 +210,7 @@ impl Agent {
             memory,
             model,
             model_config: rec.model,
+            distill: rec.distill,
             tools: None,
         })
     }
