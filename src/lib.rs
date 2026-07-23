@@ -30,7 +30,7 @@ pub mod policy;
 pub mod server;
 pub mod tool;
 
-pub use agent::{Agent, Conversation, Persona};
+pub use agent::{Agent, Conversation, Persona, WorkReport, WorkSpec};
 pub use auth::{AccessTokenProvider, Credential, RefreshingToken, StaticToken, TokenStore};
 pub use error::{LoreError, Result};
 pub use id::{AgentId, MemoryId};

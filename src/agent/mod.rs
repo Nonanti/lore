@@ -6,9 +6,11 @@
 
 mod conversation;
 mod persona;
+pub mod work;
 
 pub use conversation::{Conversation, DEFAULT_CONVERSATION_CAP};
 pub use persona::Persona;
+pub use work::{WorkReport, WorkSpec};
 
 use crate::error::{LoreError, Result};
 use crate::id::{AgentId, MemoryId};
