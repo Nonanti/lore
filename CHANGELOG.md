@@ -5,7 +5,53 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
 
 ## [Unreleased]
 
+### Added — the "AI coworkers" roadmap (5 phases)
+
+- **Hands: policy-gated exec/write tools** — `ShellTool` (timeout, output
+  truncation, exit code in text), `FileWriteTool` (atomic tmp+rename),
+  `FileEditTool` (exact single-match replace). All three pass through a new
+  policy engine (`src/policy/`): `Policy` (allowed roots, auto-allow list,
+  deny list, `default_exec`), `Gate` + pluggable `Approver` (`CliApprover`,
+  `AllowAll`, `DenyAll`). Shell metacharacter chaining is denied unless the
+  policy is fully permissive; bare-word deny entries match whole tokens
+  (`su` blocks `/usr/bin/sudo` but not `ls results`).
+- **Work loop** — `Agent::work()` + `WorkSpec`/`WorkReport`: plan → apply →
+  verify → feed the failure tail back → iterate. Victory is declared by the
+  verify command's exit code, never by the model. `WorkSpec::for_workspace`
+  detects `cargo test` / `npm test` / `pytest`. Policy denials abort;
+  non-zero verify is data.
+- **Daemon + task queue + CLI** — `lore daemon` (sequential worker, SIGINT
+  re-queue, crash recovery sweep for orphaned Running/WaitingApproval and
+  wedged WaitingSubtasks parents), SQLite-backed `TaskStore` (WAL,
+  idempotent approvals), queue-backed `QueueApprover` (approval requests
+  wait in the DB until answered). New CLI: `lore task add/list/status/log`,
+  `lore inbox`, `lore approve|deny`.
+- **Team: roles, per-agent models, PM** — `ModelConfig` + `build_model`
+  factory (Anthropic/OpenAI/OpenAiCompat/Mock, key or subscription,
+  per-agent from its record with env fallback); role presets (`backend`,
+  `frontend`, `reviewer`, `pm`) with verification-minded identity extras;
+  `lore agent create/list`. `lore task add --team` runs the PM flow:
+  decompose goal → enqueue child tasks to named agents → optional reviewer
+  pass (exactly once) → PM synthesis. Crash-safe: no duplicate children,
+  no wedged parents.
+- **Memory distillation** — after every work run the strategy is recorded
+  as procedural memory (Wilson-reinforced); `Agent::distill_work` extracts
+  up to 3 durable conventions/constraints/facts from successful tasks into
+  semantic memory; recalled conventions seed the next task's goal
+  automatically. Failed tasks skip semantic distillation (no wrong
+  conventions learned); the daemon consolidates memory after each task;
+  `--no-distill` opts out per agent.
+- `examples/hands_demo.rs` — end-to-end demo: gate prompts, deny-list
+  refusal, sandbox escape rejection, and a live agent (any
+  OpenAI-compatible endpoint) writing + verifying files through the tools.
+
 ### Fixed
+- **Multi-call tool replies no longer mistaken for final answers**:
+  `parse_tool_call` sliced from the first `{` to the LAST `}`, so a reply
+  with two back-to-back tool calls failed to parse and was treated as the
+  final answer. Each `{` is now tried as the start of one complete JSON
+  value; the first valid `{"tool":..}` wins and the solve loop re-prompts
+  for the rest.
 - **Recalled memories now reach the model**: prompt context injection used
   `Memory::summary()` — which for an **episodic** record is only its *title*, so
   the body (the actual remembered content) never reached the model. `ask`/
