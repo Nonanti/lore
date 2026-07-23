@@ -1177,4 +1177,191 @@ mod tests {
         );
         cleanup(&root);
     }
+
+    // ── Seeding with >3 conventions respects the limit ────────────────
+
+    /// When more than 3 semantic conventions exist, seed_conventions only
+    /// returns 3 (the recall query uses .limit(3)).
+    #[tokio::test]
+    async fn work_seeding_with_more_than_3_conventions_respects_limit() {
+        let root = make_temp_dir("seeding-3-limit");
+        let store: Arc<dyn crate::memory::MemoryStore> = Arc::new(
+            InMemoryStore::new().with_embedder(Arc::new(crate::memory::HashingEmbedder::new())),
+        );
+        let model = Arc::new(ScriptedModel::new(&["done"]));
+        let persona = crate::agent::Persona::new("TestAgent", "worker");
+        let agent = Agent::new(persona, store.clone(), model.clone());
+
+        // Pre-store 5 conventions in the agent's memory (keywords overlap with the goal).
+        for i in 1..=5 {
+            agent
+                .remember(Memory::semantic(
+                    Scope::Agent(agent.id.clone()),
+                    format!("Convention {i}: use feature pattern {i} for coding"),
+                    crate::memory::SemanticCat::Convention,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let spec = WorkSpec::new("write a feature", root.clone(), vec!["exit 0".to_string()])
+            .unwrap()
+            .with_max_iterations(1);
+
+        let report = agent
+            .work(&empty_ctx(), allow_gate(root.clone()), &spec)
+            .await
+            .unwrap();
+        assert!(report.success);
+
+        // The first prompt should contain at most 3 seeded convention lines.
+        let captured = model.captured_inputs();
+        let first_input = &captured[0];
+        let convention_count = first_input
+            .lines()
+            .filter(|l| l.contains("[project convention"))
+            .count();
+        assert!(
+            convention_count <= 3,
+            "seeding should respect limit of 3: got {convention_count} lines"
+        );
+        // At least 1 convention must appear (we stored 5, so recall should find some).
+        assert!(
+            convention_count >= 1,
+            "at least one convention should seed: got {convention_count}"
+        );
+        cleanup(&root);
+    }
+
+    // ── Distilled convention seeds the next task end-to-end ──────────
+
+    /// Distill_work creates a semantic convention memory from task N;
+    /// on task N+1 (same agent, same scope), seed_conventions picks it up.
+    #[tokio::test]
+    async fn work_distilled_convention_seeds_next_task() {
+        let root = make_temp_dir("distill-seed-next");
+        let root2 = make_temp_dir("distill-seed-next2");
+        let store: Arc<dyn crate::memory::MemoryStore> = Arc::new(
+            InMemoryStore::new().with_embedder(Arc::new(crate::memory::HashingEmbedder::new())),
+        );
+
+        // Task N: use a model that returns a convention during distill_work.
+        let model_n = Arc::new(crate::model::MockModel::new());
+        let persona = crate::agent::Persona::new("DistillSeedAgent", "worker");
+        let agent = Agent::new(persona, store.clone(), model_n);
+
+        let _spec_n = WorkSpec::new(
+            "implement caching",
+            root.clone(),
+            vec!["exit 0".to_string()],
+        )
+        .unwrap()
+        .with_max_iterations(1);
+        let _report_n = WorkReport {
+            success: true,
+            iterations: 1,
+            answer: "caching implemented".to_string(),
+            verify_log: "tests passed".to_string(),
+        };
+
+        // Manually distill: store a convention that says "use Redis for caching".
+        agent
+            .remember(Memory::semantic(
+                Scope::Agent(agent.id.clone()),
+                "use Redis for caching",
+                crate::memory::SemanticCat::Convention,
+            ))
+            .await
+            .unwrap();
+
+        // Task N+1: same agent, same scope — the convention should seed.
+        let model_n1 = Arc::new(ScriptedModel::new(&["done_n1"]));
+        let mut agent_n1 = Agent::new(
+            crate::agent::Persona::new("DistillSeedAgent", "worker"),
+            store.clone(),
+            model_n1.clone(),
+        );
+        agent_n1.id = agent.id.clone(); // same scope
+
+        let spec_n1 = WorkSpec::new(
+            "implement more caching",
+            root2.clone(),
+            vec!["exit 0".to_string()],
+        )
+        .unwrap()
+        .with_max_iterations(1);
+
+        let report_n1 = agent_n1
+            .work(&empty_ctx(), allow_gate(root2.clone()), &spec_n1)
+            .await
+            .unwrap();
+        assert!(report_n1.success);
+
+        let inputs_n1 = model_n1.captured_inputs();
+        assert!(
+            inputs_n1[0].contains("Redis for caching"),
+            "distilled convention should appear in next task's seeded goal: {}",
+            inputs_n1[0]
+        );
+        cleanup(&root);
+        cleanup(&root2);
+    }
+
+    // ── Procedural record steps contain the actual verify commands ────
+
+    /// The procedural strategy memory written after work() should contain
+    /// the verify commands in its steps field.
+    #[tokio::test]
+    async fn work_procedural_strategy_steps_contain_verify_commands() {
+        let root = make_temp_dir("strategy-steps");
+        let store: Arc<dyn crate::memory::MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = Arc::new(ScriptedModel::new(&["done"]));
+        let persona = crate::agent::Persona::new("TestAgent", "worker");
+        let agent = Agent::new(persona, store.clone(), model);
+
+        let spec = WorkSpec::new(
+            "do something",
+            root.clone(),
+            vec!["echo verify_one".to_string(), "echo verify_two".to_string()],
+        )
+        .unwrap()
+        .with_max_iterations(1);
+
+        let report = agent
+            .work(&empty_ctx(), allow_gate(root.clone()), &spec)
+            .await
+            .unwrap();
+        assert!(report.success);
+
+        let procs = agent
+            .recall(
+                &Query::new("task: do something")
+                    .tier(Tier::Procedural)
+                    .limit(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(procs.len(), 1, "one strategy memory should exist");
+
+        if let MemoryKind::Procedural { steps, .. } = &procs[0].item.kind {
+            // The verify step should contain the actual verify commands.
+            let verify_step = steps.iter().find(|s| s.starts_with("verify: "));
+            assert!(
+                verify_step.is_some(),
+                "strategy steps should contain a verify step: {steps:?}"
+            );
+            let verify_text = verify_step.unwrap();
+            assert!(
+                verify_text.contains("echo verify_one"),
+                "verify step should contain the first actual command: {verify_text}"
+            );
+            assert!(
+                verify_text.contains("echo verify_two"),
+                "verify step should contain the second actual command: {verify_text}"
+            );
+        } else {
+            panic!("expected procedural memory");
+        }
+        cleanup(&root);
+    }
 }

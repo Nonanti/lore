@@ -1853,4 +1853,74 @@ mod backward_compat_tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// Opt-out default (missing field) = distill ON. When AgentRecord JSON
+    /// lacks the `distill` field, `should_distill()` must return true.
+    #[test]
+    fn agent_record_missing_distill_field_defaults_to_true() {
+        // JSON without `distill` field (None → unwrap_or(true) = true).
+        let json_without_distill = r#"{
+  "id": "01HXYZAGENTNODISTILL0",
+  "persona": {
+    "name": "DefaultBot",
+    "role": "worker",
+    "description": "",
+    "traits": [],
+    "system_prompt": "",
+    "extra": [],
+    "version": 1
+  }
+}"#;
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = Arc::new(MockModel::new());
+        let agent = Agent::from_json(json_without_distill, store, model).unwrap();
+        assert!(
+            agent.should_distill(),
+            "missing distill field → defaults to true (ON)"
+        );
+    }
+
+    /// Explicit `distill: false` opts out.
+    #[test]
+    fn agent_record_explicit_false_distill_opts_out() {
+        let json_with_false = r#"{
+  "id": "01HXYZAGENTNODISTILL0",
+  "persona": {
+    "name": "OptOutBot",
+    "role": "worker",
+    "description": "",
+    "traits": [],
+    "system_prompt": "",
+    "extra": [],
+    "version": 1
+  },
+  "distill": false
+}"#;
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = Arc::new(MockModel::new());
+        let agent = Agent::from_json(json_with_false, store, model).unwrap();
+        assert!(!agent.should_distill(), "distill=false → opts out");
+    }
+
+    /// Explicit `distill: true` stays ON.
+    #[test]
+    fn agent_record_explicit_true_distill_stays_on() {
+        let json_with_true = r#"{
+  "id": "01HXYZAGENTNODISTILL0",
+  "persona": {
+    "name": "OnBot",
+    "role": "worker",
+    "description": "",
+    "traits": [],
+    "system_prompt": "",
+    "extra": [],
+    "version": 1
+  },
+  "distill": true
+}"#;
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = Arc::new(MockModel::new());
+        let agent = Agent::from_json(json_with_true, store, model).unwrap();
+        assert!(agent.should_distill(), "distill=true → ON");
+    }
 }

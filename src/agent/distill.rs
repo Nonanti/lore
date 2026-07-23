@@ -377,4 +377,101 @@ mod tests {
         assert_eq!(kind_to_cat("unknown"), SemanticCat::Fact);
         assert_eq!(kind_to_cat("ConventionFoo"), SemanticCat::Convention);
     }
+
+    // ── distill_work with verify_log >8 KiB truncates the prompt ────
+
+    /// Capturing model: records the Prompt.user field so we can assert
+    /// that the verify-log tail was truncated.
+    struct CapturePromptModel {
+        reply: String,
+        captured: Mutex<Option<String>>,
+    }
+
+    impl CapturePromptModel {
+        fn new(reply: &str) -> Self {
+            Self {
+                reply: reply.to_string(),
+                captured: Mutex::new(None),
+            }
+        }
+
+        fn captured_user(&self) -> String {
+            self.captured.lock().unwrap().clone().unwrap_or_default()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Model for CapturePromptModel {
+        async fn complete(&self, p: &Prompt) -> crate::error::Result<Completion> {
+            *self.captured.lock().unwrap() = Some(p.user.clone());
+            Ok(Completion::new(self.reply.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn distill_work_verify_log_over_8kib_truncates_prompt() {
+        // Verify log is 10 KiB; the distillation prompt should only include
+        // the tail (last 8 KiB + truncation marker).
+        let model = Arc::new(CapturePromptModel::new("[]"));
+        let agent = agent_with_model(model.clone());
+
+        let ws = make_temp_dir("distill-8k-cap");
+        let spec = WorkSpec::new("big task", ws.clone(), vec!["exit 0".to_string()]).unwrap();
+        let huge_log = "X".repeat(10 * 1024); // 10 KiB verify log
+        let report = WorkReport {
+            success: true,
+            iterations: 1,
+            answer: "done".to_string(),
+            verify_log: huge_log,
+        };
+
+        let count = agent.distill_work(&spec, &report).await.unwrap();
+        assert_eq!(count, 0, "empty list from model → Ok(0)");
+
+        let prompt_user = model.captured_user();
+        assert!(
+            prompt_user.contains("[... truncated]"),
+            "prompt should contain truncation marker: first 200 chars: {}",
+            &prompt_user[..prompt_user.len().min(200)]
+        );
+        // The verify-log portion in the prompt must not exceed 8 KiB + marker overhead.
+        // Extract the verify-log section between "Verify log (tail):" and "Iterations:"
+        let verify_section_start =
+            prompt_user.find("Verify log (tail):\n").unwrap() + "Verify log (tail):\n".len();
+        let verify_section_end = prompt_user.find("\nIterations:").unwrap();
+        let verify_section = &prompt_user[verify_section_start..verify_section_end];
+        assert!(
+            verify_section.len() <= DISTILL_VERIFY_TAIL_CAP + DISTILL_TAIL_MARKER.len(),
+            "verify section in prompt should be ≤ cap + marker: got {} bytes",
+            verify_section.len()
+        );
+        cleanup(&ws);
+    }
+
+    // ── distill_work stores at most 3 items even if model returns more ──
+
+    #[tokio::test]
+    async fn distill_work_caps_stored_items_at_max_3() {
+        // Model returns 5 items, but only 3 should be stored (DISTILL_MAX_ITEMS).
+        let items = serde_json::json!([
+            {"kind":"fact","title":"f1","body":"b1"},
+            {"kind":"fact","title":"f2","body":"b2"},
+            {"kind":"convention","title":"c3","body":"b3"},
+            {"kind":"fact","title":"f4","body":"b4"},
+            {"kind":"fact","title":"f5","body":"b5"}
+        ]);
+        let model = Arc::new(ScriptedModel::new(&[&items.to_string()]));
+        let agent = agent_with_model(model);
+        let (spec, report) = spec_and_report();
+
+        let count = agent.distill_work(&spec, &report).await.unwrap();
+        assert_eq!(count, 3, "only 3 items should be stored (max cap)");
+
+        let sem = agent
+            .recall(&Query::new("").tier(Tier::Semantic).limit(10))
+            .await
+            .unwrap();
+        assert_eq!(sem.len(), 3, "3 semantic records in memory");
+        cleanup(&report.verify_log.into());
+    }
 }
