@@ -4,6 +4,12 @@
 //! stdout + stderr + exit status, and truncates large output. Non-zero exit
 //! returns `Ok(text)` with the exit code + output — only spawn failure,
 //! timeout, and policy denial are `Err`.
+//!
+//! **Security boundary:** commands containing shell metacharacters (`;`, `|`,
+//! `&&`, `||`, backticks, `$()`, `${}`) are denied unless `default_exec` is
+//! `Allow`. This prevents chaining attacks (e.g. `ls; bash -i ...`). The
+//! auto-allow list matches the first whitespace-delimited token of the
+//! command — word-boundary matching prevents `ls` from allowing `lsof`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,6 +30,22 @@ const DEFAULT_MAX_OUTPUT: usize = 32 * 1024;
 
 /// Truncation marker appended when output exceeds the cap.
 const TRUNCATION_MARKER: &str = "\n[... output truncated]";
+
+/// Round down to the nearest UTF-8 char boundary ≤ `index`.
+///
+/// `String::truncate(new_len)` panics if `new_len` is not on a char
+/// boundary. This helper finds the closest valid byte offset so we
+/// can truncate safely even with multi-byte characters near the limit.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut i = index;
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
 
 /// Shell tool: runs commands via the policy gate.
 #[derive(Clone, Debug)]
@@ -78,7 +100,9 @@ impl Tool for ShellTool {
             return Err(LoreError::InvalidInput("shell command required".into()));
         }
 
-        // Policy gate check.
+        // Reject shell metacharacters to prevent chaining attacks
+        // (e.g. `ls; bash -i`, `echo $(python...)`). Commands with
+        // default_exec: Allow bypass this check.
         self.gate
             .check(&Action::Exec {
                 command: command.to_string(),
@@ -101,21 +125,27 @@ impl Tool for ShellTool {
         let stderr_pipe = child.stderr.take();
 
         // Read stdout and stderr concurrently into buffers.
+        // Use read_to_end + from_utf8_lossy to handle binary output
+        // gracefully instead of silently discarding InvalidData errors.
         let stdout_fut = async {
-            let mut buf = String::new();
+            let mut buf = Vec::new();
             if let Some(mut pipe) = stdout_pipe {
                 use tokio::io::AsyncReadExt;
-                let _ = AsyncReadExt::read_to_string(&mut pipe, &mut buf).await;
+                if let Err(e) = AsyncReadExt::read_to_end(&mut pipe, &mut buf).await {
+                    buf.extend_from_slice(format!("\n[stdout read error: {e}]").as_bytes());
+                }
             }
-            buf
+            String::from_utf8_lossy(&buf).into_owned()
         };
         let stderr_fut = async {
-            let mut buf = String::new();
+            let mut buf = Vec::new();
             if let Some(mut pipe) = stderr_pipe {
                 use tokio::io::AsyncReadExt;
-                let _ = AsyncReadExt::read_to_string(&mut pipe, &mut buf).await;
+                if let Err(e) = AsyncReadExt::read_to_end(&mut pipe, &mut buf).await {
+                    buf.extend_from_slice(format!("\n[stderr read error: {e}]").as_bytes());
+                }
             }
-            buf
+            String::from_utf8_lossy(&buf).into_owned()
         };
 
         // Race: read output + wait for exit, against the timeout.
@@ -138,12 +168,18 @@ impl Tool for ShellTool {
                     }
                     text.push_str(&stderr);
                 }
-                text.push_str(&format!("\n[exit code: {code}]"));
 
-                if text.len() > self.max_output {
-                    text.truncate(self.max_output);
+                // Truncate BEFORE appending exit code so the marker is
+                // always visible to the LLM (M1 fix). Use char-boundary-
+                // safe truncation to avoid panics on multi-byte UTF-8
+                // (C1 fix).
+                let truncated = text.len() > self.max_output;
+                if truncated {
+                    let cap = floor_char_boundary(&text, self.max_output);
+                    text.truncate(cap);
                     text.push_str(TRUNCATION_MARKER);
                 }
+                text.push_str(&format!("\n[exit code: {code}]"));
                 Ok(text)
             }
             Err(_) => {
@@ -329,5 +365,72 @@ mod tests {
         let tool2 = ShellTool::new(gate2, root).with_max_output(5);
         let out2 = tool2.run("echo 1234567890").await.unwrap();
         assert!(out2.contains(TRUNCATION_MARKER), "should truncate: {out2}");
+    }
+
+    #[test]
+    fn floor_char_boundary_ascii() {
+        // ASCII: every byte is a char boundary.
+        assert_eq!(floor_char_boundary("hello", 3), 3);
+        assert_eq!(floor_char_boundary("hello", 5), 5);
+        assert_eq!(floor_char_boundary("hello", 100), 5); // index >= len → len
+    }
+
+    #[test]
+    fn floor_char_boundary_multibyte() {
+        // CJK: each char is 3 bytes. "你好" = 6 bytes.
+        // Byte 4 is mid-char (char 你 = bytes 0-2, char 好 = bytes 3-5).
+        assert_eq!(floor_char_boundary("你好", 4), 3);
+        assert_eq!(floor_char_boundary("你好", 5), 3);
+        assert_eq!(floor_char_boundary("你好", 3), 3);
+        assert_eq!(floor_char_boundary("你好", 6), 6);
+        // Emoji: 🎉 is 4 bytes (F0 9F 8E 89).
+        assert_eq!(floor_char_boundary("🎉hello", 2), 0);
+        assert_eq!(floor_char_boundary("🎉hello", 3), 0);
+        assert_eq!(floor_char_boundary("🎉hello", 4), 4);
+    }
+
+    #[tokio::test]
+    async fn shell_truncation_preserves_exit_code() {
+        // M1 fix: exit code must always be visible even when output is truncated.
+        let root = std::env::temp_dir();
+        let gate = allow_gate(root.clone());
+        let tool = ShellTool::new(gate, root).with_max_output(32);
+        // Generate enough output to trigger truncation.
+        // Use a simple echo command that produces enough chars.
+        let out = tool
+            .run(r#"python3 -c 'print("A" * 200)' 2>/dev/null || printf 'AAAA_BBBB_CCCC_DDDD_EEEE_FFFF_GGGG_HHHH_IIII_JJJJ'"#)
+            .await
+            .unwrap();
+        // Exit code must appear AFTER truncation marker.
+        assert!(
+            out.contains("[exit code:"),
+            "exit code must be present: {out}"
+        );
+        // Truncation marker must also appear.
+        assert!(out.contains(TRUNCATION_MARKER), "must truncate: {out}");
+        // Exit code comes AFTER truncation marker in the string.
+        let trunc_idx = out.find(TRUNCATION_MARKER).unwrap();
+        let exit_idx = out.find("[exit code:").unwrap();
+        assert!(exit_idx > trunc_idx, "exit code after truncation: {out}");
+    }
+
+    #[tokio::test]
+    async fn shell_shell_metacharacters_denied() {
+        // C2 fix: commands with shell metacharacters are denied when
+        // default_exec != Allow.
+        let root = std::env::temp_dir();
+        let p = Policy {
+            roots: vec![root.clone()],
+            auto_allow: vec![],
+            deny: vec![],
+            default_exec: DefaultExec::Ask, // NOT Allow → metachars blocked
+            ask_on_write: false,
+        };
+        let gate = Arc::new(Gate::new(p, Arc::new(DenyAll)));
+        let tool = ShellTool::new(gate, root);
+        let result = tool.run("ls; echo hello").await;
+        assert!(result.is_err(), "semicolon chaining → denied");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("metacharacter"), "error: {err}");
     }
 }

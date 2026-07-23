@@ -96,7 +96,7 @@ impl Approver for CliApprover {
 /// `PolicyDenied`, Ask → delegates to the approver.
 pub struct Gate {
     /// Policy engine (pure evaluation).
-    pub policy: super::Policy,
+    pub(crate) policy: super::Policy,
     /// Approver for Ask verdicts.
     pub approver: Arc<dyn Approver>,
 }

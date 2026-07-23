@@ -4,8 +4,17 @@
 //! [`Policy::evaluate`], which returns a [`Verdict`] (Allow / Ask / Deny).
 //! Deny-list wins over allow-list; path containment uses canonicalization
 //! of the nearest existing ancestor to handle not-yet-created files.
+//!
+//! **Security boundary for exec:** commands containing shell metacharacters
+//! (`;`, `|`, `&&`, `||`, backticks, `$()`, `${}`) are denied unless
+//! `default_exec` is `Allow`. Auto-allow uses word-boundary matching on
+//! the first token — `ls` allows `ls -la` but not `lsof`.
 
 pub mod approval;
+
+/// Shell metacharacters that enable command chaining. Commands containing
+/// any of these are denied unless `default_exec` is `Allow`.
+const SHELL_METACHARACTERS: &[&str] = &[";", "|", "&&", "||", "`", "$(", "${"];
 
 use std::path::{Path, PathBuf};
 
@@ -97,6 +106,7 @@ impl Policy {
             ],
             deny: vec![
                 "sudo".into(),
+                "su".into(),
                 "rm -rf /".into(),
                 "git push --force".into(),
                 "shutdown".into(),
@@ -135,15 +145,32 @@ impl Policy {
                         };
                     }
                 }
+                // Shell metacharacter check: reject chaining unless
+                // default_exec is Allow (full-auto trust).
+                if self.default_exec != DefaultExec::Allow {
+                    for mc in SHELL_METACHARACTERS {
+                        if command.contains(mc) {
+                            return Verdict::Deny {
+                                reason: format!(
+                                    "command contains shell metacharacter \"{mc}\" — chaining not allowed"
+                                ),
+                            };
+                        }
+                    }
+                }
                 // Cwd must be inside a root.
                 if !self.is_inside_root(cwd) {
                     return Verdict::Deny {
                         reason: "cwd is outside allowed roots".into(),
                     };
                 }
-                // Auto-allow prefix match.
+                // Auto-allow: word-boundary match on first token.
+                // `command == a` (exact) or `command.starts_with("{a} ")`
+                // (prefix followed by whitespace) — prevents `ls` from
+                // allowing `lsof` or `lsblk`.
+                let first_token = command.split_whitespace().next().unwrap_or(command);
                 for a in &self.auto_allow {
-                    if command.starts_with(a) {
+                    if first_token == a || command.starts_with(&format!("{a} ")) {
                         return Verdict::Allow;
                     }
                 }
@@ -200,14 +227,18 @@ impl Policy {
         serde_json::from_str(&text).map_err(crate::error::LoreError::from)
     }
 
-    /// Save policy to a JSON file (creates parent dirs).
+    /// Save policy to a JSON file (atomic: tmp + rename).
     pub fn save(&self, path: &Path) -> crate::error::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| crate::error::LoreError::Storage(e.to_string()))?;
         }
         let text = serde_json::to_string_pretty(self).map_err(crate::error::LoreError::from)?;
-        std::fs::write(path, text).map_err(|e| crate::error::LoreError::Storage(e.to_string()))
+        // Atomic write: tmp file + rename prevents corrupt JSON on crash.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &text).map_err(|e| crate::error::LoreError::Storage(e.to_string()))?;
+        std::fs::rename(&tmp, path).map_err(|e| crate::error::LoreError::Storage(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -327,31 +358,34 @@ mod tests {
     // ── Auto-allow prefix matching ───────────────────────────────────────
 
     #[test]
-    fn auto_allow_prefix_match() {
+    fn auto_allow_word_boundary_match() {
         let root = PathBuf::from("/tmp");
         let p = test_policy(root.clone());
-        // "cargo test" prefix matches "cargo test -- --test-threads=1".
+        // "cargo test" word-boundary matches "cargo test -- --test-threads=1".
         let v = p.evaluate(&Action::Exec {
             command: "cargo test -- --test-threads=1".into(),
             cwd: root.clone(),
         });
         assert_eq!(v, Verdict::Allow);
-        // "ls" prefix matches "ls -la /tmp".
+        // "ls" word-boundary matches "ls -la /tmp".
         let v2 = p.evaluate(&Action::Exec {
             command: "ls -la /tmp".into(),
             cwd: root.clone(),
         });
         assert_eq!(v2, Verdict::Allow);
-        // "lsx" does prefix-match "ls" — this IS auto-allowed.
+        // "lsx" does NOT match "ls" with word-boundary — Ask.
         let v3 = p.evaluate(&Action::Exec {
             command: "lsx -la".into(),
-            cwd: root,
+            cwd: root.clone(),
         });
-        assert_eq!(v3, Verdict::Allow);
-        // A command that doesn't start with any auto_allow entry → Ask.
+        assert!(
+            matches!(v3, Verdict::Ask { .. }),
+            "lsx should not auto-allow via ls: {v3:?}"
+        );
+        // A command that doesn't match any auto_allow entry → Ask.
         let v4 = p.evaluate(&Action::Exec {
             command: "some-unknown-command".into(),
-            cwd: PathBuf::from("/tmp"),
+            cwd: root,
         });
         assert!(matches!(v4, Verdict::Ask { .. }));
     }
@@ -595,6 +629,7 @@ mod tests {
         let p = Policy::default_for(PathBuf::from("/my/project"));
         // Core dangerous commands should be in the deny list.
         assert!(p.deny.iter().any(|d| d == "sudo"), "sudo in deny list");
+        assert!(p.deny.iter().any(|d| d == "su"), "su in deny list");
         assert!(
             p.deny.iter().any(|d| d == "rm -rf /"),
             "rm -rf / in deny list"
@@ -609,5 +644,91 @@ mod tests {
         assert!(!p.ask_on_write);
         // Should have at least some auto_allow entries.
         assert!(!p.auto_allow.is_empty(), "auto_allow should not be empty");
+    }
+
+    // ── Shell metacharacter denial ───────────────────────────────────────────
+
+    #[test]
+    fn shell_metacharacters_denied_when_default_is_not_allow() {
+        let root = PathBuf::from("/tmp");
+        let p = test_policy(root.clone());
+        // default_exec = Ask → metacharacters are denied.
+        // Semicolon chaining.
+        let v = p.evaluate(&Action::Exec {
+            command: "ls; bash -i".into(),
+            cwd: root.clone(),
+        });
+        assert!(
+            matches!(v, Verdict::Deny { .. }),
+            "semicolon chaining → deny: {v:?}"
+        );
+        // Pipe chaining.
+        let v2 = p.evaluate(&Action::Exec {
+            command: "echo hello | bash".into(),
+            cwd: root.clone(),
+        });
+        assert!(
+            matches!(v2, Verdict::Deny { .. }),
+            "pipe chaining → deny: {v2:?}"
+        );
+        // && chaining.
+        let v3 = p.evaluate(&Action::Exec {
+            command: "ls && rm -rf /".into(),
+            cwd: root.clone(),
+        });
+        assert!(
+            matches!(v3, Verdict::Deny { .. }),
+            "&& chaining → deny: {v3:?}"
+        );
+        // Command substitution.
+        let v4 = p.evaluate(&Action::Exec {
+            command: "echo $(cat /etc/passwd)".into(),
+            cwd: root.clone(),
+        });
+        assert!(
+            matches!(v4, Verdict::Deny { .. }),
+            "$() substitution → deny: {v4:?}"
+        );
+        // Backtick substitution.
+        let v5 = p.evaluate(&Action::Exec {
+            command: "echo `whoami`".into(),
+            cwd: root.clone(),
+        });
+        assert!(
+            matches!(v5, Verdict::Deny { .. }),
+            "backtick substitution → deny: {v5:?}"
+        );
+        // ${} substitution.
+        let v6 = p.evaluate(&Action::Exec {
+            command: "echo ${PATH}".into(),
+            cwd: root.clone(),
+        });
+        assert!(
+            matches!(v6, Verdict::Deny { .. }),
+            "dollar-brace substitution -> deny: {:?}",
+            v6
+        );
+    }
+
+    #[test]
+    fn shell_metacharacters_allowed_when_default_exec_is_allow() {
+        let root = PathBuf::from("/tmp");
+        let p = Policy {
+            roots: vec![root.clone()],
+            auto_allow: vec![],
+            deny: vec![],
+            default_exec: DefaultExec::Allow,
+            ask_on_write: false,
+        };
+        // default_exec = Allow → metacharacters are NOT blocked.
+        let v = p.evaluate(&Action::Exec {
+            command: "ls; echo ok".into(),
+            cwd: root,
+        });
+        assert_eq!(
+            v,
+            Verdict::Allow,
+            "Allow mode bypasses metachar check: {v:?}"
+        );
     }
 }

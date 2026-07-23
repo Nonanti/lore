@@ -112,7 +112,9 @@ pub struct FileWriteTool {
 impl FileWriteTool {
     /// New write tool with the given gate and workspace root.
     pub fn new(gate: Arc<Gate>, root: PathBuf) -> Self {
-        let _ = std::fs::create_dir_all(&root);
+        if let Err(e) = std::fs::create_dir_all(&root) {
+            tracing::warn!("cannot create root dir {}: {e}", root.display());
+        }
         Self { gate, root }
     }
 }
@@ -180,7 +182,9 @@ pub struct FileEditTool {
 impl FileEditTool {
     /// New edit tool with the given gate and workspace root.
     pub fn new(gate: Arc<Gate>, root: PathBuf) -> Self {
-        let _ = std::fs::create_dir_all(&root);
+        if let Err(e) = std::fs::create_dir_all(&root) {
+            tracing::warn!("cannot create root dir {}: {e}", root.display());
+        }
         Self { gate, root }
     }
 }
