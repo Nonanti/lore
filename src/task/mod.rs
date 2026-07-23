@@ -271,7 +271,7 @@ impl TaskStore {
             .query_row(
                 "SELECT id, agent, goal, workspace, verify, status, created_at, updated_at, report
                  FROM tasks WHERE status = 'Queued'
-                 ORDER BY created_at ASC LIMIT 1",
+                 ORDER BY created_at ASC, id ASC LIMIT 1",
                 [],
                 |r| self.read_task_row(r),
             )
@@ -411,6 +411,10 @@ impl TaskStore {
     }
 
     /// Decide on an approval: set Approved or Denied, record `decided_at`.
+    ///
+    /// Idempotent: only updates rows where `status = 'Pending'`. If the
+    /// approval was already decided or the id does not exist, returns
+    /// [`LoreError::InvalidInput`] with a descriptive message.
     pub fn decide_approval(&self, id: &str, approve: bool) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let status = if approve {
@@ -421,14 +425,78 @@ impl TaskStore {
         let changed = self
             .conn
             .execute(
-                "UPDATE approvals SET status = ?1, decided_at = ?2 WHERE id = ?3",
+                "UPDATE approvals SET status = ?1, decided_at = ?2 WHERE id = ?3 AND status = 'Pending'",
                 params![status.as_str(), now, id],
             )
             .map_err(sqlite_err)?;
         if changed == 0 {
-            return Err(LoreError::NotFound(format!("approval {id}")));
+            // Distinguish: not found vs already decided.
+            let existing = self.approval_status(id)?;
+            match existing {
+                None => return Err(LoreError::NotFound(format!("approval {id}"))),
+                Some(s) => {
+                    return Err(LoreError::InvalidInput(format!(
+                        "approval {id} already decided ({})",
+                        s.as_str()
+                    )));
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Crash-recovery sweep: reset tasks stuck in `Running` or
+    /// `WaitingApproval` back to `Queued`, and mark their stale `Pending`
+    /// approvals as `Denied`. Returns the number of orphaned tasks
+    /// re-queued.
+    ///
+    /// Call on daemon startup, before entering the poll loop, so that
+    /// crash-orphaned tasks are visible to `next_queued()` again.
+    pub fn recover_orphaned(&self) -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+
+        // Mark stale Pending approvals for orphaned tasks as Denied.
+        let denied = self
+            .conn
+            .execute(
+                "UPDATE approvals SET status = 'Denied', decided_at = ?1\n                 WHERE status = 'Pending'\n                   AND task_id IN (SELECT id FROM tasks WHERE status IN ('Running', 'WaitingApproval'))",
+                params![now],
+            )
+            .map_err(sqlite_err)?;
+        if denied > 0 {
+            tracing::info!(
+                count = denied,
+                "denied stale Pending approvals for orphaned tasks"
+            );
+        }
+
+        // Re-queue orphaned Running/WaitingApproval tasks.
+        let requeued = self
+            .conn
+            .execute(
+                "UPDATE tasks SET status = 'Queued', updated_at = ?1\n                 WHERE status IN ('Running', 'WaitingApproval')",
+                params![now],
+            )
+            .map_err(sqlite_err)?;
+        if requeued > 0 {
+            tracing::info!(count = requeued, "re-queued orphaned tasks on startup");
+        }
+
+        Ok(requeued)
+    }
+
+    /// Deny all Pending approvals for a specific task (used on SIGINT
+    /// re-queue and crash recovery to clear stale approvals).
+    pub fn deny_pending_approvals_for_task(&self, task_id: &str) -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        let denied = self
+            .conn
+            .execute(
+                "UPDATE approvals SET status = 'Denied', decided_at = ?1\n                 WHERE task_id = ?2 AND status = 'Pending'",
+                params![now, task_id],
+            )
+            .map_err(sqlite_err)?;
+        Ok(denied)
     }
 
     // ── Row mappers ────────────────────────────────────────────────────
@@ -800,5 +868,215 @@ mod tests {
         // Timestamps should be equal (RFC3339 preserves UTC).
         assert_eq!(loaded.created_at, t.created_at);
         assert_eq!(loaded.updated_at, t.updated_at);
+    }
+
+    // ── next_queued skips non-Queued tasks ────────────────────────────
+
+    #[test]
+    fn next_queued_skips_non_queued() {
+        let store = TaskStore::in_memory().unwrap();
+
+        // Enqueue 4 tasks, set statuses to Running, Completed, Failed, WaitingApproval.
+        let t1 = store.enqueue(new_task("a1", "running goal")).unwrap();
+        store.set_status(&t1.id, TaskStatus::Running).unwrap();
+
+        let t2 = store.enqueue(new_task("a2", "completed goal")).unwrap();
+        store.set_status(&t2.id, TaskStatus::Completed).unwrap();
+
+        let t3 = store.enqueue(new_task("a3", "failed goal")).unwrap();
+        store.set_status(&t3.id, TaskStatus::Failed).unwrap();
+
+        let t4 = store.enqueue(new_task("a4", "waiting goal")).unwrap();
+        store
+            .set_status(&t4.id, TaskStatus::WaitingApproval)
+            .unwrap();
+
+        // Enqueue one more that stays Queued.
+        let t_queued = store.enqueue(new_task("a5", "queued goal")).unwrap();
+
+        let next = store.next_queued().unwrap().unwrap();
+        assert_eq!(next.id, t_queued.id, "only the Queued task is returned");
+    }
+
+    // ── decide_approval on already-decided entry (current: overwrites) ──
+
+    #[test]
+    fn decide_approval_idempotent_rejects_already_decided() {
+        let store = TaskStore::in_memory().unwrap();
+        let t = store.enqueue(new_task("a", "goal")).unwrap();
+        let approval_id = store.add_approval(&t.id, "{}", "test").unwrap();
+
+        // Decide: approve.
+        store.decide_approval(&approval_id, true).unwrap();
+        let status = store.approval_status(&approval_id).unwrap().unwrap();
+        assert_eq!(status, ApprovalStatus::Approved);
+
+        // Re-decide: should fail — already decided.
+        let err = store.decide_approval(&approval_id, false).unwrap_err();
+        assert!(
+            matches!(err, LoreError::InvalidInput(_)),
+            "re-deciding should return InvalidInput: {err:?}"
+        );
+
+        // Status unchanged — still Approved (not overwritten to Denied).
+        let status = store.approval_status(&approval_id).unwrap().unwrap();
+        assert_eq!(
+            status,
+            ApprovalStatus::Approved,
+            "status unchanged after rejected re-decide"
+        );
+
+        // No pending entries.
+        let pending = store.pending_approvals().unwrap();
+        assert_eq!(pending.len(), 0, "no pending after decision");
+    }
+
+    // ── WAL: two connections on same DB, no deadlock ───────────────────
+
+    #[test]
+    fn wal_two_connections_no_deadlock() {
+        let db = TmpDb::new();
+        let conn1 = TaskStore::open(db.path()).unwrap();
+        let conn2 = TaskStore::open(db.path()).unwrap();
+
+        // Enqueue on conn1.
+        let t1 = conn1.enqueue(new_task("wal1", "goal1")).unwrap();
+
+        // Read on conn2 — should see the task.
+        let next = conn2.next_queued().unwrap().unwrap();
+        assert_eq!(next.id, t1.id, "conn2 sees conn1's enqueue");
+
+        // Set status on conn2.
+        conn2.set_status(&t1.id, TaskStatus::Running).unwrap();
+
+        // Verify on conn1.
+        let loaded = conn1.get(&t1.id).unwrap().unwrap();
+        assert_eq!(
+            loaded.status,
+            TaskStatus::Running,
+            "conn1 sees conn2's update"
+        );
+
+        // Enqueue on conn2 while conn1 is also writing.
+        let _t2 = conn2.enqueue(new_task("wal2", "goal2")).unwrap();
+        let list = conn1.list(100).unwrap();
+        assert_eq!(list.len(), 2, "conn1 sees both tasks");
+    }
+
+    // ── Approval decide visible across connections ──────────────────────
+
+    #[test]
+    fn approval_decide_visible_across_connections() {
+        let db = TmpDb::new();
+        let writer = TaskStore::open(db.path()).unwrap();
+        let reader = TaskStore::open(db.path()).unwrap();
+
+        let t = writer.enqueue(new_task("a", "goal")).unwrap();
+        let approval_id = writer
+            .add_approval(&t.id, "{}", "cross-conn reason")
+            .unwrap();
+
+        // Writer decides: approve.
+        writer.decide_approval(&approval_id, true).unwrap();
+
+        // Reader sees the decision.
+        let status = reader.approval_status(&approval_id).unwrap().unwrap();
+        assert_eq!(
+            status,
+            ApprovalStatus::Approved,
+            "decision visible across connections"
+        );
+
+        // Reader sees no pending approvals.
+        let pending = reader.pending_approvals().unwrap();
+        assert_eq!(pending.len(), 0, "no pending after cross-connection decide");
+    }
+
+    // ── Crash recovery: recover_orphaned ──────────────────────────────
+
+    #[test]
+    fn recover_orphaned_requeues_running_and_waiting_approval() {
+        let store = TaskStore::in_memory().unwrap();
+
+        // Task stuck in Running (daemon crash).
+        let t1 = store.enqueue(new_task("a1", "running goal")).unwrap();
+        store.set_status(&t1.id, TaskStatus::Running).unwrap();
+
+        // Task stuck in WaitingApproval with a Pending approval.
+        let t2 = store.enqueue(new_task("a2", "waiting goal")).unwrap();
+        store
+            .set_status(&t2.id, TaskStatus::WaitingApproval)
+            .unwrap();
+        let approval_id = store.add_approval(&t2.id, "{}", "stale approval").unwrap();
+
+        // A normally queued task stays untouched.
+        let t3 = store.enqueue(new_task("a3", "queued goal")).unwrap();
+
+        // Recover.
+        let requeued = store.recover_orphaned().unwrap();
+        assert_eq!(requeued, 2, "two orphaned tasks re-queued");
+
+        // Both orphaned tasks are now Queued.
+        let loaded1 = store.get(&t1.id).unwrap().unwrap();
+        assert_eq!(loaded1.status, TaskStatus::Queued, "Running task re-queued");
+
+        let loaded2 = store.get(&t2.id).unwrap().unwrap();
+        assert_eq!(
+            loaded2.status,
+            TaskStatus::Queued,
+            "WaitingApproval task re-queued"
+        );
+
+        // The stale approval is now Denied.
+        let approval = store.approval_status(&approval_id).unwrap().unwrap();
+        assert_eq!(
+            approval,
+            ApprovalStatus::Denied,
+            "stale approval marked Denied"
+        );
+
+        // t3 remains Queued (was never orphaned).
+        let loaded3 = store.get(&t3.id).unwrap().unwrap();
+        assert_eq!(loaded3.status, TaskStatus::Queued, "normal task unaffected");
+
+        // next_queued picks t1 first (earliest created_at).
+        let next = store.next_queued().unwrap().unwrap();
+        assert_eq!(next.id, t1.id, "FIFO order preserved after recovery");
+    }
+
+    #[test]
+    fn recover_orphaned_no_orphans_is_zero() {
+        let store = TaskStore::in_memory().unwrap();
+        let requeued = store.recover_orphaned().unwrap();
+        assert_eq!(requeued, 0, "no orphans → 0 re-queued");
+    }
+
+    // ── FIFO tiebreaker: id ordering ──────────────────────────────────
+
+    #[test]
+    fn fifo_tiebreaker_by_id_when_same_created_at() {
+        let store = TaskStore::in_memory().unwrap();
+
+        // Insert two tasks with identical created_at by directly writing rows
+        // (enqueue generates unique timestamps, so we can't rely on it).
+        let now = Utc::now().to_rfc3339();
+        let verify_json = serde_json::to_string(&vec!["echo ok"]).unwrap();
+
+        // IDs: smaller ULID first alphabetically.
+        let id_a = "01ARZ00000000000000000000"; // smallest ULID-like id
+        let id_b = "01ARZ99999999999999999999"; // larger ULID-like id
+
+        for (id, agent) in [(id_a, "first"), (id_b, "second")] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO tasks (id, agent, goal, workspace, verify, status, created_at, updated_at)\n                     VALUES (?1, ?2, ?3, ?4, ?5, 'Queued', ?6, ?7)",
+                    rusqlite::params![id, agent, "goal", "/tmp", verify_json, now, now],
+                )
+                .unwrap();
+        }
+
+        let next = store.next_queued().unwrap().unwrap();
+        assert_eq!(next.id, id_a, "FIFO tiebreaker: smaller id comes first");
     }
 }

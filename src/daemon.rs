@@ -106,8 +106,10 @@ pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Resu
         .data_dir
         .join("memory")
         .join(format!("{}.db", task.agent));
-    std::fs::create_dir_all(mem_path.parent().expect("memory dir has parent"))
-        .map_err(|e| crate::error::LoreError::Storage(e.to_string()))?;
+    let parent = mem_path
+        .parent()
+        .ok_or_else(|| crate::error::LoreError::Storage("memory dir has no parent".into()))?;
+    std::fs::create_dir_all(parent).map_err(|e| crate::error::LoreError::Storage(e.to_string()))?;
     let mem_store: Arc<dyn MemoryStore> = Arc::new(
         SqliteStore::open(&mem_path.to_string_lossy())
             .map_err(|e| crate::error::LoreError::Storage(e.to_string()))?
@@ -175,8 +177,7 @@ pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Resu
         Ok(r) => r,
         Err(e) => {
             let msg = format!("work loop error: {e}");
-            tracing::error!(task_id, error = %e, "{}
-", msg);
+            tracing::error!(task_id, error = %e, "{msg}");
             log.write_line(&format!("[daemon] FATAL: {msg}"));
             let report_json = serde_json::to_string(&WorkReport {
                 success: false,
@@ -215,6 +216,17 @@ pub async fn run_daemon(data_dir: &Path, db_path: &Path) -> Result<()> {
     let store = TaskStore::open(db_path)?;
     let model = build_model_from_env(data_dir);
 
+    // Crash recovery: sweep orphaned tasks left from a previous crash
+    // or kill. Resets Running/WaitingApproval → Queued and denies
+    // stale Pending approvals.
+    let recovered = store.recover_orphaned()?;
+    if recovered > 0 {
+        tracing::info!(
+            count = recovered,
+            "re-queued orphaned tasks from previous run"
+        );
+    }
+
     let deps = TaskDeps {
         data_dir: data_dir.to_path_buf(),
         model,
@@ -247,13 +259,19 @@ pub async fn run_daemon(data_dir: &Path, db_path: &Path) -> Result<()> {
         tracing::info!(task_id = %task.id, agent = %task.agent, "dequeued task");
         store.set_status(&task.id, TaskStatus::Running)?;
 
-        // Run task, with shutdown-awareness: if SIGTERM arrives mid-run,
-        // mark the task Queued again for later resumption.
+        // Run task, with shutdown-awareness: if SIGINT arrives mid-run,
+        // mark the task Queued again for later resumption. NOTE: cancellation
+        // is at the next Tokio await point (shell command, LLM call, approval
+        // poll) — "finish current verify command" is best-effort, not a
+        // guaranteed checkpoint.
         let result = tokio::select! {
             r = run_task(&store, &task.id, &deps) => r,
             _ = shutdown_rx.recv() => {
-                tracing::warn!(task_id = %task.id, "shutdown mid-run — re-queuing task");
+                tracing::warn!(task_id = %task.id, "shutdown mid-run — re-queuing task + denying stale approvals");
                 store.set_status(&task.id, TaskStatus::Queued)?;
+                // Deny any Pending approvals for the re-queued task to avoid
+                // inbox clutter from a stale partial work cycle.
+                store.deny_pending_approvals_for_task(&task.id)?;
                 break;
             }
         };

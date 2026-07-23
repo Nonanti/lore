@@ -503,9 +503,13 @@ fn handle_task(data: &str, cmd: TaskCmd) -> anyhow::Result<()> {
             workspace,
             verify,
         } => {
-            let ws = workspace
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let ws = workspace.map(std::path::PathBuf::from).unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+            // Canonicalize to an absolute path before storing, so the
+            // daemon (which may run from a different CWD, e.g. systemd)
+            // resolves the workspace correctly.
+            let ws = ws.canonicalize().unwrap_or(ws);
             let new_task = NewTask {
                 agent,
                 goal,
@@ -522,8 +526,9 @@ fn handle_task(data: &str, cmd: TaskCmd) -> anyhow::Result<()> {
             } else {
                 // Compact table: id, agent, status, age, goal(60ch).
                 for t in &tasks {
-                    let age = t.created_at.signed_duration_since(chrono::Utc::now());
-                    let mins = -age.num_minutes();
+                    let mins = chrono::Utc::now()
+                        .signed_duration_since(t.created_at)
+                        .num_minutes();
                     let goal_short = if t.goal.chars().count() > 60 {
                         let mut s: String = t.goal.chars().take(57).collect();
                         s.push('…');
@@ -561,6 +566,12 @@ fn handle_task(data: &str, cmd: TaskCmd) -> anyhow::Result<()> {
             }
         }
         TaskCmd::Log { id, tail } => {
+            // Reject IDs containing path separators or ".." to prevent
+            // path traversal (single-operator risk is self-inflicted, but
+            // worth validating).
+            if id.contains('/') || id.contains('\\') || id.contains("..") {
+                anyhow::bail!("invalid task id: {id}");
+            }
             let log_path = std::path::PathBuf::from(data)
                 .join("logs")
                 .join(format!("{id}.log"));
@@ -918,8 +929,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("(inbox empty — no pending approvals)");
             } else {
                 for a in &pending {
-                    let age = a.created_at.signed_duration_since(chrono::Utc::now());
-                    let mins = -age.num_minutes();
+                    let mins = chrono::Utc::now()
+                        .signed_duration_since(a.created_at)
+                        .num_minutes();
                     println!("{}  task:{}  {}  {mins}m ago", a.id, a.task_id, a.reason);
                 }
             }
