@@ -312,4 +312,55 @@ mod tests {
             .await;
         assert!(result2.is_err());
     }
+
+    // ── Gate: custom Approver returning false ────────────────────────────
+
+    /// An approver that always returns false, providing a reason string.
+    #[derive(Debug)]
+    struct RejectWithReason;
+
+    #[async_trait]
+    impl Approver for RejectWithReason {
+        async fn decide(&self, _req: &ApprovalRequest) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_ask_custom_approver_returns_false() {
+        let root = std::env::temp_dir();
+        let p = Policy {
+            roots: vec![root.clone()],
+            auto_allow: vec![],
+            deny: vec![],
+            default_exec: DefaultExec::Ask,
+            ask_on_write: false,
+        }; // Everything goes to Ask.
+        let gate = Gate::new(p, Arc::new(RejectWithReason));
+        let result = gate
+            .check(&Action::Exec {
+                command: "echo hello".into(),
+                cwd: root,
+            })
+            .await;
+        assert!(result.is_err(), "Ask + false approver → denied");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, LoreError::PolicyDenied(_)),
+            "PolicyDenied: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_debug_impl_works() {
+        let root = PathBuf::from("/tmp");
+        let p = test_policy(root);
+        let gate = Gate::new(p, Arc::new(AllowAll));
+        let debug_str = format!("{gate:?}");
+        assert!(debug_str.contains("Gate"), "Debug output: {debug_str}");
+        assert!(
+            debug_str.contains("Arc<dyn Approver>"),
+            "Debug placeholder for approver: {debug_str}"
+        );
+    }
 }

@@ -258,4 +258,76 @@ mod tests {
         assert!(tool.run("").await.is_err());
         assert!(tool.run("  ").await.is_err());
     }
+
+    // ── Additional edge-case tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn shell_stderr_is_captured() {
+        let root = std::env::temp_dir();
+        let gate = allow_gate(root.clone());
+        let tool = ShellTool::new(gate, root);
+        let out = tool
+            .run("echo stdout_msg; echo stderr_msg >&2")
+            .await
+            .unwrap();
+        assert!(out.contains("stdout_msg"), "stdout in output: {out}");
+        assert!(out.contains("stderr_msg"), "stderr in output: {out}");
+    }
+
+    #[tokio::test]
+    async fn shell_cwd_outside_roots_denied() {
+        // Shell tool with a cwd outside the policy roots → Deny.
+        let root = std::env::temp_dir();
+        let p = Policy {
+            roots: vec![root.clone()],
+            auto_allow: vec![],
+            deny: vec![],
+            default_exec: DefaultExec::Allow,
+            ask_on_write: false,
+        };
+        let gate = Arc::new(Gate::new(p, Arc::new(AllowAll)));
+        let tool = ShellTool::new(gate, PathBuf::from("/etc"));
+        let result = tool.run("echo hello").await;
+        assert!(result.is_err(), "cwd outside roots → policy denied");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("policy denied"), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn shell_deny_list_beats_auto_allow() {
+        // Both auto_allow and deny contain "sudo" → deny wins.
+        let root = std::env::temp_dir();
+        let p = Policy {
+            roots: vec![root.clone()],
+            auto_allow: vec!["sudo".into()],
+            deny: vec!["sudo".into()],
+            default_exec: DefaultExec::Allow,
+            ask_on_write: false,
+        };
+        let gate = Arc::new(Gate::new(p, Arc::new(AllowAll)));
+        let tool = ShellTool::new(gate, root);
+        let result = tool.run("sudo echo hello").await;
+        assert!(result.is_err(), "deny-list beats auto_allow");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("policy denied"), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn shell_truncation_boundary_exact() {
+        let root = std::env::temp_dir();
+        // Generate short output that fits within 200 bytes → no truncation.
+        let gate = allow_gate(root.clone());
+        let tool = ShellTool::new(gate, root.clone()).with_max_output(200);
+        let out = tool.run("echo 1234567890").await.unwrap();
+        assert!(
+            !out.contains(TRUNCATION_MARKER),
+            "should not truncate: {out}"
+        );
+
+        // Now set max_output very small → must truncate.
+        let gate2 = allow_gate(root.clone());
+        let tool2 = ShellTool::new(gate2, root).with_max_output(5);
+        let out2 = tool2.run("echo 1234567890").await.unwrap();
+        assert!(out2.contains(TRUNCATION_MARKER), "should truncate: {out2}");
+    }
 }

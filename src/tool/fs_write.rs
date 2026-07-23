@@ -466,4 +466,96 @@ mod tests {
         assert!(err.contains("bad JSON args"), "error: {err}");
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // ── Additional edge-case tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn write_empty_content() {
+        let dir = std::env::temp_dir().join("lore-write-empty-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gate = allow_gate(dir.clone());
+        let tool = FileWriteTool::new(gate, dir.clone());
+        let out = tool
+            .run(r#"{"path":"empty.txt","content":""}"#)
+            .await
+            .unwrap();
+        assert!(out.contains("0 bytes"), "empty content: {out}");
+        let read = std::fs::read_to_string(dir.join("empty.txt")).unwrap();
+        assert_eq!(read, "", "file should be empty");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn write_symlink_escape_rejected() {
+        let dir = std::env::temp_dir().join("lore-symlink-escape-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Create a symlink inside dir pointing outside the root.
+        let outside = std::env::temp_dir().join("lore-symlink-outside-target");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("evil_link")).unwrap();
+        let gate = allow_gate(dir.clone());
+        let tool = FileWriteTool::new(gate, dir.clone());
+        // Writing through the symlink should be rejected (canonicalization
+        // resolves it to a path outside the root).
+        let result = tool
+            .run(r#"{"path":"evil_link/file.txt","content":"escape"}"#)
+            .await;
+        assert!(result.is_err(), "symlink escape must be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("escapes workspace") || err.contains("only relative"),
+            "error: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_nonexistent_file() {
+        let dir = std::env::temp_dir().join("lore-edit-nonexistent-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gate = allow_gate(dir.clone());
+        let tool = FileEditTool::new(gate, dir.clone());
+        let result = tool
+            .run(r#"{"path":"no_such_file.txt","old":"a","new":"b"}"#)
+            .await;
+        assert!(result.is_err(), "editing nonexistent file must be Err");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("cannot read") || err.contains("not found"),
+            "error: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_empty_old_string() {
+        let dir = std::env::temp_dir().join("lore-edit-empty-old-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("doc.txt"), "hello world").unwrap();
+        let gate = allow_gate(dir.clone());
+        let tool = FileEditTool::new(gate, dir.clone());
+        // Empty old string matches N+1 times in Rust → multi-match error.
+        let result = tool.run(r#"{"path":"doc.txt","old":"","new":"X"}"#).await;
+        assert!(result.is_err(), "empty old must fail");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("times"), "multi-match error: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn write_empty_path_rejected() {
+        let dir = std::env::temp_dir().join("lore-write-empty-path-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let gate = allow_gate(dir.clone());
+        let tool = FileWriteTool::new(gate, dir.clone());
+        let result = tool.run(r#"{"path":"","content":"test"}"#).await;
+        assert!(result.is_err(), "empty path must be rejected");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("file path required") || err.contains("required"),
+            "error: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

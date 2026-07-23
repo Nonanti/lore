@@ -587,4 +587,27 @@ mod tests {
         assert_eq!(loaded.ask_on_write, p.ask_on_write);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // ── default_for() sanity ──────────────────────────────────────────────
+
+    #[test]
+    fn default_for_has_expected_deny_list() {
+        let p = Policy::default_for(PathBuf::from("/my/project"));
+        // Core dangerous commands should be in the deny list.
+        assert!(p.deny.iter().any(|d| d == "sudo"), "sudo in deny list");
+        assert!(
+            p.deny.iter().any(|d| d == "rm -rf /"),
+            "rm -rf / in deny list"
+        );
+        assert!(
+            p.deny.iter().any(|d| d == "shutdown"),
+            "shutdown in deny list"
+        );
+        // Default exec should be Ask (safest).
+        assert_eq!(p.default_exec, DefaultExec::Ask);
+        // ask_on_write should be false (writes inside roots are allowed).
+        assert!(!p.ask_on_write);
+        // Should have at least some auto_allow entries.
+        assert!(!p.auto_allow.is_empty(), "auto_allow should not be empty");
+    }
 }
