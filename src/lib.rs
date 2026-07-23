@@ -28,6 +28,7 @@ pub mod model;
 pub mod orchestrator;
 pub mod policy;
 pub mod server;
+pub mod task;
 pub mod tool;
 
 pub use agent::{Agent, Conversation, Persona, WorkReport, WorkSpec};
@@ -54,6 +55,8 @@ pub use server::{
     ActResp, AgentView, AppState, AskResp, DeliberateReply, DeliberateResp, MemoryView,
     PersonaPatch,
 };
+pub use task::approver::QueueApprover;
+pub use task::{ApprovalEntry, ApprovalStatus, NewTask, Task, TaskStatus, TaskStore};
 pub use tool::{
     parse_tool_call, CalcTool, FileEditTool, FileReadTool, FileWriteTool, KeywordRouter, LlmRouter,
     ShellTool, TimeTool, Tool, ToolCall, ToolContext, ToolRegistry, ToolRouter, WebFetchTool,
