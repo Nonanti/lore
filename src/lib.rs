@@ -55,6 +55,6 @@ pub use server::{
     PersonaPatch,
 };
 pub use tool::{
-    parse_tool_call, CalcTool, FileReadTool, KeywordRouter, LlmRouter, TimeTool, Tool, ToolCall,
-    ToolContext, ToolRegistry, ToolRouter, WebFetchTool,
+    parse_tool_call, CalcTool, FileEditTool, FileReadTool, FileWriteTool, KeywordRouter, LlmRouter,
+    ShellTool, TimeTool, Tool, ToolCall, ToolContext, ToolRegistry, ToolRouter, WebFetchTool,
 };

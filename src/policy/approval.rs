@@ -101,6 +101,15 @@ pub struct Gate {
     pub approver: Arc<dyn Approver>,
 }
 
+impl std::fmt::Debug for Gate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Gate")
+            .field("policy", &self.policy)
+            .field("approver", &"Arc<dyn Approver>")
+            .finish()
+    }
+}
+
 impl Gate {
     /// New gate with the given policy and approver.
     pub fn new(policy: super::Policy, approver: Arc<dyn Approver>) -> Self {

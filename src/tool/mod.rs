@@ -6,8 +6,12 @@
 //! LLM router can plug into the same trait. `Agent::act` drives this loop.
 
 pub mod builtin;
+pub mod fs_write;
+pub mod shell;
 
 pub use builtin::{CalcTool, FileReadTool, TimeTool, WebFetchTool};
+pub use fs_write::{FileEditTool, FileWriteTool};
+pub use shell::ShellTool;
 
 use crate::error::Result;
 use crate::model::{Model, Prompt};
