@@ -132,6 +132,7 @@ mod tests {
             goal: goal.to_string(),
             workspace: PathBuf::from("/tmp"),
             verify: vec!["echo ok".to_string()],
+            parent_id: None,
         }
     }
 

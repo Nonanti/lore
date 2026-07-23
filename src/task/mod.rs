@@ -76,6 +76,9 @@ pub struct Task {
     pub updated_at: DateTime<Utc>,
     /// WorkReport JSON (present when Completed or Failed).
     pub report: Option<String>,
+    /// Parent task id (for team task hierarchy; None for standalone tasks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 /// Input for enqueue — fields the caller must provide.
@@ -89,6 +92,8 @@ pub struct NewTask {
     pub workspace: PathBuf,
     /// Verify commands.
     pub verify: Vec<String>,
+    /// Parent task id (for team task hierarchy; None for standalone tasks).
+    pub parent_id: Option<String>,
 }
 
 /// Approval entry: tracks a pending human decision on an agent action.
@@ -139,8 +144,10 @@ impl ApprovalStatus {
     }
 }
 
-/// Schema version for `user_version` pragma (v1).
-const SCHEMA_VERSION: u32 = 1;
+/// Schema version for `user_version` pragma.
+/// v1: initial schema (no parent_id).
+/// v2: adds `parent_id TEXT` column for team task hierarchy.
+const SCHEMA_VERSION: u32 = 2;
 
 /// SQLite-backed task store (single connection, WAL mode).
 ///
@@ -206,8 +213,9 @@ impl TaskStore {
         Ok(Self { conn })
     }
 
-    /// Migration via `user_version` pragma. v1 is the initial schema;
-    /// Phase 4 will add `parent_id` via v2 migration.
+    /// Migration via `user_version` pragma.
+    /// v0→v1: initial schema (CREATE IF NOT EXISTS).
+    /// v1→v2: adds `parent_id TEXT` column for team task hierarchy.
     fn migrate(conn: &Connection) -> Result<()> {
         let ver: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -217,8 +225,26 @@ impl TaskStore {
             return Ok(());
         }
 
-        // v0 → v1: tables are already created above (CREATE IF NOT EXISTS).
-        // Just stamp the version.
+        // v1→v2: add parent_id column (additive, idempotent via column-existence check).
+        if ver < 2 {
+            let has_parent_id: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'parent_id'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(sqlite_err)?
+                > 0;
+            if !has_parent_id {
+                conn.execute_batch(
+                    "ALTER TABLE tasks ADD COLUMN parent_id TEXT;
+                     CREATE INDEX IF NOT EXISTS idx_task_parent ON tasks(parent_id);",
+                )
+                .map_err(sqlite_err)?;
+                tracing::info!(step = "v1→v2", "added parent_id column to tasks");
+            }
+        }
+
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
             .map_err(sqlite_err)?;
 
@@ -233,10 +259,11 @@ impl TaskStore {
         let now = Utc::now();
         let verify_json = serde_json::to_string(&task.verify)?;
         let workspace_str = task.workspace.to_string_lossy().to_string();
+        let parent_id_str = task.parent_id.as_deref();
 
         self.conn.execute(
-            "INSERT INTO tasks (id, agent, goal, workspace, verify, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO tasks (id, agent, goal, workspace, verify, status, created_at, updated_at, parent_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 id,
                 task.agent,
@@ -246,6 +273,7 @@ impl TaskStore {
                 TaskStatus::Queued.as_str(),
                 now.to_rfc3339(),
                 now.to_rfc3339(),
+                parent_id_str,
             ],
         )
         .map_err(sqlite_err)?;
@@ -260,6 +288,7 @@ impl TaskStore {
             created_at: now,
             updated_at: now,
             report: None,
+            parent_id: task.parent_id,
         })
     }
 
@@ -269,7 +298,7 @@ impl TaskStore {
         use rusqlite::OptionalExtension;
         self.conn
             .query_row(
-                "SELECT id, agent, goal, workspace, verify, status, created_at, updated_at, report
+                "SELECT id, agent, goal, workspace, verify, status, created_at, updated_at, report, parent_id
                  FROM tasks WHERE status = 'Queued'
                  ORDER BY created_at ASC, id ASC LIMIT 1",
                 [],
@@ -332,7 +361,7 @@ impl TaskStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, agent, goal, workspace, verify, status, created_at, updated_at, report
+                "SELECT id, agent, goal, workspace, verify, status, created_at, updated_at, report, parent_id
              FROM tasks ORDER BY created_at DESC LIMIT ?1",
             )
             .map_err(sqlite_err)?;
@@ -351,13 +380,60 @@ impl TaskStore {
         use rusqlite::OptionalExtension;
         self.conn
             .query_row(
-                "SELECT id, agent, goal, workspace, verify, status, created_at, updated_at, report
+                "SELECT id, agent, goal, workspace, verify, status, created_at, updated_at, report, parent_id
                  FROM tasks WHERE id = ?1",
                 params![id],
                 |r| self.read_task_row(r),
             )
             .optional()
             .map_err(sqlite_err)
+    }
+
+    /// Returns children of a parent task (tasks where parent_id = id).
+    pub fn children_of(&self, id: &str) -> Result<Vec<Task>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, agent, goal, workspace, verify, status, created_at, updated_at, report, parent_id
+                 FROM tasks WHERE parent_id = ?1 ORDER BY created_at ASC",
+            )
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![id], |r| self.read_task_row(r))
+            .map_err(sqlite_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(sqlite_err)?);
+        }
+        Ok(out)
+    }
+
+    /// True when no child of `id` is in an active (unfinished) state.
+    /// Active states: Queued, Running, WaitingApproval, WaitingSubtasks.
+    /// If there are no children, returns true (vacuously all done).
+    pub fn all_children_done(&self, id: &str) -> Result<bool> {
+        let active_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE parent_id = ?1
+                 AND status IN ('Queued', 'Running', 'WaitingApproval', 'WaitingSubtasks')",
+                params![id],
+                |r| r.get(0),
+            )
+            .map_err(sqlite_err)?;
+        Ok(active_count == 0)
+    }
+
+    /// Enqueue a child task with a parent_id link.
+    pub fn enqueue_child(&self, parent_id: &str, task: NewTask) -> Result<Task> {
+        let child = NewTask {
+            agent: task.agent,
+            goal: task.goal,
+            workspace: task.workspace,
+            verify: task.verify,
+            parent_id: Some(parent_id.to_string()),
+        };
+        self.enqueue(child)
     }
 
     /// Insert an approval entry for a task. Returns the approval id.
@@ -511,6 +587,7 @@ impl TaskStore {
         let created_at_str: String = r.get(6)?;
         let updated_at_str: String = r.get(7)?;
         let report: Option<String> = r.get(8)?;
+        let parent_id: Option<String> = r.get(9)?;
 
         Ok(Task {
             id,
@@ -526,6 +603,7 @@ impl TaskStore {
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_default(),
             report,
+            parent_id,
         })
     }
 
@@ -595,6 +673,7 @@ mod tests {
             goal: goal.to_string(),
             workspace: PathBuf::from("/tmp"),
             verify: vec!["echo ok".to_string()],
+            parent_id: None,
         }
     }
 
@@ -846,6 +925,7 @@ mod tests {
                 "cargo test".to_string(),
                 "cargo clippy -- -D warnings".to_string(),
             ],
+            parent_id: None,
         };
         let t = store.enqueue(task).unwrap();
         let loaded = store.get(&t.id).unwrap().unwrap();
@@ -1078,5 +1158,158 @@ mod tests {
 
         let next = store.next_queued().unwrap().unwrap();
         assert_eq!(next.id, id_a, "FIFO tiebreaker: smaller id comes first");
+    }
+
+    // ── v1→v2 migration preserves pre-existing rows ────────────────────
+
+    #[test]
+    fn migration_v1_to_v2_preserves_existing_rows() {
+        let db = TmpDb::new();
+
+        // Manually create a v1 schema DB (no parent_id column).
+        {
+            let conn = Connection::open(db.path()).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS tasks (
+                    id          TEXT PRIMARY KEY,
+                    agent       TEXT NOT NULL,
+                    goal        TEXT NOT NULL,
+                    workspace   TEXT NOT NULL,
+                    verify      TEXT NOT NULL,
+                    status      TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL,
+                    report      TEXT
+                );
+                CREATE TABLE IF NOT EXISTS approvals (
+                    id          TEXT PRIMARY KEY,
+                    task_id     TEXT NOT NULL,
+                    action      TEXT NOT NULL,
+                    reason      TEXT NOT NULL,
+                    status      TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    decided_at  TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_task_status ON tasks(status);
+                CREATE INDEX IF NOT EXISTS idx_approval_task ON approvals(task_id);
+                CREATE INDEX IF NOT EXISTS idx_approval_status ON approvals(status);
+                PRAGMA user_version = 1;",
+            )
+            .unwrap();
+            // Insert a row in v1 schema.
+            let now = Utc::now().to_rfc3339();
+            let verify_json = serde_json::to_string(&vec!["echo ok"]).unwrap();
+            conn.execute(
+                "INSERT INTO tasks (id, agent, goal, workspace, verify, status, created_at, updated_at)
+                 VALUES ('01TESTMIGRATION01', 'migbot', 'migrate me', '/tmp', ?1, 'Completed', ?2, ?3)",
+                rusqlite::params![verify_json, now, now],
+            )
+            .unwrap();
+        }
+
+        // Open with TaskStore (triggers v1→v2 migration).
+        let store = TaskStore::open(db.path()).unwrap();
+
+        // Pre-existing row is preserved.
+        let task = store.get("01TESTMIGRATION01").unwrap().unwrap();
+        assert_eq!(task.agent, "migbot");
+        assert_eq!(task.goal, "migrate me");
+        assert_eq!(task.status, TaskStatus::Completed);
+        assert_eq!(task.parent_id, None, "v1 rows have no parent_id");
+
+        // New row with parent_id works.
+        let child = store
+            .enqueue_child("01TESTMIGRATION01", new_task("child", "sub goal"))
+            .unwrap();
+        assert_eq!(child.parent_id, Some("01TESTMIGRATION01".to_string()));
+    }
+
+    // ── enqueue_child / children_of / all_children_done ──────────────
+
+    #[test]
+    fn enqueue_child_and_children_of() {
+        let store = TaskStore::in_memory().unwrap();
+        let parent = store.enqueue(new_task("pm", "big goal")).unwrap();
+
+        let c1 = store
+            .enqueue_child(&parent.id, new_task("backend", "impl feature"))
+            .unwrap();
+        let c2 = store
+            .enqueue_child(&parent.id, new_task("frontend", "build UI"))
+            .unwrap();
+
+        assert_eq!(c1.parent_id, Some(parent.id.clone()));
+        assert_eq!(c2.parent_id, Some(parent.id.clone()));
+
+        let children = store.children_of(&parent.id).unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].id, c1.id);
+        assert_eq!(children[1].id, c2.id);
+
+        // Children of a nonexistent id return empty.
+        let empty = store.children_of("nonexistent").unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn all_children_done_transitions() {
+        let store = TaskStore::in_memory().unwrap();
+        let parent = store.enqueue(new_task("pm", "goal")).unwrap();
+
+        let c1 = store
+            .enqueue_child(&parent.id, new_task("a", "g1"))
+            .unwrap();
+        let c2 = store
+            .enqueue_child(&parent.id, new_task("b", "g2"))
+            .unwrap();
+
+        // Both Queued → not done.
+        assert!(!store.all_children_done(&parent.id).unwrap());
+
+        // c1 Running → still not done.
+        store.set_status(&c1.id, TaskStatus::Running).unwrap();
+        assert!(!store.all_children_done(&parent.id).unwrap());
+
+        // c1 Completed, c2 Queued → still not done.
+        store
+            .complete(
+                &c1.id,
+                &serde_json::to_string(&serde_json::json!({"success":true})).unwrap(),
+            )
+            .unwrap();
+        assert!(!store.all_children_done(&parent.id).unwrap());
+
+        // c2 Completed → all done.
+        store
+            .complete(
+                &c2.id,
+                &serde_json::to_string(&serde_json::json!({"success":true})).unwrap(),
+            )
+            .unwrap();
+        assert!(store.all_children_done(&parent.id).unwrap());
+
+        // One child Failed, one Completed → all done (both in terminal states).
+        let p2 = store.enqueue(new_task("pm", "goal2")).unwrap();
+        let f1 = store.enqueue_child(&p2.id, new_task("a", "g")).unwrap();
+        let f2 = store.enqueue_child(&p2.id, new_task("b", "g")).unwrap();
+        store
+            .complete(
+                &f1.id,
+                &serde_json::to_string(&serde_json::json!({"success":true})).unwrap(),
+            )
+            .unwrap();
+        store
+            .fail(
+                &f2.id,
+                &serde_json::to_string(&serde_json::json!({"success":false})).unwrap(),
+            )
+            .unwrap();
+        assert!(store.all_children_done(&p2.id).unwrap());
+
+        // No children → vacuously all done.
+        let solo = store.enqueue(new_task("solo", "goal")).unwrap();
+        assert!(store.all_children_done(&solo.id).unwrap());
     }
 }

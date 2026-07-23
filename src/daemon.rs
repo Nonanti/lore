@@ -5,6 +5,10 @@
 //! → Completed/Failed). CLI inserts tasks and answers approvals; WAL mode
 //! permits concurrent SQLite access. Per-task execution is extracted into
 //! [`run_task`] for testing.
+//!
+//! Team tasks (agent == "pm") are decomposed into child subtasks instead of
+//! being run directly. After each child completes/fails, `maybe_complete_parent`
+//! checks whether the parent can transition to Completed or Failed.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,13 +16,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::agent::{Agent, WorkReport, WorkSpec};
-use crate::error::Result;
+use crate::error::{LoreError, Result};
 use crate::memory::{HashingEmbedder, MemoryStore, SqliteStore};
-use crate::model::Model;
+use crate::model::{Model, ModelConfig};
+use crate::orchestrator::pm::{
+    build_roster, collect_child_reports, decompose_with_retry, has_review_child, has_reviewer,
+    synthesis_prompt,
+};
 use crate::policy::approval::Gate;
 use crate::policy::Policy;
 use crate::task::approver::QueueApprover;
-use crate::task::{TaskStatus, TaskStore};
+use crate::task::{NewTask, TaskStatus, TaskStore};
 use crate::tool::{
     FileEditTool, FileReadTool, FileWriteTool, LlmRouter, ShellTool, ToolContext, ToolRegistry,
 };
@@ -64,6 +72,7 @@ pub struct TaskDeps {
 /// Runs a single task: loads agent, builds policy/gate/tools, calls
 /// `agent.work`, and records the result in the task store.
 ///
+/// Uses per-agent model config if the agent record has one, else env fallback.
 /// Returns the [`WorkReport`] from the agent's work loop. Errors from agent
 /// loading or model calls are recorded as task failures (daemon continues).
 pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Result<WorkReport> {
@@ -77,6 +86,9 @@ pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Resu
         "[daemon] task {} started — agent: {}, goal: {}",
         task.id, task.agent, task.goal
     ));
+
+    // Build per-task model: agent record's ModelConfig if present, else env fallback.
+    let model = build_per_task_model(&deps.data_dir, &task.agent, &deps.model)?;
 
     // Load agent persona from <data>/agents/<name>.json.
     let persona_path = deps
@@ -116,7 +128,7 @@ pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Resu
             .with_embedder(Arc::new(HashingEmbedder::new())),
     );
 
-    let agent = Agent::load_from(&persona_path, mem_store, deps.model.clone())?;
+    let agent = Agent::load_from(&persona_path, mem_store, model.clone())?;
 
     // Policy: load <data>/policy.json if present, else default_for(workspace).
     let policy_path = deps.data_dir.join("policy.json");
@@ -147,7 +159,7 @@ pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Resu
     reg.register(Arc::new(FileReadTool::new(
         task.workspace.to_string_lossy().to_string(),
     )));
-    let router = Arc::new(LlmRouter::new(deps.model.clone()));
+    let router = Arc::new(LlmRouter::new(model.clone()));
     let ctx = ToolContext {
         registry: reg,
         router,
@@ -259,48 +271,62 @@ pub async fn run_daemon(data_dir: &Path, db_path: &Path) -> Result<()> {
         tracing::info!(task_id = %task.id, agent = %task.agent, "dequeued task");
         store.set_status(&task.id, TaskStatus::Running)?;
 
-        // Run task, with shutdown-awareness: if SIGINT arrives mid-run,
-        // mark the task Queued again for later resumption. NOTE: cancellation
-        // is at the next Tokio await point (shell command, LLM call, approval
-        // poll) — "finish current verify command" is best-effort, not a
-        // guaranteed checkpoint.
-        let result = tokio::select! {
-            r = run_task(&store, &task.id, &deps) => r,
-            _ = shutdown_rx.recv() => {
-                tracing::warn!(task_id = %task.id, "shutdown mid-run — re-queuing task + denying stale approvals");
-                store.set_status(&task.id, TaskStatus::Queued)?;
-                // Deny any Pending approvals for the re-queued task to avoid
-                // inbox clutter from a stale partial work cycle.
-                store.deny_pending_approvals_for_task(&task.id)?;
-                break;
+        // Team task: PM agent decomposes goal into subtasks (not run_task).
+        let is_team = task.agent == "pm";
+        if is_team {
+            let result = decompose_team_task(&store, &task.id, &deps).await;
+            if let Err(e) = &result {
+                // decompose_team_task already records failures.
+                tracing::error!(task_id = %task.id, error = %e, "PM decomposition failed — daemon continues");
             }
-        };
-
-        match result {
-            Ok(report) => {
-                tracing::info!(
-                    task_id = %task.id,
-                    success = report.success,
-                    iterations = report.iterations,
-                    "task finished"
-                );
-            }
-            Err(e) => {
-                // run_task already records failures (persona missing, etc.)
-                // in the task store. If it failed before recording, do it now.
-                if store
-                    .get(&task.id)?
-                    .is_none_or(|t| t.status != TaskStatus::Failed)
-                {
-                    let report_json = serde_json::to_string(&WorkReport {
-                        success: false,
-                        iterations: 0,
-                        answer: format!("daemon error: {e}"),
-                        verify_log: String::new(),
-                    })?;
-                    store.fail(&task.id, &report_json)?;
+        } else {
+            // Regular task: run_task, with shutdown-awareness.
+            let result = tokio::select! {
+                r = run_task(&store, &task.id, &deps) => r,
+                _ = shutdown_rx.recv() => {
+                    tracing::warn!(task_id = %task.id, "shutdown mid-run — re-queuing task + denying stale approvals");
+                    store.set_status(&task.id, TaskStatus::Queued)?;
+                    store.deny_pending_approvals_for_task(&task.id)?;
+                    break;
                 }
-                tracing::error!(task_id = %task.id, error = %e, "task failed — daemon continues");
+            };
+
+            match result {
+                Ok(report) => {
+                    tracing::info!(
+                        task_id = %task.id,
+                        success = report.success,
+                        iterations = report.iterations,
+                        "task finished"
+                    );
+                }
+                Err(e) => {
+                    // run_task already records failures (persona missing, etc.)
+                    // in the task store. If it failed before recording, do it now.
+                    if store
+                        .get(&task.id)?
+                        .is_none_or(|t| t.status != TaskStatus::Failed)
+                    {
+                        let report_json = serde_json::to_string(&WorkReport {
+                            success: false,
+                            iterations: 0,
+                            answer: format!("daemon error: {e}"),
+                            verify_log: String::new(),
+                        })?;
+                        store.fail(&task.id, &report_json)?;
+                    }
+                    tracing::error!(task_id = %task.id, error = %e, "task failed — daemon continues");
+                }
+            }
+        }
+
+        // After any task completion/failure, check parent.
+        if let Ok(completed) = maybe_complete_parent(&store, &task.id, &deps).await {
+            if completed {
+                tracing::info!(
+                    child_task_id = %task.id,
+                    "parent task finalized"
+                );
             }
         }
     }
@@ -310,11 +336,211 @@ pub async fn run_daemon(data_dir: &Path, db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Build the model from the same env config as CLI (reuse main.rs helpers).
-/// This function is standalone to avoid importing the entire main.rs module.
+/// Build per-task model: if the agent record has a ModelConfig, use it;
+/// otherwise fall back to env config.
+fn build_per_task_model(
+    data_dir: &Path,
+    agent_name: &str,
+    env_model: &Arc<dyn Model>,
+) -> Result<Arc<dyn Model>> {
+    let persona_path = data_dir.join("agents").join(format!("{agent_name}.json"));
+    if persona_path.exists() {
+        let json = std::fs::read_to_string(&persona_path)
+            .map_err(|e| LoreError::Storage(e.to_string()))?;
+        let rec: serde_json::Value = serde_json::from_str(&json)?;
+        if let Some(model_cfg) = rec.get("model") {
+            let cfg: ModelConfig = serde_json::from_value(model_cfg.clone())?;
+            return crate::model::build_model(&cfg, data_dir);
+        }
+    }
+    // No per-agent model config → env fallback.
+    Ok(env_model.clone())
+}
+
 /// Build the model from env config (centralized in `lore::model::factory`).
 fn build_model_from_env(data_dir: &Path) -> Arc<dyn Model> {
     crate::model::build_model_from_env(data_dir)
+}
+
+/// Decompose a PM team task: prompt the PM agent model with the goal + roster,
+/// enqueue children, set parent to WaitingSubtasks.
+pub async fn decompose_team_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Result<()> {
+    let task = store
+        .get(task_id)?
+        .ok_or_else(|| LoreError::NotFound(format!("task {task_id}")))?;
+
+    let pm_model = build_per_task_model(&deps.data_dir, &task.agent, &deps.model)?;
+    let roster = build_roster(&deps.data_dir)?;
+
+    if roster.is_empty() {
+        let msg = "PM decomposition failed: no agents in roster";
+        tracing::error!(task_id, "{msg}");
+        let report_json = serde_json::to_string(&WorkReport {
+            success: false,
+            iterations: 0,
+            answer: msg.to_string(),
+            verify_log: String::new(),
+        })?;
+        store.fail(task_id, &report_json)?;
+        return Err(LoreError::InvalidInput(msg.to_string()));
+    }
+
+    let specs = decompose_with_retry(&pm_model, &task.goal, &roster).await;
+    match specs {
+        Ok(subtasks) => {
+            for spec in &subtasks {
+                let child = NewTask {
+                    agent: spec.agent.clone(),
+                    goal: spec.goal.clone(),
+                    workspace: task.workspace.clone(),
+                    verify: spec.verify.clone(),
+                    parent_id: None, // enqueue_child sets this
+                };
+                store.enqueue_child(task_id, child)?;
+                tracing::info!(
+                    parent_id = task_id,
+                    child_agent = %spec.agent,
+                    child_goal = %spec.goal,
+                    "enqueued child subtask"
+                );
+            }
+            store.set_status(task_id, TaskStatus::WaitingSubtasks)?;
+            tracing::info!(
+                parent_id = task_id,
+                children_count = subtasks.len(),
+                "PM task decomposed, waiting for subtasks"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let msg = format!("PM decomposition failed: {e}");
+            tracing::error!(task_id, error = %e, "{msg}");
+            let report_json = serde_json::to_string(&WorkReport {
+                success: false,
+                iterations: 0,
+                answer: msg.clone(),
+                verify_log: String::new(),
+            })?;
+            store.fail(task_id, &report_json)?;
+            Err(LoreError::InvalidInput(msg))
+        }
+    }
+}
+
+/// After a child task completes/fails, check if the parent can transition.
+/// Returns true if the parent was finalized (Completed or Failed).
+pub async fn maybe_complete_parent(
+    store: &TaskStore,
+    child_task_id: &str,
+    deps: &TaskDeps,
+) -> Result<bool> {
+    let child = store
+        .get(child_task_id)?
+        .ok_or_else(|| LoreError::NotFound(format!("task {child_task_id}")))?;
+
+    let parent_id = match child.parent_id {
+        Some(pid) => pid,
+        None => return Ok(false), // No parent — standalone task.
+    };
+
+    // Check if parent exists and is still WaitingSubtasks.
+    let parent = store.get(&parent_id)?;
+    if parent.is_none_or(|p| p.status != TaskStatus::WaitingSubtasks) {
+        return Ok(false); // Parent already finalized or not waiting.
+    }
+
+    // Not all children done yet? Wait.
+    if !store.all_children_done(&parent_id)? {
+        return Ok(false);
+    }
+
+    let children = store.children_of(&parent_id)?;
+
+    // If any child Failed (other than the reviewer) → parent Failed.
+    let non_review_failures = children
+        .iter()
+        .filter(|c| c.status == TaskStatus::Failed && c.agent != "reviewer")
+        .count();
+    if non_review_failures > 0 {
+        let reports = collect_child_reports(store, &parent_id)?;
+        let failing_reports: Vec<String> = reports
+            .iter()
+            .filter(|r| r.status == "Failed" && r.agent != "reviewer")
+            .map(|r| format!("Agent {} (goal: {}): {}", r.agent, r.goal, r.report))
+            .collect();
+        let msg = format!(
+            "Team task failed — child subtask(s) failed:\n{}",
+            failing_reports.join("\n")
+        );
+        let report_json = serde_json::to_string(&WorkReport {
+            success: false,
+            iterations: 0,
+            answer: msg,
+            verify_log: String::new(),
+        })?;
+        store.fail(&parent_id, &report_json)?;
+        tracing::info!(
+            parent_id,
+            failed_children = non_review_failures,
+            "parent task Failed (child failure propagated)"
+        );
+        return Ok(true);
+    }
+
+    // All children succeeded. Check if a reviewer should be enqueued.
+    let roster = build_roster(&deps.data_dir)?;
+    if has_reviewer(&roster) && !has_review_child(store, &parent_id)? {
+        // Enqueue ONE review child.
+        let children_reports = collect_child_reports(store, &parent_id)?;
+        let review_goal = format!(
+            "Review the completed work:\n{}\nLook for gaps, contradictions, missing verification.",
+            synthesis_prompt(&children_reports)
+        );
+        let review_task = NewTask {
+            agent: "reviewer".to_string(),
+            goal: review_goal,
+            workspace: children
+                .first()
+                .map(|c| c.workspace.clone())
+                .unwrap_or_else(std::env::temp_dir),
+            verify: vec![],
+            parent_id: None, // enqueue_child sets this
+        };
+        store.enqueue_child(&parent_id, review_task)?;
+        tracing::info!(
+            parent_id,
+            "review child enqueued, parent stays WaitingSubtasks"
+        );
+        return Ok(false); // Parent still waiting (for the review child).
+    }
+
+    // All children done + review done (or no reviewer) → PM synthesis.
+    let pm_model = build_per_task_model(&deps.data_dir, "pm", &deps.model)?;
+    let children_reports = collect_child_reports(store, &parent_id)?;
+    let synth_text = synthesis_prompt(&children_reports);
+
+    let prompt = crate::model::Prompt {
+        system: "You are a project manager synthesizing subtask results into a combined report."
+            .to_string(),
+        user: synth_text,
+        ..Default::default()
+    };
+
+    let completion = pm_model.complete(&prompt).await?;
+    let combined_report = serde_json::json!({
+        "success": true,
+        "iterations": children.len(),
+        "answer": completion.text,
+        "children_count": children.len(),
+    });
+    let report_json = serde_json::to_string(&combined_report)?;
+    store.complete(&parent_id, &report_json)?;
+    tracing::info!(
+        parent_id,
+        children_count = children.len(),
+        "parent task Completed via PM synthesis"
+    );
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -458,6 +684,7 @@ mod tests {
                 goal: "say hello".to_string(),
                 workspace: workspace.clone(),
                 verify: vec!["exit 0".to_string()],
+                parent_id: None,
             })
             .unwrap();
         store.set_status(&task.id, TaskStatus::Running).unwrap();
@@ -508,6 +735,7 @@ mod tests {
                 goal: "fail this task".to_string(),
                 workspace: workspace.clone(),
                 verify: vec!["exit 0".to_string()],
+                parent_id: None,
             })
             .unwrap();
         store.set_status(&task.id, TaskStatus::Running).unwrap();
@@ -532,6 +760,7 @@ mod tests {
                 goal: "another task".to_string(),
                 workspace: workspace.clone(),
                 verify: vec!["exit 0".to_string()],
+                parent_id: None,
             })
             .unwrap();
         assert_eq!(task2.status, TaskStatus::Queued, "next task is queued fine");
@@ -554,6 +783,7 @@ mod tests {
                 goal: "do something".to_string(),
                 workspace: workspace.clone(),
                 verify: vec!["exit 0".to_string()],
+                parent_id: None,
             })
             .unwrap();
         store.set_status(&task.id, TaskStatus::Running).unwrap();
@@ -605,6 +835,7 @@ mod tests {
                 goal: "log this".to_string(),
                 workspace: workspace.clone(),
                 verify: vec!["exit 0".to_string()],
+                parent_id: None,
             })
             .unwrap();
         store.set_status(&task.id, TaskStatus::Running).unwrap();
@@ -625,5 +856,337 @@ mod tests {
         assert!(content.contains("completed"), "log: completed marker");
 
         cleanup(&workspace);
+    }
+
+    // ── maybe_complete_parent: all-success + no reviewer ──────────────
+
+    #[tokio::test]
+    async fn maybe_complete_parent_all_success_no_reviewer() {
+        let store = TaskStore::in_memory().unwrap();
+        let db = TmpDb::new("mcp-success-no-review");
+
+        // Parent PM task.
+        let parent = store
+            .enqueue(NewTask {
+                agent: "pm".to_string(),
+                goal: "build app".to_string(),
+                workspace: PathBuf::from("/tmp"),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+        store
+            .set_status(&parent.id, TaskStatus::WaitingSubtasks)
+            .unwrap();
+
+        // Children: both Completed.
+        let c1 = store
+            .enqueue_child(
+                &parent.id,
+                NewTask {
+                    agent: "backend".to_string(),
+                    goal: "impl API".to_string(),
+                    workspace: PathBuf::from("/tmp"),
+                    verify: vec![],
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+        let c2 = store
+            .enqueue_child(
+                &parent.id,
+                NewTask {
+                    agent: "frontend".to_string(),
+                    goal: "build UI".to_string(),
+                    workspace: PathBuf::from("/tmp"),
+                    verify: vec![],
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+
+        store
+            .complete(
+                &c1.id,
+                &serde_json::to_string(&serde_json::json!({"success":true,"answer":"API done"}))
+                    .unwrap(),
+            )
+            .unwrap();
+        store
+            .complete(
+                &c2.id,
+                &serde_json::to_string(&serde_json::json!({"success":true,"answer":"UI done"}))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        // No reviewer persona in data dir.
+        let model = Arc::new(ScriptedModel::new(&["synthesized: all good"]));
+        let deps = TaskDeps {
+            data_dir: db.data_dir().to_path_buf(),
+            model,
+            db_path: db.path().to_path_buf(),
+        };
+
+        let completed = maybe_complete_parent(&store, &c2.id, &deps).await.unwrap();
+        assert!(completed, "parent should be finalized");
+
+        let parent_loaded = store.get(&parent.id).unwrap().unwrap();
+        assert_eq!(parent_loaded.status, TaskStatus::Completed);
+    }
+
+    // ── maybe_complete_parent: all-success + reviewer persona → review child enqueued ──
+
+    #[tokio::test]
+    async fn maybe_complete_parent_all_success_with_reviewer_enqueues_review() {
+        let store = TaskStore::in_memory().unwrap();
+        let db = TmpDb::new("mcp-review");
+
+        // Create reviewer persona file.
+        let agents_dir = db.data_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let persona = Persona::new("reviewer", "code reviewer");
+        let mem_store: Arc<dyn crate::memory::MemoryStore> = Arc::new(InMemoryStore::new());
+        let agent = Agent::new(persona, mem_store, Arc::new(MockModel::new()));
+        agent.save_to(agents_dir.join("reviewer.json")).unwrap();
+
+        // Also create pm persona for the synthesis model.
+        let pm_persona = Persona::new("pm", "project manager");
+        let pm_mem: Arc<dyn crate::memory::MemoryStore> = Arc::new(InMemoryStore::new());
+        let pm_agent = Agent::new(pm_persona, pm_mem, Arc::new(MockModel::new()));
+        pm_agent.save_to(agents_dir.join("pm.json")).unwrap();
+
+        let parent = store
+            .enqueue(NewTask {
+                agent: "pm".to_string(),
+                goal: "build app".to_string(),
+                workspace: PathBuf::from("/tmp"),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+        store
+            .set_status(&parent.id, TaskStatus::WaitingSubtasks)
+            .unwrap();
+
+        let c1 = store
+            .enqueue_child(
+                &parent.id,
+                NewTask {
+                    agent: "backend".to_string(),
+                    goal: "impl API".to_string(),
+                    workspace: PathBuf::from("/tmp"),
+                    verify: vec![],
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+        store
+            .complete(
+                &c1.id,
+                &serde_json::to_string(&serde_json::json!({"success":true,"answer":"done"}))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let model = Arc::new(MockModel::new());
+        let deps = TaskDeps {
+            data_dir: db.data_dir().to_path_buf(),
+            model,
+            db_path: db.path().to_path_buf(),
+        };
+
+        // First call: review child enqueued, parent stays WaitingSubtasks.
+        let completed = maybe_complete_parent(&store, &c1.id, &deps).await.unwrap();
+        assert!(
+            !completed,
+            "parent not finalized yet — review child enqueued"
+        );
+
+        let children = store.children_of(&parent.id).unwrap();
+        let review_children = children.iter().filter(|c| c.agent == "reviewer").count();
+        assert_eq!(review_children, 1, "exactly one review child enqueued");
+
+        // Second call: review already enqueued — does NOT create another.
+        let completed2 = maybe_complete_parent(&store, &c1.id, &deps).await.unwrap();
+        assert!(
+            !completed2,
+            "parent not finalized — review still in progress"
+        );
+
+        let children2 = store.children_of(&parent.id).unwrap();
+        let review_children2 = children2.iter().filter(|c| c.agent == "reviewer").count();
+        assert_eq!(
+            review_children2, 1,
+            "still exactly one review child — no duplicate"
+        );
+
+        // Now complete the review child → parent completes via synthesis.
+        let review_child = children2.iter().find(|c| c.agent == "reviewer").unwrap();
+        store
+            .complete(
+                &review_child.id,
+                &serde_json::to_string(
+                    &serde_json::json!({"success":true,"answer":"review looks good"}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let synth_model = Arc::new(ScriptedModel::new(&["synthesized: all good with review"]));
+        let synth_deps = TaskDeps {
+            data_dir: db.data_dir().to_path_buf(),
+            model: synth_model,
+            db_path: db.path().to_path_buf(),
+        };
+
+        let completed3 = maybe_complete_parent(&store, &review_child.id, &synth_deps)
+            .await
+            .unwrap();
+        assert!(completed3, "parent finalized after review");
+
+        let parent_loaded = store.get(&parent.id).unwrap().unwrap();
+        assert_eq!(parent_loaded.status, TaskStatus::Completed);
+    }
+
+    // ── maybe_complete_parent: child Failed → parent Failed ──────────
+
+    #[tokio::test]
+    async fn maybe_complete_parent_child_failed_propagates() {
+        let store = TaskStore::in_memory().unwrap();
+        let db = TmpDb::new("mcp-fail");
+
+        let parent = store
+            .enqueue(NewTask {
+                agent: "pm".to_string(),
+                goal: "build app".to_string(),
+                workspace: PathBuf::from("/tmp"),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+        store
+            .set_status(&parent.id, TaskStatus::WaitingSubtasks)
+            .unwrap();
+
+        let c1 = store
+            .enqueue_child(
+                &parent.id,
+                NewTask {
+                    agent: "backend".to_string(),
+                    goal: "impl API".to_string(),
+                    workspace: PathBuf::from("/tmp"),
+                    verify: vec![],
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+        let c2 = store
+            .enqueue_child(
+                &parent.id,
+                NewTask {
+                    agent: "frontend".to_string(),
+                    goal: "build UI".to_string(),
+                    workspace: PathBuf::from("/tmp"),
+                    verify: vec![],
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+
+        // c1 succeeded, c2 failed.
+        store
+            .complete(
+                &c1.id,
+                &serde_json::to_string(&serde_json::json!({"success":true,"answer":"done"}))
+                    .unwrap(),
+            )
+            .unwrap();
+        store
+            .fail(
+                &c2.id,
+                &serde_json::to_string(&serde_json::json!({"success":false,"answer":"UI broken"}))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let model = Arc::new(MockModel::new());
+        let deps = TaskDeps {
+            data_dir: db.data_dir().to_path_buf(),
+            model,
+            db_path: db.path().to_path_buf(),
+        };
+
+        let completed = maybe_complete_parent(&store, &c2.id, &deps).await.unwrap();
+        assert!(completed, "parent should be Failed");
+
+        let parent_loaded = store.get(&parent.id).unwrap().unwrap();
+        assert_eq!(parent_loaded.status, TaskStatus::Failed);
+    }
+
+    // ── Recovery interplay: orphaned child re-queued → parent completes ──
+
+    #[tokio::test]
+    async fn recovery_orphaned_child_parent_completes_later() {
+        let store = TaskStore::in_memory().unwrap();
+        let db = TmpDb::new("mcp-recovery");
+
+        let parent = store
+            .enqueue(NewTask {
+                agent: "pm".to_string(),
+                goal: "build app".to_string(),
+                workspace: PathBuf::from("/tmp"),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+        store
+            .set_status(&parent.id, TaskStatus::WaitingSubtasks)
+            .unwrap();
+
+        let c1 = store
+            .enqueue_child(
+                &parent.id,
+                NewTask {
+                    agent: "backend".to_string(),
+                    goal: "impl API".to_string(),
+                    workspace: PathBuf::from("/tmp"),
+                    verify: vec![],
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+
+        // Simulate crash: child was Running, now orphaned → re-queued.
+        store.set_status(&c1.id, TaskStatus::Running).unwrap();
+        store.recover_orphaned().unwrap();
+        // Child is now Queued again.
+        let c1_loaded = store.get(&c1.id).unwrap().unwrap();
+        assert_eq!(c1_loaded.status, TaskStatus::Queued);
+
+        // Parent still waiting — child not yet done.
+        assert!(!store.all_children_done(&parent.id).unwrap());
+
+        // Child completes later (manual sim).
+        store
+            .complete(
+                &c1.id,
+                &serde_json::to_string(&serde_json::json!({"success":true,"answer":"done"}))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let model = Arc::new(ScriptedModel::new(&["synthesized: done"]));
+        let deps = TaskDeps {
+            data_dir: db.data_dir().to_path_buf(),
+            model,
+            db_path: db.path().to_path_buf(),
+        };
+
+        let completed = maybe_complete_parent(&store, &c1.id, &deps).await.unwrap();
+        assert!(completed, "parent should finalize after child completes");
+
+        let parent_loaded = store.get(&parent.id).unwrap().unwrap();
+        assert_eq!(parent_loaded.status, TaskStatus::Completed);
     }
 }

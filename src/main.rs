@@ -204,6 +204,9 @@ enum TaskCmd {
         /// Verification commands (repeatable).
         #[arg(long, short = 'v', value_delimiter = ',')]
         verify: Vec<String>,
+        /// Team task: agent forced to 'pm' for decomposition.
+        #[arg(long)]
+        team: bool,
     },
     /// List tasks (compact table).
     List {
@@ -506,7 +509,9 @@ fn handle_task(data: &str, cmd: TaskCmd) -> anyhow::Result<()> {
             goal,
             workspace,
             verify,
+            team,
         } => {
+            let final_agent = if team { "pm" } else { &agent };
             let ws = workspace.map(std::path::PathBuf::from).unwrap_or_else(|| {
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
             });
@@ -515,13 +520,18 @@ fn handle_task(data: &str, cmd: TaskCmd) -> anyhow::Result<()> {
             // resolves the workspace correctly.
             let ws = ws.canonicalize().unwrap_or(ws);
             let new_task = NewTask {
-                agent,
+                agent: final_agent.to_string(),
                 goal,
                 workspace: ws,
                 verify,
+                parent_id: None,
             };
             let task = store.enqueue(new_task)?;
-            println!("✅ task {} queued", task.id);
+            if team {
+                println!("✅ team task {} queued (agent: pm)", task.id);
+            } else {
+                println!("✅ task {} queued", task.id);
+            }
         }
         TaskCmd::List { limit } => {
             let tasks = store.list(limit)?;
@@ -564,6 +574,23 @@ fn handle_task(data: &str, cmd: TaskCmd) -> anyhow::Result<()> {
                         let summary: serde_json::Value = serde_json::from_str(report)
                             .unwrap_or_else(|_| serde_json::Value::String(report.clone()));
                         println!("report:      {}", summary);
+                    }
+                    if let Some(pid) = &t.parent_id {
+                        println!("parent:      {}", pid);
+                    }
+                    // Show children if present.
+                    let children = store.children_of(&id)?;
+                    if !children.is_empty() {
+                        println!("children:");
+                        for c in &children {
+                            println!(
+                                "  {}  {:<10} {:<20}  {}",
+                                c.id,
+                                c.agent,
+                                c.status.as_str(),
+                                c.goal
+                            );
+                        }
                     }
                 }
                 None => anyhow::bail!("task {id} not found"),
@@ -1468,11 +1495,13 @@ mod tests {
                     goal,
                     workspace,
                     verify,
+                    team,
                 } => {
                     assert_eq!(agent, "myagent");
                     assert_eq!(goal, "fix the bug");
                     assert!(workspace.is_none());
                     assert!(verify.is_empty());
+                    assert!(!team);
                 }
                 other => panic!("expected Add, got {other:?}"),
             },
@@ -1500,11 +1529,13 @@ mod tests {
                     goal,
                     workspace,
                     verify,
+                    team,
                 } => {
                     assert_eq!(agent, "bot");
                     assert_eq!(goal, "goal");
                     assert_eq!(workspace.as_deref(), Some("/tmp/ws"));
                     assert_eq!(verify, vec!["cargo test"]);
+                    assert!(!team);
                 }
                 other => panic!("expected Add, got {other:?}"),
             },

@@ -9,6 +9,7 @@
 //! (thus terminating). `Tell` → recipient `experience`s, no reply.
 
 mod message;
+pub mod pm;
 mod registry;
 
 pub use message::{Delivery, Envelope, MessageKind, Party, Recipient};
