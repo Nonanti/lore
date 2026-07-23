@@ -33,6 +33,10 @@ pub enum LoreError {
     #[error("server error: {0}")]
     Server(String),
 
+    /// Action denied by policy gate.
+    #[error("policy denied: {0}")]
+    PolicyDenied(String),
+
     /// Other, wrapped errors.
     #[error(transparent)]
     Other(#[from] anyhow::Error),

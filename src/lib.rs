@@ -26,6 +26,7 @@ pub mod id;
 pub mod memory;
 pub mod model;
 pub mod orchestrator;
+pub mod policy;
 pub mod server;
 pub mod tool;
 
@@ -47,6 +48,8 @@ pub use model::{
     Role, Turn,
 };
 pub use orchestrator::{Delivery, Envelope, MessageKind, Orchestrator, Party, Recipient, Registry};
+pub use policy::approval::{AllowAll, Approver, CliApprover, DenyAll, Gate};
+pub use policy::{Action, DefaultExec, Policy, Verdict};
 pub use server::{
     ActResp, AgentView, AppState, AskResp, DeliberateReply, DeliberateResp, MemoryView,
     PersonaPatch,
