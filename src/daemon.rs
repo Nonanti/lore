@@ -1189,4 +1189,154 @@ mod tests {
         let parent_loaded = store.get(&parent.id).unwrap().unwrap();
         assert_eq!(parent_loaded.status, TaskStatus::Completed);
     }
+
+    // ── Review child itself fails → parent still completes ──────────
+    // Reviewer failure is NOT treated as a regular child failure (reviewer
+    // is excluded from the "non-review failure" filter). After the review
+    // child fails, all children are done, reviewer exists but review child
+    // already enqueued → no duplicate, and the parent proceeds to synthesis.
+
+    #[tokio::test]
+    async fn maybe_complete_parent_review_child_fails_parent_completes() {
+        let store = TaskStore::in_memory().unwrap();
+        let db = TmpDb::new("mcp-review-fail");
+
+        // Create reviewer persona file so roster has reviewer.
+        let agents_dir = db.data_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let persona = Persona::new("reviewer", "code reviewer");
+        let mem_store: Arc<dyn crate::memory::MemoryStore> = Arc::new(InMemoryStore::new());
+        let agent = Agent::new(persona, mem_store, Arc::new(MockModel::new()));
+        agent.save_to(agents_dir.join("reviewer.json")).unwrap();
+
+        // Also create pm persona for synthesis.
+        let pm_persona = Persona::new("pm", "project manager");
+        let pm_mem: Arc<dyn crate::memory::MemoryStore> = Arc::new(InMemoryStore::new());
+        let pm_agent = Agent::new(pm_persona, pm_mem, Arc::new(MockModel::new()));
+        pm_agent.save_to(agents_dir.join("pm.json")).unwrap();
+
+        let parent = store
+            .enqueue(NewTask {
+                agent: "pm".to_string(),
+                goal: "build app".to_string(),
+                workspace: PathBuf::from("/tmp"),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+        store
+            .set_status(&parent.id, TaskStatus::WaitingSubtasks)
+            .unwrap();
+
+        // Worker child succeeds.
+        let c1 = store
+            .enqueue_child(
+                &parent.id,
+                NewTask {
+                    agent: "backend".to_string(),
+                    goal: "impl API".to_string(),
+                    workspace: PathBuf::from("/tmp"),
+                    verify: vec![],
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+        store
+            .complete(
+                &c1.id,
+                &serde_json::to_string(&serde_json::json!({"success":true,"answer":"API done"}))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let model = Arc::new(MockModel::new());
+        let deps = TaskDeps {
+            data_dir: db.data_dir().to_path_buf(),
+            model,
+            db_path: db.path().to_path_buf(),
+        };
+
+        // First maybe_complete_parent: reviewer exists → review child enqueued.
+        let completed1 = maybe_complete_parent(&store, &c1.id, &deps).await.unwrap();
+        assert!(
+            !completed1,
+            "review child enqueued, parent stays WaitingSubtasks"
+        );
+
+        let children = store.children_of(&parent.id).unwrap();
+        let review_child = children.iter().find(|c| c.agent == "reviewer").unwrap();
+
+        // Review child itself FAILS — reviewer failure is NOT a regular child failure.
+        store
+            .fail(
+                &review_child.id,
+                &serde_json::to_string(
+                    &serde_json::json!({"success":false,"answer":"review crashed"}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Second maybe_complete_parent: all children done, review child failed
+        // but reviewer failures don't propagate to parent. Parent should still
+        // complete via synthesis (has_review_child is true, so no duplicate review).
+        let synth_model = Arc::new(ScriptedModel::new(&[
+            "synthesized: accepted despite review failure",
+        ]));
+        let synth_deps = TaskDeps {
+            data_dir: db.data_dir().to_path_buf(),
+            model: synth_model,
+            db_path: db.path().to_path_buf(),
+        };
+
+        let completed2 = maybe_complete_parent(&store, &review_child.id, &synth_deps)
+            .await
+            .unwrap();
+        assert!(
+            completed2,
+            "parent should complete even though review child failed"
+        );
+
+        let parent_loaded = store.get(&parent.id).unwrap().unwrap();
+        assert_eq!(
+            parent_loaded.status,
+            TaskStatus::Completed,
+            "reviewer failure does not wedge the parent"
+        );
+    }
+
+    // ── decompose_team_task with empty roster → fail ────────────────────
+
+    #[tokio::test]
+    async fn decompose_team_task_empty_roster_fails() {
+        let store = TaskStore::in_memory().unwrap();
+        let db = TmpDb::new("dt-empty-roster");
+
+        // Parent PM task.
+        let parent = store
+            .enqueue(NewTask {
+                agent: "pm".to_string(),
+                goal: "build app".to_string(),
+                workspace: PathBuf::from("/tmp"),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+        store.set_status(&parent.id, TaskStatus::Running).unwrap();
+
+        // No agents dir → empty roster → decompose_team_task fails.
+        let model = Arc::new(ScriptedModel::new(&["should not be called"]));
+        let deps = TaskDeps {
+            data_dir: db.data_dir().to_path_buf(),
+            model,
+            db_path: db.path().to_path_buf(),
+        };
+
+        let result = decompose_team_task(&store, &parent.id, &deps).await;
+        assert!(result.is_err(), "empty roster should fail decompose");
+
+        // Parent task is marked Failed.
+        let parent_loaded = store.get(&parent.id).unwrap().unwrap();
+        assert_eq!(parent_loaded.status, TaskStatus::Failed);
+    }
 }

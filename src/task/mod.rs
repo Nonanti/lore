@@ -1312,4 +1312,80 @@ mod tests {
         let solo = store.enqueue(new_task("solo", "goal")).unwrap();
         assert!(store.all_children_done(&solo.id).unwrap());
     }
+
+    // ── Migration idempotent: re-opening a v2 DB doesn't break ──────────
+
+    #[test]
+    fn migration_v2_idempotent_on_reopen() {
+        let db = TmpDb::new();
+
+        // First open: creates v2 schema with parent_id.
+        {
+            let store = TaskStore::open(db.path()).unwrap();
+            let parent = store.enqueue(new_task("pm", "goal")).unwrap();
+            let child = store
+                .enqueue_child(&parent.id, new_task("backend", "sub"))
+                .unwrap();
+            assert_eq!(child.parent_id, Some(parent.id.clone()));
+        }
+
+        // Second open: migration should be idempotent — no ALTER TABLE error.
+        let store = TaskStore::open(db.path()).unwrap();
+        let parent_loaded = store.get("01ARZ00000").unwrap(); // nonexistent is fine
+        assert!(parent_loaded.is_none(), "sanity check");
+
+        // Parent_id column still works after re-open.
+        let new_parent = store.enqueue(new_task("pm2", "goal2")).unwrap();
+        let new_child = store
+            .enqueue_child(&new_parent.id, new_task("frontend", "sub2"))
+            .unwrap();
+        assert_eq!(
+            new_child.parent_id,
+            Some(new_parent.id.clone()),
+            "parent_id column works after idempotent migration"
+        );
+
+        // Can still query children_of.
+        let children = store.children_of(&new_parent.id).unwrap();
+        assert_eq!(children.len(), 1);
+    }
+
+    // ── all_children_done with WaitingSubtasks child ───────────────────
+
+    #[test]
+    fn all_children_done_waiting_subtasks_is_not_done() {
+        let store = TaskStore::in_memory().unwrap();
+        let parent = store.enqueue(new_task("pm", "goal")).unwrap();
+        let c1 = store
+            .enqueue_child(&parent.id, new_task("backend", "g"))
+            .unwrap();
+
+        // WaitingSubtasks is a non-terminal state → children are NOT done.
+        store
+            .set_status(&c1.id, TaskStatus::WaitingSubtasks)
+            .unwrap();
+        assert!(
+            !store.all_children_done(&parent.id).unwrap(),
+            "WaitingSubtasks child means not all done"
+        );
+    }
+
+    // ── all_children_done with WaitingApproval child ───────────────────
+
+    #[test]
+    fn all_children_done_waiting_approval_is_not_done() {
+        let store = TaskStore::in_memory().unwrap();
+        let parent = store.enqueue(new_task("pm", "goal")).unwrap();
+        let c1 = store
+            .enqueue_child(&parent.id, new_task("backend", "g"))
+            .unwrap();
+
+        store
+            .set_status(&c1.id, TaskStatus::WaitingApproval)
+            .unwrap();
+        assert!(
+            !store.all_children_done(&parent.id).unwrap(),
+            "WaitingApproval child means not all done"
+        );
+    }
 }

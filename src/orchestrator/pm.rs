@@ -601,4 +601,80 @@ mod tests {
 
         assert!(has_review_child(&store, &parent.id).unwrap());
     }
+
+    // ── Duplicate agent names in decomposition output ──────────────────
+
+    #[tokio::test]
+    async fn decompose_duplicate_agent_names_allowed() {
+        // Two subtasks both assigned to "backend" — this is valid (e.g. two
+        // backend tasks with different goals). Agent validation only checks
+        // that names exist in roster, not that they're unique.
+        let json = serde_json::to_string(&serde_json::json!([
+            {"agent": "backend", "goal": "implement API", "verify": ["cargo test"]},
+            {"agent": "backend", "goal": "implement caching", "verify": ["cargo test"]}
+        ]))
+        .unwrap();
+        let model: Arc<dyn Model> = Arc::new(ScriptedPm::new(&[&json]));
+        let specs = decompose(&model, "build", &make_roster()).await.unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].agent, "backend");
+        assert_eq!(specs[1].agent, "backend");
+        assert_ne!(specs[0].goal, specs[1].goal);
+    }
+
+    // ── Empty decomposition array → error ────────────────────────────────
+
+    #[tokio::test]
+    async fn decompose_empty_array_errors() {
+        // PM model returns [] → parse_subtasks yields empty specs → error.
+        let json = serde_json::to_string(&serde_json::json!([])).unwrap();
+        let model: Arc<dyn Model> = Arc::new(ScriptedPm::new(&[&json]));
+        let result = decompose(&model, "goal", &make_roster()).await;
+        assert!(result.is_err(), "empty array should produce an error");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no valid JSON"),
+            "empty array treated as no valid subtasks: {err}"
+        );
+    }
+
+    // ── collect_child_reports for nonexistent parent ────────────────────
+
+    #[test]
+    fn collect_child_reports_empty_parent() {
+        let store = TaskStore::in_memory().unwrap();
+        // nonexistent parent → empty children_of → empty reports.
+        let reports = collect_child_reports(&store, "nonexistent-id").unwrap();
+        assert!(reports.is_empty(), "no children → no reports");
+    }
+
+    // ── has_review_child for nonexistent parent ──────────────────────────
+
+    #[test]
+    fn has_review_child_nonexistent_parent_returns_false() {
+        let store = TaskStore::in_memory().unwrap();
+        // nonexistent parent → children_of returns [] → false.
+        assert!(!has_review_child(&store, "nonexistent-id").unwrap());
+    }
+
+    // ── build_roster with nonexistent agents dir ──────────────────────────
+
+    #[test]
+    fn build_roster_nonexistent_dir_returns_empty() {
+        let tmp = std::env::temp_dir().join(format!("lore-no-agents-{}", ulid::Ulid::new()));
+        // dir doesn't exist at all → empty roster.
+        let roster = build_roster(&tmp).unwrap();
+        assert!(roster.is_empty());
+    }
+
+    // ── synthesis_prompt with empty reports ──────────────────────────────
+
+    #[test]
+    fn synthesis_prompt_empty_reports_still_valid() {
+        let prompt = synthesis_prompt(&[]);
+        assert!(
+            prompt.contains("Synthesize"),
+            "empty reports still produce prompt"
+        );
+    }
 }
