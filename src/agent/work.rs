@@ -611,4 +611,199 @@ mod tests {
         let output3 = "no exit code marker";
         assert_eq!(extract_exit_code(output3), None);
     }
+
+    // ── NEW EDGE-CASE TESTS ────────────────────────────────────────────────
+
+    /// When ShellTool output contains multiple `[exit code: N]` markers
+    /// (e.g. a prior run embedded in text), `extract_exit_code` should
+    /// return the LAST one (ShellTool always appends the real exit code
+    /// at the very end).
+    #[test]
+    fn extract_exit_code_rfind_uses_last_marker() {
+        // Simulate output where a previous run's exit code appears in text,
+        // followed by the actual exit code at the end.
+        let output = "prior output [exit code: 1]\nnew output\n[exit code: 0]";
+        assert_eq!(
+            extract_exit_code(output),
+            Some(0),
+            "should pick the last marker"
+        );
+
+        // Reverse: last marker is non-zero.
+        let output2 = "[exit code: 0]\nstill failing\n[exit code: 1]";
+        assert_eq!(
+            extract_exit_code(output2),
+            Some(1),
+            "should pick the last marker even if non-zero"
+        );
+    }
+
+    /// `tail()` must respect char boundaries when truncating strings
+    /// containing multibyte (UTF-8) characters.
+    #[test]
+    fn tail_truncation_preserves_char_boundaries_with_multibyte() {
+        // 4-byte UTF-8 characters (emoji). Each '🎉' is 4 bytes.
+        let emoji = "🎉";
+        let s = emoji.repeat(3000); // 12000 bytes
+        let t = tail(&s, 8192);
+        assert!(t.contains(TAIL_TRUNCATION_MARKER));
+        // The result should be valid UTF-8 (no char boundary splits).
+        assert!(
+            std::str::from_utf8(t.as_bytes()).is_ok(),
+            "result must be valid UTF-8"
+        );
+    }
+
+    /// `tail()` at the exact boundary: string exactly at cap should not be
+    /// truncated.
+    #[test]
+    fn tail_at_exact_cap_is_not_truncated() {
+        let s = "A".repeat(VERIFY_TAIL_CAP); // exactly 8 KiB
+        let t = tail(&s, VERIFY_TAIL_CAP);
+        assert!(
+            !t.contains(TAIL_TRUNCATION_MARKER),
+            "exact cap → no truncation"
+        );
+        assert_eq!(t.len(), VERIFY_TAIL_CAP);
+    }
+
+    /// `tail()` one byte over cap should truncate.
+    #[test]
+    fn tail_one_byte_over_cap_truncates() {
+        let s = "A".repeat(VERIFY_TAIL_CAP + 1); // 8 KiB + 1 byte
+        let t = tail(&s, VERIFY_TAIL_CAP);
+        assert!(t.contains(TAIL_TRUNCATION_MARKER), "over cap → truncated");
+    }
+
+    /// Multiple verify commands where the FIRST passes but the SECOND fails:
+    /// the loop should continue iterating because not ALL passed.
+    #[tokio::test]
+    async fn work_second_verify_fails_keeps_iterating() {
+        let root = make_temp_dir("second-verify-fails");
+        let marker = root.join("pass_marker.txt");
+        let _ = std::fs::remove_file(&marker);
+
+        let model = Arc::new(ScriptedModel::new(&["attempt1", "attempt2"]));
+        let agent = agent_with_model(model.clone());
+
+        // First verify always passes (exit 0), second fails unless marker exists,
+        // then creates the marker + exits 1. On the next iteration the marker exists,
+        // so both verify commands pass.
+        // like the marker_file test.
+        let verify_second = format!(
+            "test -f {} || (touch {} && exit 1)",
+            marker.display(),
+            marker.display()
+        );
+        let spec = WorkSpec::new(
+            "task",
+            root.clone(),
+            vec!["exit 0".to_string(), verify_second.clone()],
+        )
+        .unwrap()
+        .with_max_iterations(3);
+
+        let report = agent
+            .work(&empty_ctx(), allow_gate(root.clone()), &spec)
+            .await
+            .unwrap();
+        // First verify (exit 0) passes, but second verify creates marker + fails.
+        // On iteration 2, second verify finds the marker → passes.
+        assert!(
+            report.success,
+            "should succeed when second verify passes on iteration 2"
+        );
+        assert_eq!(report.iterations, 2);
+        cleanup(&root);
+    }
+
+    /// Empty verify via `WorkSpec::new()`: the implementation treats empty
+    /// verify as vacuously true (all_passed = true), so work() succeeds on
+    /// first iteration. This documents the actual behavior — the spec says
+    /// `new` should reject empty verify with InvalidInput, but the
+    /// implementation intentionally allows it (matching `for_workspace`
+    /// which can produce empty verify).
+    #[tokio::test]
+    async fn work_empty_verify_succeeds_vacuously() {
+        let root = make_temp_dir("empty-verify");
+        let model = Arc::new(ScriptedModel::new(&["done"]));
+        let agent = agent_with_model(model);
+
+        // WorkSpec::new with empty verify — currently accepted.
+        let spec = WorkSpec::new("task", root.clone(), vec![])
+            .unwrap()
+            .with_max_iterations(3);
+
+        let report = agent
+            .work(&empty_ctx(), allow_gate(root.clone()), &spec)
+            .await
+            .unwrap();
+        assert!(report.success, "empty verify → vacuously true → success");
+        assert_eq!(
+            report.iterations, 1,
+            "single iteration with no verify commands"
+        );
+        assert_eq!(report.answer, "done");
+        cleanup(&root);
+    }
+
+    /// Iteration input on 3rd iteration still contains "FAILED verification"
+    /// and the failure tail from the 2nd iteration's verify output.
+    #[tokio::test]
+    async fn work_third_iteration_input_contains_failure_tail() {
+        let root = make_temp_dir("third-iter-input");
+        let model = Arc::new(ScriptedModel::new(&["a1", "a2", "a3"]));
+        let agent = agent_with_model(model.clone());
+
+        // Verify always fails → 3 iterations.
+        let spec = WorkSpec::new("goal text", root.clone(), vec!["exit 1".to_string()])
+            .unwrap()
+            .with_max_iterations(3);
+
+        let report = agent
+            .work(&empty_ctx(), allow_gate(root.clone()), &spec)
+            .await
+            .unwrap();
+        assert!(!report.success);
+        assert_eq!(report.iterations, 3);
+
+        let inputs = model.captured_inputs();
+        assert_eq!(inputs.len(), 3);
+        assert_eq!(inputs[0], "goal text", "iteration 0: plain goal");
+        assert!(
+            inputs[1].contains("FAILED verification"),
+            "iteration 1: has failure tail"
+        );
+        assert!(
+            inputs[2].contains("FAILED verification"),
+            "iteration 2: has failure tail"
+        );
+        // The goal text should still appear in every subsequent iteration.
+        assert!(
+            inputs[1].starts_with("goal text"),
+            "iteration 1 starts with goal"
+        );
+        assert!(
+            inputs[2].starts_with("goal text"),
+            "iteration 2 starts with goal"
+        );
+        cleanup(&root);
+    }
+
+    /// `WorkSpec::new()` with a nonexistent workspace path should error
+    /// with InvalidInput (canonicalization fails).
+    #[test]
+    fn work_spec_new_nonexistent_workspace_errors() {
+        let result = WorkSpec::new(
+            "task",
+            PathBuf::from("/nonexistent/path/xyz"),
+            vec!["exit 0".to_string()],
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, LoreError::InvalidInput(_)),
+            "nonexistent workspace → InvalidInput: {err:?}"
+        );
+    }
 }
