@@ -1,0 +1,14 @@
+{
+  "id": "01HXYZOLDAGENT0",
+  "persona": {
+    "name": "OldBot",
+    "role": "worker",
+    "description": "",
+    "traits": [
+      "curious",
+      "cautious"
+    ],
+    "system_prompt": "",
+    "version": 1
+  }
+}

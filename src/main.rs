@@ -5,10 +5,10 @@
 
 use clap::{Parser, Subcommand};
 use lore::{
-    Agent, AgentId, AnthropicAuth, AnthropicModel, AppState, CalcTool, CodexModel, Credential,
-    FileReadTool, HashingEmbedder, InMemoryStore, KeywordRouter, Memory, MemoryGraph, MemoryStore,
-    MessageKind, MockModel, Model, NewTask, OpenAiModel, Orchestrator, Party, Persona,
-    PersonaPatch, Query, RefreshingToken, Scope, SemanticCat, SqliteStore, TaskStore, TimeTool,
+    build_model, build_model_from_env, preset, Agent, AgentId, AppState, AuthKind, CalcTool,
+    Credential, FileReadTool, HashingEmbedder, InMemoryStore, KeywordRouter, Memory, MemoryGraph,
+    MemoryStore, MessageKind, Model, ModelConfig, NewTask, Orchestrator, Party, Persona,
+    PersonaPatch, ProviderKind, Query, Scope, SemanticCat, SqliteStore, TaskStore, TimeTool,
     TokenStore, ToolContext, ToolRegistry, WebFetchTool,
 };
 use std::sync::Arc;
@@ -177,6 +177,11 @@ enum Cmd {
         #[command(subcommand)]
         task_cmd: TaskCmd,
     },
+    /// Agent management subcommands.
+    Agent {
+        #[command(subcommand)]
+        agent_cmd: AgentCmd,
+    },
     /// Show pending approval inbox.
     Inbox,
     /// Approve a pending approval.
@@ -216,186 +221,37 @@ enum TaskCmd {
         tail: Option<usize>,
     },
 }
-fn env_max_tokens() -> Option<u32> {
-    match std::env::var("LORE_LLM_MAX_TOKENS") {
-        Ok(mt) => match mt.parse::<u32>() {
-            Ok(n) if n > 0 => Some(n),
-            _ => {
-                tracing::warn!(value = %mt, "LORE_LLM_MAX_TOKENS invalid, ignored");
-                None
-            }
-        },
-        Err(_) => None,
-    }
+
+#[derive(Debug, Subcommand)]
+enum AgentCmd {
+    /// Create a new agent with a role preset and optional model config.
+    Create {
+        /// Agent name (used as persona file stem).
+        name: String,
+        /// Role preset (backend, frontend, reviewer, pm) or freeform role.
+        #[arg(long)]
+        role: String,
+        /// LLM provider (anthropic, openai, openai-compat, mock).
+        /// Omit → env fallback (no model field in JSON).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Model name (e.g. claude-sonnet-4-5-20250929, qwen3:8b).
+        #[arg(long)]
+        model: Option<String>,
+        /// Auth method: key (metered) or subs (subscription).
+        #[arg(long)]
+        auth: Option<String>,
+        /// Base URL for OpenAI-compatible provider.
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    /// List agents (name, role, provider/model or '(env)').
+    List,
 }
-
-/// Optional request timeout in seconds (`LORE_LLM_TIMEOUT`).
-fn env_timeout() -> Option<std::time::Duration> {
-    match std::env::var("LORE_LLM_TIMEOUT") {
-        Ok(to) => match to.parse::<u64>() {
-            Ok(n) if n > 0 => Some(std::time::Duration::from_secs(n)),
-            _ => {
-                tracing::warn!(value = %to, "LORE_LLM_TIMEOUT invalid, ignored");
-                None
-            }
-        },
-        Err(_) => None,
-    }
-}
-
-/// Refresh closure for Anthropic subscription tokens.
-fn anthropic_refresh_fn() -> lore::auth::RefreshFn {
-    Box::new(|rt: String| Box::pin(async move { lore::auth::refresh_anthropic(&rt).await }))
-}
-
-/// Refresh closure for OpenAI (Codex) subscription tokens.
-fn openai_refresh_fn() -> lore::auth::RefreshFn {
-    Box::new(|rt: String| Box::pin(async move { lore::auth::refresh_openai(&rt).await }))
-}
-
-/// Builds an OpenAI provider: subscription (Codex Responses) or metered API key
-/// (Chat Completions via `OpenAiModel`).
-fn build_openai(data: &str) -> Arc<dyn Model> {
-    let name = std::env::var("LORE_LLM_MODEL").unwrap_or_else(|_| "gpt-5".into());
-    let store = TokenStore::new(data);
-    let stored = store.load("openai").ok().flatten();
-    let mode = std::env::var("LORE_AUTH").ok();
-    let want_key = mode.as_deref() == Some("key");
-    let want_subs = mode.as_deref() == Some("subs");
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .or_else(|_| std::env::var("LORE_LLM_KEY"))
-        .ok()
-        .filter(|k| !k.trim().is_empty());
-
-    // Subscription (Codex) path.
-    if !want_key {
-        if let Some(cred @ Credential::OAuth { account_id, .. }) = &stored {
-            let account_id = account_id.clone();
-            let refreshing =
-                RefreshingToken::new(store, "openai", cred.clone(), openai_refresh_fn());
-            let mut m = CodexModel::new(name, Arc::new(refreshing), account_id);
-            if let Some(d) = env_timeout() {
-                m = m.with_timeout(d);
-            }
-            return Arc::new(m);
-        }
-        if want_subs {
-            tracing::warn!(
-                "LORE_AUTH=subs but no OpenAI subscription credential; run `lore login openai`"
-            );
-        }
-    }
-    // Metered API-key path (official Chat Completions).
-    let key = api_key.or_else(|| match &stored {
-        Some(Credential::ApiKey { key }) => Some(key.clone()),
-        _ => None,
-    });
-    match key {
-        Some(k) => {
-            let mut m = OpenAiModel::new("https://api.openai.com/v1", name).with_api_key(k);
-            if let Some(n) = env_max_tokens() {
-                m = m.with_max_tokens(n);
-            }
-            if let Some(d) = env_timeout() {
-                m = m.with_timeout(d);
-            }
-            Arc::new(m)
-        }
-        None => {
-            tracing::warn!(
-                "LORE_PROVIDER=openai but no credential found \
-                 (run `lore login openai` or set OPENAI_API_KEY); using MockModel"
-            );
-            Arc::new(MockModel::new())
-        }
-    }
-}
-
-/// Resolves Anthropic auth: `LORE_AUTH=key|subs` (default: subs if a stored
-/// OAuth credential exists, else an API key from `ANTHROPIC_API_KEY`/`LORE_LLM_KEY`).
-fn resolve_anthropic_auth(data: &str) -> Option<AnthropicAuth> {
-    let store = TokenStore::new(data);
-    let stored = store.load("anthropic").ok().flatten();
-    let mode = std::env::var("LORE_AUTH").ok();
-    let want_key = mode.as_deref() == Some("key");
-    let want_subs = mode.as_deref() == Some("subs");
-    let api_key = std::env::var("ANTHROPIC_API_KEY")
-        .or_else(|_| std::env::var("LORE_LLM_KEY"))
-        .ok()
-        .filter(|k| !k.trim().is_empty());
-
-    // Explicit API-key mode, or a stored api-key credential.
-    if want_key {
-        return api_key.map(AnthropicAuth::ApiKey);
-    }
-    if let Some(Credential::ApiKey { key }) = &stored {
-        if !want_subs {
-            return Some(AnthropicAuth::ApiKey(key.clone()));
-        }
-    }
-    // Subscription (OAuth) from the token store.
-    if let Some(cred @ Credential::OAuth { .. }) = stored {
-        let refreshing = RefreshingToken::new(store, "anthropic", cred, anthropic_refresh_fn());
-        return Some(AnthropicAuth::OAuth(Arc::new(refreshing)));
-    }
-    // Fall back to an API key from the environment.
-    api_key.map(AnthropicAuth::ApiKey)
-}
-
-/// Builds an Anthropic model (subscription or API key).
-fn build_anthropic(data: &str) -> Arc<dyn Model> {
-    let name = std::env::var("LORE_LLM_MODEL").unwrap_or_else(|_| "claude-sonnet-4-5".into());
-    match resolve_anthropic_auth(data) {
-        Some(auth) => {
-            let mut m = AnthropicModel::new(name, auth);
-            if let Some(n) = env_max_tokens() {
-                m = m.with_max_tokens(n);
-            }
-            if let Some(d) = env_timeout() {
-                m = m.with_timeout(d);
-            }
-            Arc::new(m)
-        }
-        None => {
-            tracing::warn!(
-                "LORE_PROVIDER=anthropic but no credential found \
-                 (run `lore login anthropic` or set ANTHROPIC_API_KEY); using MockModel"
-            );
-            Arc::new(MockModel::new())
-        }
-    }
-}
-
-/// Sets up the model. `LORE_PROVIDER=anthropic` selects the Anthropic provider
-/// (subscription/API key); otherwise `LORE_LLM_BASE` uses the OpenAI-compatible
-/// path (incl. Ollama); with neither set, `MockModel`.
-fn build_model(data: &str) -> Arc<dyn Model> {
-    match std::env::var("LORE_PROVIDER").ok().as_deref() {
-        Some("anthropic") => return build_anthropic(data),
-        Some("openai") => return build_openai(data),
-        _ => {}
-    }
-    match std::env::var("LORE_LLM_BASE") {
-        Ok(base) => {
-            let name = std::env::var("LORE_LLM_MODEL").unwrap_or_else(|_| "llama3.2".into());
-            let mut m = OpenAiModel::new(base, name);
-            if let Ok(key) = std::env::var("LORE_LLM_KEY") {
-                m = m.with_api_key(key);
-            }
-            // Optional response token limit. Low values on reasoning models may
-            // spend the budget on thinking — use deliberately.
-            if let Some(n) = env_max_tokens() {
-                m = m.with_max_tokens(n);
-            }
-            // Optional request timeout (seconds). Slow local models (e.g. 14B+
-            // on CPU) may exceed the default 120 s — can be increased.
-            if let Some(d) = env_timeout() {
-                m = m.with_timeout(d);
-            }
-            Arc::new(m)
-        }
-        Err(_) => Arc::new(MockModel::new()),
-    }
+/// Sets up the model from env config (centralized in `lore::model::factory`).
+fn build_model_from_env_cli(data: &str) -> Arc<dyn Model> {
+    let path = std::path::Path::new(data);
+    build_model_from_env(path)
 }
 
 /// Sets up the embedder: `LORE_EMBEDDER=neural` + `neural` feature → fastembed;
@@ -460,8 +316,12 @@ fn build_state(data: &str) -> anyhow::Result<AppState> {
                 .on("file", "file"),
         ),
     };
-    let mut app =
-        AppState::persistent(format!("{data}/agents"), store, build_model(data))?.with_tools(tools);
+    let mut app = AppState::persistent(
+        format!("{data}/agents"),
+        store,
+        build_model_from_env_cli(data),
+    )?
+    .with_tools(tools);
     // Security: if LORE_API_KEY is set, auth is mandatory; LORE_RATE_LIMIT caps requests per minute.
     if let Some(key) = parse_api_key(std::env::var("LORE_API_KEY").ok()) {
         app = app.with_api_key(key);
@@ -489,6 +349,150 @@ fn build_state(data: &str) -> anyhow::Result<AppState> {
         }
     }
     Ok(app)
+}
+/// Handle agent subcommands: create with role preset + optional model, list.
+fn handle_agent(data: &str, cmd: AgentCmd) -> anyhow::Result<()> {
+    let agents_dir = format!("{}/agents", data);
+    std::fs::create_dir_all(&agents_dir)?;
+
+    match cmd {
+        AgentCmd::Create {
+            name,
+            role,
+            provider,
+            model,
+            auth,
+            base_url,
+        } => {
+            // Resolve role preset or use the role string as-is.
+            let role_preset = preset(&role);
+            let (role_str, traits, extra_lines) = match &role_preset {
+                Some(r) => (
+                    r.role.to_string(),
+                    r.traits.to_vec(),
+                    vec![r.identity_extra.to_string()],
+                ),
+                None => (role.clone(), Vec::new(), Vec::new()),
+            };
+
+            let mut persona = Persona::new(&name, &role_str);
+            if !traits.is_empty() {
+                persona = persona.with_traits(traits.iter().map(|s| s.to_string()));
+            }
+            if !extra_lines.is_empty() {
+                persona = persona.with_extra(extra_lines);
+            }
+
+            // Build ModelConfig only if provider is specified.
+            // No provider → no model field → env fallback at runtime.
+            let model_config: Option<ModelConfig> = if let Some(p_str) = &provider {
+                let provider_kind = match p_str.as_str() {
+                    "anthropic" => ProviderKind::Anthropic,
+                    "openai" => ProviderKind::OpenAI,
+                    "openai-compat" => ProviderKind::OpenAiCompat,
+                    "mock" => ProviderKind::Mock,
+                    other => anyhow::bail!(
+                        "unknown provider '{other}' (expected: anthropic, openai, openai-compat, mock)"
+                    ),
+                };
+                let model_name = model.clone().unwrap_or_else(|| match provider_kind {
+                    ProviderKind::Anthropic => "claude-sonnet-4-5".to_string(),
+                    ProviderKind::OpenAI => "gpt-5".to_string(),
+                    ProviderKind::OpenAiCompat => "llama3.2".to_string(),
+                    ProviderKind::Mock => "mock".to_string(),
+                });
+                let auth_kind = match auth.as_deref() {
+                    Some("key") => Some(AuthKind::Key),
+                    Some("subs") => Some(AuthKind::Subs),
+                    Some(other) => anyhow::bail!("unknown auth '{other}' (expected: key, subs)"),
+                    None => None,
+                };
+                Some(ModelConfig {
+                    provider: provider_kind,
+                    model: model_name,
+                    auth: auth_kind,
+                    base_url: base_url.clone(),
+                })
+            } else {
+                None
+            };
+
+            // Build model: use per-agent config if present, else env.
+            let data_path = std::path::Path::new(data);
+            let arc_model: Arc<dyn Model> = match &model_config {
+                Some(cfg) => build_model(cfg, data_path)?,
+                None => build_model_from_env(data_path),
+            };
+
+            let agent = Agent::new(persona, Arc::new(lore::InMemoryStore::new()), arc_model);
+            let agent = match model_config {
+                Some(cfg) => agent.with_model_config(cfg),
+                None => agent,
+            };
+
+            // Save persona+model JSON under <data>/agents/<name>.json.
+            let path = std::path::PathBuf::from(&agents_dir).join(format!("{name}.json"));
+            agent.save_to(&path)?;
+
+            // Summary line.
+            let model_label = match agent.model_config() {
+                Some(cfg) => format!(
+                    "{}/{}",
+                    serde_json::to_value(&cfg.provider)?.as_str().unwrap_or("?"),
+                    cfg.model
+                ),
+                None => "(env)".to_string(),
+            };
+            println!(
+                "✅ created: {}  {}  {}  model: {}",
+                agent.id, agent.persona.name, agent.persona.role, model_label
+            );
+        }
+        AgentCmd::List => {
+            // Scan <data>/agents/*.json, show name, role, provider/model or '(env)'.
+            let dir = std::path::Path::new(&agents_dir);
+            if !dir.exists() {
+                println!("(no agents — create one with 'lore agent create')");
+                return Ok(());
+            }
+            let mut entries = Vec::new();
+            for entry in std::fs::read_dir(dir)? {
+                let path = entry?.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let json = std::fs::read_to_string(&path)?;
+                let rec: serde_json::Value = serde_json::from_str(&json)?;
+                let name = rec
+                    .get("persona")
+                    .and_then(|p| p.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("?");
+                let role = rec
+                    .get("persona")
+                    .and_then(|p| p.get("role"))
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("?");
+                let model_label = match rec.get("model") {
+                    Some(m) => {
+                        let provider = m.get("provider").and_then(|p| p.as_str()).unwrap_or("?");
+                        let model = m.get("model").and_then(|m| m.as_str()).unwrap_or("?");
+                        format!("{provider}/{model}")
+                    }
+                    None => "(env)".to_string(),
+                };
+                entries.push(format!("{name:<12} {role:<20} {model_label}"));
+            }
+            if entries.is_empty() {
+                println!("(no agents — create one with 'lore agent create')");
+            } else {
+                for line in &entries {
+                    println!("{line}");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Handle task subcommands.
@@ -922,6 +926,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
         Cmd::Task { task_cmd } => handle_task(&cli.data, task_cmd)?,
+        Cmd::Agent { agent_cmd } => handle_agent(&cli.data, agent_cmd)?,
         Cmd::Inbox => {
             let store = TaskStore::open(std::path::Path::new(&format!("{}/tasks.db", cli.data)))?;
             let pending = store.pending_approvals()?;
@@ -969,7 +974,7 @@ async fn run_demo(data: &str) -> anyhow::Result<()> {
     // Native embedder attached → recall is hybrid (keyword + cosine).
     let store: Arc<dyn MemoryStore> =
         Arc::new(InMemoryStore::new().with_embedder(Arc::new(HashingEmbedder::new())));
-    let model = build_model(data);
+    let model = build_model_from_env_cli(data);
     match std::env::var("LORE_LLM_BASE") {
         Ok(base) => println!("🔌 Real model: {base}"),
         Err(_) => println!("🧪 MockModel (LORE_LLM_BASE not set)"),
@@ -1594,6 +1599,110 @@ mod tests {
         match cli.cmd {
             Some(super::Cmd::Deny { id }) => assert_eq!(id, "approval_id"),
             other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_agent_create() {
+        let cli =
+            super::Cli::parse_from(["lore", "agent", "create", "devbot", "--role", "backend"]);
+        match cli.cmd {
+            Some(super::Cmd::Agent { agent_cmd }) => match agent_cmd {
+                super::AgentCmd::Create {
+                    name,
+                    role,
+                    provider,
+                    model,
+                    auth,
+                    base_url,
+                } => {
+                    assert_eq!(name, "devbot");
+                    assert_eq!(role, "backend");
+                    assert!(provider.is_none());
+                    assert!(model.is_none());
+                    assert!(auth.is_none());
+                    assert!(base_url.is_none());
+                }
+                other => panic!("expected Create, got {other:?}"),
+            },
+            other => panic!("expected Agent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_agent_create_with_all_options() {
+        let cli = super::Cli::parse_from([
+            "lore",
+            "agent",
+            "create",
+            "devbot",
+            "--role",
+            "backend",
+            "--provider",
+            "anthropic",
+            "--model",
+            "claude-sonnet-4-5-20250929",
+            "--auth",
+            "subs",
+            "--base-url",
+            "http://localhost:11434/v1",
+        ]);
+        match cli.cmd {
+            Some(super::Cmd::Agent { agent_cmd }) => match agent_cmd {
+                super::AgentCmd::Create {
+                    name,
+                    role,
+                    provider,
+                    model,
+                    auth,
+                    base_url,
+                } => {
+                    assert_eq!(name, "devbot");
+                    assert_eq!(role, "backend");
+                    assert_eq!(provider.as_deref(), Some("anthropic"));
+                    assert_eq!(model.as_deref(), Some("claude-sonnet-4-5-20250929"));
+                    assert_eq!(auth.as_deref(), Some("subs"));
+                    assert_eq!(base_url.as_deref(), Some("http://localhost:11434/v1"));
+                }
+                other => panic!("expected Create, got {other:?}"),
+            },
+            other => panic!("expected Agent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_agent_create_mock_provider() {
+        let cli = super::Cli::parse_from([
+            "lore",
+            "agent",
+            "create",
+            "testbot",
+            "--role",
+            "tester",
+            "--provider",
+            "mock",
+        ]);
+        match cli.cmd {
+            Some(super::Cmd::Agent { agent_cmd }) => match agent_cmd {
+                super::AgentCmd::Create { name, provider, .. } => {
+                    assert_eq!(name, "testbot");
+                    assert_eq!(provider.as_deref(), Some("mock"));
+                }
+                other => panic!("expected Create, got {other:?}"),
+            },
+            other => panic!("expected Agent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_agent_list() {
+        let cli = super::Cli::parse_from(["lore", "agent", "list"]);
+        match cli.cmd {
+            Some(super::Cmd::Agent { agent_cmd }) => match agent_cmd {
+                super::AgentCmd::List => {}
+                other => panic!("expected List, got {other:?}"),
+            },
+            other => panic!("expected Agent, got {other:?}"),
         }
     }
 }

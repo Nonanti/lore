@@ -32,6 +32,7 @@ pub mod server;
 pub mod task;
 pub mod tool;
 
+pub use agent::roles::{preset, presets};
 pub use agent::{Agent, Conversation, Persona, WorkReport, WorkSpec};
 pub use auth::{AccessTokenProvider, Credential, RefreshingToken, StaticToken, TokenStore};
 pub use daemon::{run_daemon, run_task, TaskDeps};
@@ -47,8 +48,8 @@ pub use memory::{
     SemanticCat, Signal, SqliteStore, Tier,
 };
 pub use model::{
-    AnthropicAuth, AnthropicModel, CodexModel, Completion, MockModel, Model, OpenAiModel, Prompt,
-    Role, Turn,
+    build_model, build_model_from_env, AnthropicAuth, AnthropicModel, AuthKind, CodexModel,
+    Completion, MockModel, Model, ModelConfig, OpenAiModel, Prompt, ProviderKind, Role, Turn,
 };
 pub use orchestrator::{Delivery, Envelope, MessageKind, Orchestrator, Party, Recipient, Registry};
 pub use policy::approval::{AllowAll, Approver, CliApprover, DenyAll, Gate};

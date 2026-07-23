@@ -18,6 +18,10 @@ pub struct Persona {
     pub traits: Vec<String>,
     /// Extra/custom system instruction (optional).
     pub system_prompt: String,
+    /// Additional identity lines appended to `identity_prompt()` (additive serde).
+    /// Populated from role presets' `identity_extra` or manual additions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra: Vec<String>,
     /// Persona version (increments when identity changes).
     pub version: u32,
 }
@@ -31,6 +35,7 @@ impl Persona {
             description: String::new(),
             traits: Vec::new(),
             system_prompt: String::new(),
+            extra: Vec::new(),
             version: 1,
         }
     }
@@ -59,6 +64,13 @@ impl Persona {
         self
     }
 
+    /// Adds identity extra lines (from role presets or manual additions).
+    /// These are appended after traits and system_prompt in `identity_prompt()`.
+    pub fn with_extra(mut self, lines: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.extra.extend(lines.into_iter().map(Into::into));
+        self
+    }
+
     /// Marks the persona as revised, increments the version.
     pub fn revised(mut self) -> Self {
         self.version += 1;
@@ -78,6 +90,10 @@ impl Persona {
         if !self.system_prompt.is_empty() {
             p.push(' ');
             p.push_str(&self.system_prompt);
+        }
+        if !self.extra.is_empty() {
+            p.push(' ');
+            p.push_str(&self.extra.join(" "));
         }
         p
     }

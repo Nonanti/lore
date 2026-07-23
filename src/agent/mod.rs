@@ -6,10 +6,12 @@
 
 mod conversation;
 mod persona;
+pub mod roles;
 pub mod work;
 
 pub use conversation::{Conversation, DEFAULT_CONVERSATION_CAP};
 pub use persona::Persona;
+pub use roles::{preset, presets, Role};
 pub use work::{WorkReport, WorkSpec};
 
 use crate::error::{LoreError, Result};
@@ -69,6 +71,14 @@ const SOLVE_PRIOR_MIN_WILSON: f64 = 0.2;
 struct AgentRecord {
     id: AgentId,
     persona: Persona,
+    /// Per-agent model configuration (optional; absent → env fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<crate::model::ModelConfig>,
+    /// Identity extra lines stored separately for backward compat.
+    /// (Already part of Persona.extra, but kept for migration.
+    ///  This field is purely additive: loaded values are merged into persona.extra.)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    extra: Vec<String>,
 }
 
 /// An agent with identity, memory, and model.
@@ -82,6 +92,8 @@ pub struct Agent {
     pub memory: Arc<dyn MemoryStore>,
     /// Reasoning engine (LLM abstraction).
     pub model: Arc<dyn Model>,
+    /// Per-agent model config (optional; absent → env fallback).
+    model_config: Option<crate::model::ModelConfig>,
     /// Optional tool context (registry + router).
     tools: Option<Arc<ToolContext>>,
 }
@@ -94,6 +106,7 @@ impl Agent {
             persona,
             memory,
             model,
+            model_config: None,
             tools: None,
         }
     }
@@ -110,6 +123,7 @@ impl Agent {
             persona,
             memory,
             model,
+            model_config: None,
             tools: None,
         }
     }
@@ -120,28 +134,62 @@ impl Agent {
         self
     }
 
+    /// Sets per-agent model config (builder pattern).
+    pub fn with_model_config(mut self, cfg: crate::model::ModelConfig) -> Self {
+        self.model_config = Some(cfg);
+        self
+    }
+
+    /// Returns the per-agent model config (None → env fallback).
+    pub fn model_config(&self) -> Option<&crate::model::ModelConfig> {
+        self.model_config.as_ref()
+    }
+
     /// This agent's personal memory scope.
     pub fn scope(&self) -> Scope {
         Scope::Agent(self.id.clone())
     }
 
-    /// Serializes identity (id + persona) to JSON (Arc handles not included).
+    /// Serializes identity (id + persona + model_config + extra) to JSON (Arc handles not included).
     pub fn to_json(&self) -> Result<String> {
+        // Merge persona.extra into the record's extra field for backward compat.
+        // persona.extra already holds these values; the record's extra is a
+        // redundant store that allows migration.
+        let extra = self.persona.extra.clone();
         let rec = AgentRecord {
             id: self.id.clone(),
             persona: self.persona.clone(),
+            model: self.model_config.clone(),
+            extra,
         };
         Ok(serde_json::to_string_pretty(&rec)?)
     }
 
     /// Reconstructs an agent from JSON identity (with the given memory + model).
+    /// Per-agent model_config, if present, is stored but the provided model
+    /// (usually env-based or pre-built) is used as-is. The daemon will
+    /// rebuild the model from model_config when needed.
     pub fn from_json(
         json: &str,
         memory: Arc<dyn MemoryStore>,
         model: Arc<dyn Model>,
     ) -> Result<Self> {
         let rec: AgentRecord = serde_json::from_str(json)?;
-        Ok(Self::with_id(rec.id, rec.persona, memory, model))
+        // Merge record-level extra into persona.extra (additive: dedup by appending).
+        let mut persona = rec.persona;
+        for line in &rec.extra {
+            if !persona.extra.contains(line) {
+                persona.extra.push(line.clone());
+            }
+        }
+        Ok(Self {
+            id: rec.id,
+            persona,
+            memory,
+            model,
+            model_config: rec.model,
+            tools: None,
+        })
     }
 
     /// Saves identity to a file.
@@ -1633,5 +1681,153 @@ mod think_resilience_tests {
             reply, "full CoT text",
             "user sees full text despite memory failure"
         );
+    }
+}
+
+#[cfg(test)]
+mod backward_compat_tests {
+    use super::*;
+    use crate::memory::InMemoryStore;
+    use crate::model::MockModel;
+
+    /// Old schema JSON (no model or extra fields) must load unchanged.
+    #[test]
+    fn old_agent_json_loads_without_model_or_extra() {
+        let old_json = r#"{
+  "id": "01HXYZOLDAGENT0",
+  "persona": {
+    "name": "OldBot",
+    "role": "worker",
+    "description": "",
+    "traits": ["curious", "cautious"],
+    "system_prompt": "",
+    "version": 1
+  }
+}"#;
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = Arc::new(MockModel::new());
+        let agent = Agent::from_json(old_json, store, model).unwrap();
+        assert_eq!(agent.persona.name, "OldBot");
+        assert_eq!(agent.persona.role, "worker");
+        assert!(
+            agent.model_config().is_none(),
+            "old schema should have no model config"
+        );
+        assert!(
+            agent.persona.extra.is_empty(),
+            "old schema should have no extra"
+        );
+    }
+
+    /// New schema with model and extra fields roundtrips cleanly.
+    #[test]
+    fn new_agent_json_with_model_roundtrips() {
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = Arc::new(MockModel::new());
+        let persona = Persona::new("NewBot", "backend engineer")
+            .with_traits(["verification-minded"])
+            .with_extra(["Run the project's tests before claiming done."]);
+        let agent =
+            Agent::new(persona, store, model).with_model_config(crate::model::ModelConfig {
+                provider: crate::model::ProviderKind::Anthropic,
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                auth: Some(crate::model::AuthKind::Subs),
+                base_url: None,
+            });
+
+        let json = agent.to_json().unwrap();
+        let back = Agent::from_json(
+            &json,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(MockModel::new()),
+        )
+        .unwrap();
+        assert_eq!(back.persona.name, "NewBot");
+        assert_eq!(back.persona.role, "backend engineer");
+        assert!(back.model_config().is_some());
+        assert_eq!(
+            back.model_config().unwrap().provider,
+            crate::model::ProviderKind::Anthropic
+        );
+        assert_eq!(
+            back.model_config().unwrap().model,
+            "claude-sonnet-4-5-20250929"
+        );
+        assert!(!back.persona.extra.is_empty());
+        assert!(back.persona.extra[0].contains("Run the project's tests"));
+    }
+
+    /// Agent JSON with extra field but no model also roundtrips.
+    #[test]
+    fn agent_json_with_extra_no_model_roundtrips() {
+        let old_json = r#"{
+  "id": "01HXYZAGENTEXTRA0",
+  "persona": {
+    "name": "ExtraBot",
+    "role": "helper",
+    "description": "",
+    "traits": [],
+    "system_prompt": "",
+    "extra": ["custom identity line"],
+    "version": 1
+  },
+  "extra": ["custom identity line"]
+}"#;
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = Arc::new(MockModel::new());
+        let agent = Agent::from_json(old_json, store, model).unwrap();
+        assert_eq!(agent.persona.name, "ExtraBot");
+        assert!(agent
+            .persona
+            .extra
+            .contains(&"custom identity line".to_string()));
+        assert!(agent.model_config().is_none());
+    }
+
+    /// identity_prompt includes extra lines from role presets.
+    #[test]
+    fn identity_extra_appears_in_identity_prompt() {
+        let r = crate::agent::roles::preset("backend").unwrap();
+        let persona = Persona::new("Dev", r.role)
+            .with_traits(r.traits.iter().map(|s| s.to_string()))
+            .with_extra([r.identity_extra.to_string()]);
+        let ip = persona.identity_prompt();
+        assert!(
+            ip.contains("Run the project's tests before claiming done"),
+            "identity_extra should appear in prompt: {ip}"
+        );
+    }
+
+    /// save_to/load_from preserves model_config and extra.
+    #[tokio::test]
+    async fn save_load_preserves_model_config_and_extra() {
+        let dir = std::env::temp_dir().join(format!("lore-agent-persist-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("persist_agent.json");
+
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = Arc::new(MockModel::new());
+        let persona = Persona::new("PersistentBot", "reviewer")
+            .with_extra(["Read code critically: look for logic gaps."]);
+        let agent =
+            Agent::new(persona, store, model).with_model_config(crate::model::ModelConfig {
+                provider: crate::model::ProviderKind::Mock,
+                model: "mock".to_string(),
+                auth: None,
+                base_url: None,
+            });
+        agent.save_to(&path).unwrap();
+
+        let loaded = Agent::load_from(
+            &path,
+            Arc::new(InMemoryStore::new()),
+            Arc::new(MockModel::new()),
+        )
+        .unwrap();
+        assert_eq!(loaded.persona.name, "PersistentBot");
+        assert!(loaded.model_config().is_some());
+        assert!(!loaded.persona.extra.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -6,11 +6,13 @@
 
 mod anthropic;
 mod codex;
+mod factory;
 mod mock;
 mod openai;
 
 pub use anthropic::{AnthropicAuth, AnthropicModel};
 pub use codex::CodexModel;
+pub use factory::{build_model, build_model_from_env, AuthKind, ModelConfig, ProviderKind};
 pub use mock::MockModel;
 pub use openai::OpenAiModel;
 
