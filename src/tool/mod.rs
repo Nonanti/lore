@@ -192,26 +192,37 @@ impl ToolRouter for LlmRouter {
     }
 }
 
-/// Extracts the first JSON object from free-form text (between prose/code
-/// fences) and converts it to a `{"tool":..,"args":..}` call. Returns `None`
-/// if tool is null/empty.
+/// Extracts the first JSON tool-call object from free-form text (between
+/// prose/code fences) and converts it to a `{"tool":..,"args":..}` call.
+/// Returns `None` if tool is null/empty.
+///
+/// Trailing content after the first complete object is ignored — models
+/// sometimes emit several calls in one reply (`{…}\n{…}`); only the first
+/// is taken, the loop re-prompts for the rest. Each `{` is tried as a
+/// potential start, so prose containing stray braces before the real JSON
+/// does not break parsing.
 pub fn parse_tool_call(text: &str) -> Option<ToolCall> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end < start {
-        return None;
+    for (start, _) in text.match_indices('{') {
+        let mut stream =
+            serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
+        let Some(Ok(v)) = stream.next() else {
+            continue;
+        };
+        let Some(tool) = v.get("tool").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let tool = tool.trim().to_string();
+        if tool.is_empty() || tool == "null" {
+            return None;
+        }
+        let args = v
+            .get("args")
+            .and_then(|a| a.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Some(ToolCall { tool, args });
     }
-    let v: serde_json::Value = serde_json::from_str(&text[start..=end]).ok()?;
-    let tool = v.get("tool")?.as_str()?.trim().to_string();
-    if tool.is_empty() || tool == "null" {
-        return None;
-    }
-    let args = v
-        .get("args")
-        .and_then(|a| a.as_str())
-        .unwrap_or("")
-        .to_string();
-    Some(ToolCall { tool, args })
+    None
 }
 
 /// Tool context bound to an agent: registry + router.
@@ -300,6 +311,21 @@ mod tests {
         assert!(parse_tool_call(r#"{"tool":null}"#).is_none());
         assert!(parse_tool_call(r#"{"tool":""}"#).is_none());
         assert!(parse_tool_call("no json here").is_none());
+    }
+
+    #[test]
+    fn parse_tool_call_takes_first_of_many() {
+        // Models sometimes emit several calls in one reply — only the
+        // first is taken (the solve loop re-prompts for the rest).
+        let two = "{\"tool\":\"write\",\"args\":\"a\"}\n{\"tool\":\"shell\",\"args\":\"b\"}";
+        let c = parse_tool_call(two).unwrap();
+        assert_eq!(c.tool, "write");
+        assert_eq!(c.args, "a");
+
+        // Stray braces in prose before the real JSON do not break parsing.
+        let noisy = "use {tool} syntax: {\"tool\":\"calc\",\"args\":\"1+1\"}";
+        let c2 = parse_tool_call(noisy).unwrap();
+        assert_eq!(c2.tool, "calc");
     }
 
     /// Test model that returns a fixed JSON tool call.
