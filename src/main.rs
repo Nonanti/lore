@@ -7,9 +7,9 @@ use clap::{Parser, Subcommand};
 use lore::{
     Agent, AgentId, AnthropicAuth, AnthropicModel, AppState, CalcTool, CodexModel, Credential,
     FileReadTool, HashingEmbedder, InMemoryStore, KeywordRouter, Memory, MemoryGraph, MemoryStore,
-    MessageKind, MockModel, Model, OpenAiModel, Orchestrator, Party, Persona, PersonaPatch, Query,
-    RefreshingToken, Scope, SemanticCat, SqliteStore, TimeTool, TokenStore, ToolContext,
-    ToolRegistry, WebFetchTool,
+    MessageKind, MockModel, Model, NewTask, OpenAiModel, Orchestrator, Party, Persona,
+    PersonaPatch, Query, RefreshingToken, Scope, SemanticCat, SqliteStore, TaskStore, TimeTool,
+    TokenStore, ToolContext, ToolRegistry, WebFetchTool,
 };
 use std::sync::Arc;
 
@@ -30,7 +30,7 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Cmd {
     /// Run the HTTP service.
     Serve {
@@ -170,9 +170,52 @@ enum Cmd {
     /// Recompute embeddings for all records with the active embedder
     /// (run after changing embedder — e.g. hashing → neural).
     Reembed,
+    /// Run the task queue daemon in the foreground.
+    Daemon,
+    /// Task management subcommands.
+    Task {
+        #[command(subcommand)]
+        task_cmd: TaskCmd,
+    },
+    /// Show pending approval inbox.
+    Inbox,
+    /// Approve a pending approval.
+    Approve { id: String },
+    /// Deny a pending approval.
+    Deny { id: String },
 }
 
-/// Optional response token cap (`LORE_LLM_MAX_TOKENS`).
+#[derive(Debug, Subcommand)]
+enum TaskCmd {
+    /// Enqueue a new task.
+    Add {
+        /// Agent name (persona file stem).
+        agent: String,
+        /// Goal description.
+        goal: String,
+        /// Workspace root path.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Verification commands (repeatable).
+        #[arg(long, short = 'v', value_delimiter = ',')]
+        verify: Vec<String>,
+    },
+    /// List tasks (compact table).
+    List {
+        /// Max tasks to show (default 20).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Show full task record.
+    Status { id: String },
+    /// Print the task log file.
+    Log {
+        id: String,
+        /// Show last N lines (default all).
+        #[arg(long)]
+        tail: Option<usize>,
+    },
+}
 fn env_max_tokens() -> Option<u32> {
     match std::env::var("LORE_LLM_MAX_TOKENS") {
         Ok(mt) => match mt.parse::<u32>() {
@@ -446,6 +489,101 @@ fn build_state(data: &str) -> anyhow::Result<AppState> {
         }
     }
     Ok(app)
+}
+
+/// Handle task subcommands.
+fn handle_task(data: &str, cmd: TaskCmd) -> anyhow::Result<()> {
+    let db_path = format!("{}/tasks.db", data);
+    let store = TaskStore::open(std::path::Path::new(&db_path))?;
+
+    match cmd {
+        TaskCmd::Add {
+            agent,
+            goal,
+            workspace,
+            verify,
+        } => {
+            let ws = workspace
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let new_task = NewTask {
+                agent,
+                goal,
+                workspace: ws,
+                verify,
+            };
+            let task = store.enqueue(new_task)?;
+            println!("✅ task {} queued", task.id);
+        }
+        TaskCmd::List { limit } => {
+            let tasks = store.list(limit)?;
+            if tasks.is_empty() {
+                println!("(no tasks — add one with 'lore task add')");
+            } else {
+                // Compact table: id, agent, status, age, goal(60ch).
+                for t in &tasks {
+                    let age = t.created_at.signed_duration_since(chrono::Utc::now());
+                    let mins = -age.num_minutes();
+                    let goal_short = if t.goal.chars().count() > 60 {
+                        let mut s: String = t.goal.chars().take(57).collect();
+                        s.push('…');
+                        s
+                    } else {
+                        t.goal.clone()
+                    };
+                    println!(
+                        "{}  {:<10} {:<20} {mins}m  {goal_short}",
+                        t.id,
+                        t.agent,
+                        t.status.as_str()
+                    );
+                }
+            }
+        }
+        TaskCmd::Status { id } => {
+            let task = store.get(&id)?;
+            match task {
+                Some(t) => {
+                    println!("id:          {}", t.id);
+                    println!("agent:       {}", t.agent);
+                    println!("goal:        {}", t.goal);
+                    println!("workspace:   {}", t.workspace.display());
+                    println!("status:      {}", t.status.as_str());
+                    println!("created:     {}", t.created_at.to_rfc3339());
+                    println!("updated:     {}", t.updated_at.to_rfc3339());
+                    if let Some(report) = &t.report {
+                        let summary: serde_json::Value = serde_json::from_str(report)
+                            .unwrap_or_else(|_| serde_json::Value::String(report.clone()));
+                        println!("report:      {}", summary);
+                    }
+                }
+                None => anyhow::bail!("task {id} not found"),
+            }
+        }
+        TaskCmd::Log { id, tail } => {
+            let log_path = std::path::PathBuf::from(data)
+                .join("logs")
+                .join(format!("{id}.log"));
+            if !log_path.exists() {
+                anyhow::bail!("log file not found for task {id}");
+            }
+            let content = std::fs::read_to_string(&log_path)?;
+            let lines: Vec<&str> = content.lines().collect();
+            match tail {
+                Some(n) => {
+                    for line in lines.iter().rev().take(n).rev() {
+                        println!("{line}");
+                    }
+                }
+                None => {
+                    for line in &lines {
+                        println!("{line}");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Sets up structured logging. Filter: `LORE_LOG` env (e.g.
@@ -763,6 +901,52 @@ async fn main() -> anyhow::Result<()> {
                 .with_embedder(build_embedder());
             let n = store.reembed().await?;
             println!("✅ {n} records re-embedded with active embedder");
+        }
+        Cmd::Daemon => {
+            let db_path = format!("{}/tasks.db", cli.data);
+            lore::run_daemon(
+                std::path::Path::new(&cli.data),
+                std::path::Path::new(&db_path),
+            )
+            .await?;
+        }
+        Cmd::Task { task_cmd } => handle_task(&cli.data, task_cmd)?,
+        Cmd::Inbox => {
+            let store = TaskStore::open(std::path::Path::new(&format!("{}/tasks.db", cli.data)))?;
+            let pending = store.pending_approvals()?;
+            if pending.is_empty() {
+                println!("(inbox empty — no pending approvals)");
+            } else {
+                for a in &pending {
+                    let age = a.created_at.signed_duration_since(chrono::Utc::now());
+                    let mins = -age.num_minutes();
+                    println!("{}  task:{}  {}  {mins}m ago", a.id, a.task_id, a.reason);
+                }
+            }
+        }
+        Cmd::Approve { id } => {
+            let store = TaskStore::open(std::path::Path::new(&format!("{}/tasks.db", cli.data)))?;
+            let status = store.approval_status(&id)?;
+            match status {
+                Some(lore::ApprovalStatus::Pending) => {
+                    store.decide_approval(&id, true)?;
+                    println!("✅ approved: {id}");
+                }
+                Some(s) => anyhow::bail!("approval {id} is not pending (status: {s:?})"),
+                None => anyhow::bail!("approval {id} not found"),
+            }
+        }
+        Cmd::Deny { id } => {
+            let store = TaskStore::open(std::path::Path::new(&format!("{}/tasks.db", cli.data)))?;
+            let status = store.approval_status(&id)?;
+            match status {
+                Some(lore::ApprovalStatus::Pending) => {
+                    store.decide_approval(&id, false)?;
+                    println!("🚫 denied: {id}");
+                }
+                Some(s) => anyhow::bail!("approval {id} is not pending (status: {s:?})"),
+                None => anyhow::bail!("approval {id} not found"),
+            }
         }
     }
     Ok(())
@@ -1211,6 +1395,8 @@ fn show_auth(data: &str) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     #[test]
     fn callback_query_parsing() {
         let req = "GET /callback?code=abc%23xyz&state=st%20ate HTTP/1.1\r\nHost: x\r\n\r\n";
@@ -1245,5 +1431,157 @@ mod tests {
             super::parse_api_key(Some("  secret  ".into())),
             Some("secret".to_string())
         );
+    }
+
+    // ── Clap parsing: new subcommands ────────────────────────────────
+
+    #[test]
+    fn parse_daemon() {
+        let cli = super::Cli::parse_from(["lore", "daemon"]);
+        assert!(matches!(cli.cmd, Some(super::Cmd::Daemon)));
+    }
+
+    #[test]
+    fn parse_task_add() {
+        let cli = super::Cli::parse_from(["lore", "task", "add", "myagent", "fix the bug"]);
+        match cli.cmd {
+            Some(super::Cmd::Task { task_cmd }) => match task_cmd {
+                super::TaskCmd::Add {
+                    agent,
+                    goal,
+                    workspace,
+                    verify,
+                } => {
+                    assert_eq!(agent, "myagent");
+                    assert_eq!(goal, "fix the bug");
+                    assert!(workspace.is_none());
+                    assert!(verify.is_empty());
+                }
+                other => panic!("expected Add, got {other:?}"),
+            },
+            other => panic!("expected Task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_task_add_with_workspace_and_verify() {
+        let cli = super::Cli::parse_from([
+            "lore",
+            "task",
+            "add",
+            "bot",
+            "goal",
+            "--workspace",
+            "/tmp/ws",
+            "--verify",
+            "cargo test",
+        ]);
+        match cli.cmd {
+            Some(super::Cmd::Task { task_cmd }) => match task_cmd {
+                super::TaskCmd::Add {
+                    agent,
+                    goal,
+                    workspace,
+                    verify,
+                } => {
+                    assert_eq!(agent, "bot");
+                    assert_eq!(goal, "goal");
+                    assert_eq!(workspace.as_deref(), Some("/tmp/ws"));
+                    assert_eq!(verify, vec!["cargo test"]);
+                }
+                other => panic!("expected Add, got {other:?}"),
+            },
+            other => panic!("expected Task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_task_list() {
+        let cli = super::Cli::parse_from(["lore", "task", "list"]);
+        match cli.cmd {
+            Some(super::Cmd::Task { task_cmd }) => match task_cmd {
+                super::TaskCmd::List { limit } => assert_eq!(limit, 20),
+                other => panic!("expected List, got {other:?}"),
+            },
+            other => panic!("expected Task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_task_list_with_limit() {
+        let cli = super::Cli::parse_from(["lore", "task", "list", "--limit", "5"]);
+        match cli.cmd {
+            Some(super::Cmd::Task { task_cmd }) => match task_cmd {
+                super::TaskCmd::List { limit } => assert_eq!(limit, 5),
+                other => panic!("expected List, got {other:?}"),
+            },
+            other => panic!("expected Task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_task_status() {
+        let cli = super::Cli::parse_from(["lore", "task", "status", "01ABC"]);
+        match cli.cmd {
+            Some(super::Cmd::Task { task_cmd }) => match task_cmd {
+                super::TaskCmd::Status { id } => assert_eq!(id, "01ABC"),
+                other => panic!("expected Status, got {other:?}"),
+            },
+            other => panic!("expected Task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_task_log() {
+        let cli = super::Cli::parse_from(["lore", "task", "log", "01ABC"]);
+        match cli.cmd {
+            Some(super::Cmd::Task { task_cmd }) => match task_cmd {
+                super::TaskCmd::Log { id, tail } => {
+                    assert_eq!(id, "01ABC");
+                    assert!(tail.is_none());
+                }
+                other => panic!("expected Log, got {other:?}"),
+            },
+            other => panic!("expected Task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_task_log_with_tail() {
+        let cli = super::Cli::parse_from(["lore", "task", "log", "01ABC", "--tail", "10"]);
+        match cli.cmd {
+            Some(super::Cmd::Task { task_cmd }) => match task_cmd {
+                super::TaskCmd::Log { id, tail } => {
+                    assert_eq!(id, "01ABC");
+                    assert_eq!(tail, Some(10));
+                }
+                other => panic!("expected Log, got {other:?}"),
+            },
+            other => panic!("expected Task, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_inbox() {
+        let cli = super::Cli::parse_from(["lore", "inbox"]);
+        assert!(matches!(cli.cmd, Some(super::Cmd::Inbox)));
+    }
+
+    #[test]
+    fn parse_approve() {
+        let cli = super::Cli::parse_from(["lore", "approve", "approval_id"]);
+        match cli.cmd {
+            Some(super::Cmd::Approve { id }) => assert_eq!(id, "approval_id"),
+            other => panic!("expected Approve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_deny() {
+        let cli = super::Cli::parse_from(["lore", "deny", "approval_id"]);
+        match cli.cmd {
+            Some(super::Cmd::Deny { id }) => assert_eq!(id, "approval_id"),
+            other => panic!("expected Deny, got {other:?}"),
+        }
     }
 }

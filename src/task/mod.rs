@@ -30,7 +30,7 @@ pub enum TaskStatus {
 
 impl TaskStatus {
     /// SQLite storage string.
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             TaskStatus::Queued => "Queued",
             TaskStatus::Running => "Running",

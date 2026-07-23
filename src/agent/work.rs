@@ -36,7 +36,7 @@ pub struct WorkSpec {
 }
 
 /// Outcome of a work loop run.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct WorkReport {
     /// Whether ALL verify commands passed on the final iteration.
     pub success: bool,
