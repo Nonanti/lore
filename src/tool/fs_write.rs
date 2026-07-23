@@ -27,6 +27,25 @@ use crate::tool::Tool;
 /// - Symlink escapes (canonicalization check)
 ///
 /// Returns the canonicalized full path on success.
+/// TOCTOU narrowing: re-verify containment immediately before touching
+/// the filesystem. A symlink swapped into an ancestor directory after the
+/// initial [`sandbox_path`] check is caught before bytes are written or
+/// the rename lands. The residual syscall-sized window can only be closed
+/// with `O_NOFOLLOW` (would require the `nix` crate — deliberately avoided).
+fn reverify_containment(full: &Path, root: &Path) -> Result<()> {
+    let root_canon = std::fs::canonicalize(root).map_err(|e| LoreError::Storage(e.to_string()))?;
+    let parent = full.parent().unwrap_or(Path::new("."));
+    let canon = std::fs::canonicalize(parent).map_err(|e| {
+        LoreError::Storage(format!("cannot resolve parent {}: {e}", parent.display()))
+    })?;
+    if !canon.starts_with(&root_canon) {
+        return Err(LoreError::InvalidInput(
+            "path escapes workspace root (changed after validation)".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn sandbox_path(rel: &str, root: &Path) -> Result<PathBuf> {
     if rel.is_empty() {
         return Err(LoreError::InvalidInput("file path required".into()));
@@ -153,11 +172,16 @@ impl Tool for FileWriteTool {
                 .map_err(|e| LoreError::Storage(format!("cannot create parent dirs: {e}")))?;
         }
 
+        // TOCTOU narrowing: re-verify containment after mkdir, before any
+        // bytes are written, and again before the rename lands.
+        reverify_containment(&full, &self.root)?;
+
         // Atomic write: tmp file + rename.
         let tmp_name = format!(".lore-write-tmp-{}", ulid::Ulid::new());
         let tmp_path = full.parent().unwrap_or(Path::new(".")).join(&tmp_name);
         std::fs::write(&tmp_path, &wa.content)
             .map_err(|e| LoreError::Storage(format!("write failed: {e}")))?;
+        reverify_containment(&full, &self.root)?;
         std::fs::rename(&tmp_path, &full)
             .map_err(|e| LoreError::Storage(format!("atomic rename failed: {e}")))?;
 
@@ -239,11 +263,13 @@ impl Tool for FileEditTool {
         // Replace exactly one occurrence.
         let new_content = content.replacen(&ea.old, &ea.new, 1);
 
-        // Atomic write (same as FileWriteTool).
+        // Atomic write (same as FileWriteTool), with TOCTOU re-checks.
+        reverify_containment(&full, &self.root)?;
         let tmp_name = format!(".lore-edit-tmp-{}", ulid::Ulid::new());
         let tmp_path = full.parent().unwrap_or(Path::new(".")).join(&tmp_name);
         std::fs::write(&tmp_path, &new_content)
             .map_err(|e| LoreError::Storage(format!("write failed: {e}")))?;
+        reverify_containment(&full, &self.root)?;
         std::fs::rename(&tmp_path, &full)
             .map_err(|e| LoreError::Storage(format!("atomic rename failed: {e}")))?;
 

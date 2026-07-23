@@ -143,19 +143,24 @@ pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Resu
     let gate = Arc::new(Gate::new(policy, Arc::new(approver)));
 
     // ToolContext: shell + write + edit + file-read, LlmRouter.
+    // Reviewers are report-only by role preset — enforce it in the
+    // registry (no write/edit tools; shell stays, still policy-gated).
+    let read_only = agent.persona.role == "reviewer";
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(ShellTool::new(
         gate.clone(),
         task.workspace.clone(),
     )));
-    reg.register(Arc::new(FileWriteTool::new(
-        gate.clone(),
-        task.workspace.clone(),
-    )));
-    reg.register(Arc::new(FileEditTool::new(
-        gate.clone(),
-        task.workspace.clone(),
-    )));
+    if !read_only {
+        reg.register(Arc::new(FileWriteTool::new(
+            gate.clone(),
+            task.workspace.clone(),
+        )));
+        reg.register(Arc::new(FileEditTool::new(
+            gate.clone(),
+            task.workspace.clone(),
+        )));
+    }
     reg.register(Arc::new(FileReadTool::new(
         task.workspace.to_string_lossy().to_string(),
     )));
@@ -208,11 +213,12 @@ pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Resu
     ));
 
     // Memory distillation: extract durable facts from the completed task.
-    // Skipped on failed tasks to prevent contamination — failed outputs may
-    // produce wrong conventions that would be injected into future tasks.
+    // Failed tasks also distill, but ONLY negative lessons — distill_work
+    // forces every item to the Constraint category on failure (no wrong
+    // conventions from failed attempts; gotchas are still learned).
     // Agent opt-out: `should_distill()` returns false when distill field is Some(false).
     // Distillation errors are logged and never fail the task.
-    if report.success && agent.should_distill() {
+    if agent.should_distill() {
         let distilled = agent.distill_work(&spec, &report).await;
         match distilled {
             Ok(n) if n > 0 => {
@@ -237,14 +243,9 @@ pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Resu
             }
         }
     } else {
-        let reason = if !report.success {
-            "task failed"
-        } else {
-            "agent opted out"
-        };
-        tracing::info!(task_id, "distillation skipped ({reason})");
+        tracing::info!(task_id, "distillation skipped (agent opted out)");
         log.write_line(&format!(
-            "[daemon] task {} distillation skipped: {reason}",
+            "[daemon] task {} distillation skipped: agent opted out",
             task.id
         ));
     }
@@ -1742,7 +1743,7 @@ mod tests {
     // ── daemon distillation: failed tasks skip distillation ──
 
     #[tokio::test]
-    async fn run_task_failed_task_skips_distillation() {
+    async fn run_task_failed_task_distills_negative_lessons() {
         let db = TmpDb::new("rt-distill-skip-fail");
         let workspace = make_temp_dir("rt-distill-skip-fail-ws");
         let store = TaskStore::open(db.path()).unwrap();
@@ -1762,9 +1763,15 @@ mod tests {
             .unwrap();
         store.set_status(&task.id, TaskStatus::Running).unwrap();
 
-        // Model provides 5 replies for 5 iterations (default max_iterations).
+        // Model provides 5 replies for 5 iterations (default max_iterations)
+        // plus a 6th reply for the distillation call: one negative lesson.
         let model = Arc::new(ScriptedModel::new(&[
-            "trying 1", "trying 2", "trying 3", "trying 4", "trying 5",
+            "trying 1",
+            "trying 2",
+            "trying 3",
+            "trying 4",
+            "trying 5",
+            r#"[{"kind":"constraint","title":"avoid `exit 1` as a verify command","body":"it always fails"}]"#,
         ]));
         let deps = TaskDeps {
             data_dir: db.data_dir().to_path_buf(),
@@ -1778,12 +1785,13 @@ mod tests {
             "task should fail when verify always exits 1"
         );
 
-        // Log should contain "distillation skipped: task failed".
+        // Failed tasks no longer skip distillation — they distill
+        // negative lessons (constraints) instead.
         let log_path = db.data_dir().join("logs").join(format!("{}.log", task.id));
         let log_content = std::fs::read_to_string(&log_path).unwrap();
         assert!(
-            log_content.contains("distillation skipped: task failed"),
-            "log should mention distillation skipped for failed task: {log_content}"
+            log_content.contains("distilled 1 memories"),
+            "log should record failure-lesson distillation: {log_content}"
         );
 
         cleanup(&workspace);

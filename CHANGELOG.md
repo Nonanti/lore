@@ -46,6 +46,25 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
   OpenAI-compatible endpoint) writing + verifying files through the tools.
 
 ### Fixed
+- **Failed tasks now teach negative lessons instead of nothing**:
+  `distill_work` runs for failed tasks too, but the prompt asks ONLY for
+  avoid-X lessons and every item is forced to `SemanticCat::Constraint`
+  (capped at 2) — gotchas are learned without failed attempts teaching
+  wrong conventions/facts.
+- **Reviewer agents are enforced read-only**: the daemon no longer
+  registers write/edit tools for the `reviewer` role (the preset said
+  report-only but the tools allowed edits); shell stays, policy-gated.
+- **TOCTOU symlink race narrowed in file writes**: containment is
+  re-verified after parent-dir creation, before any bytes are written,
+  and again before the atomic rename lands (both write and edit tools).
+  The residual syscall-sized window needs `O_NOFOLLOW` (no `nix` dep
+  deliberately); documented in code.
+- **Flaky tests stabilized**: `consolidate_survives_concurrent_writes`
+  writer now retries transient "database is locked" errors instead of
+  panicking (lock contention while consolidation holds BEGIN IMMEDIATE
+  is expected load, not a failure); temp dirs in agent tests are unique
+  per call (ulid), killing the parallel-cleanup race that failed random
+  distill tests in ~1/3 of full-suite runs.
 - **Multi-call tool replies no longer mistaken for final answers**:
   `parse_tool_call` sliced from the first `{` to the LAST `}`, so a reply
   with two back-to-back tool calls failed to parse and was treated as the

@@ -19,6 +19,8 @@ const DISTILL_IMPORTANCE: f32 = 0.5;
 
 /// Maximum items distilled from a single task (cost limit).
 const DISTILL_MAX_ITEMS: usize = 3;
+/// Failure distillation is capped lower — negative lessons only.
+const DISTILL_MAX_ITEMS_FAILURE: usize = 2;
 
 /// Cap on verify-log tail included in the distillation prompt (8 KiB).
 const DISTILL_VERIFY_TAIL_CAP: usize = 8 * 1024;
@@ -87,6 +89,12 @@ impl Agent {
     /// Makes ONE model call with a cheap prompt (final answer + verify-log
     /// tail), asks for at most 3 items as JSON. Parsed items are stored as
     /// `MemoryKind::Semantic` via [`Agent::remember`] (scope-enforced, best-effort).
+    ///
+    /// **Failed tasks** (`report.success == false`) also distill, but the
+    /// prompt asks ONLY for negative lessons and every item is forced to
+    /// `SemanticCat::Constraint` (capped at 2) — a failed attempt must
+    /// never teach wrong conventions/facts, only "avoid X" gotchas.
+    ///
     /// Near-duplicate dedup only happens at [`MemoryStore::consolidate`] time, which
     /// the daemon calls after each task to prevent unbounded growth.
     /// Returns the count of stored items.
@@ -96,16 +104,33 @@ impl Agent {
     pub async fn distill_work(&self, spec: &WorkSpec, report: &WorkReport) -> Result<usize> {
         let verify_tail = tail_cap(&report.verify_log, DISTILL_VERIFY_TAIL_CAP);
 
+        let (instruction, max_items) = if report.success {
+            (
+                format!(
+                    "From this completed task, extract durable facts worth remembering for \
+                    future work in this project: conventions, gotchas, commands that worked. \
+                    Return JSON: \
+                    [{{\"kind\":\"convention\"|\"constraint\"|\"fact\",\"title\":\"...\",\"body\":\"...\"}}]. \
+                    At most {DISTILL_MAX_ITEMS} items; return an empty list [] if nothing durable."
+                ),
+                DISTILL_MAX_ITEMS,
+            )
+        } else {
+            (
+                format!(
+                    "This task FAILED verification. Extract ONLY negative lessons — approaches, \
+                    commands, or paths to AVOID — every item must have \"kind\":\"constraint\". \
+                    Do NOT extract conventions or facts from a failed attempt. \
+                    Return JSON: \
+                    [{{\"kind\":\"constraint\",\"title\":\"...\",\"body\":\"...\"}}]. \
+                    At most {DISTILL_MAX_ITEMS_FAILURE} items; return an empty list [] if none."
+                ),
+                DISTILL_MAX_ITEMS_FAILURE,
+            )
+        };
+
         let prompt = Prompt {
-            system: format!(
-                "{}\n\n\
-                From this completed task, extract durable facts worth remembering for \
-                future work in this project: conventions, gotchas, commands that worked. \
-                Return JSON: \
-                [{{\"kind\":\"convention\"|\"constraint\"|\"fact\",\"title\":\"...\",\"body\":\"...\"}}]. \
-                At most {DISTILL_MAX_ITEMS} items; return an empty list [] if nothing durable.",
-                self.persona.identity_prompt()
-            ),
+            system: format!("{}\n\n{instruction}", self.persona.identity_prompt()),
             context: vec![],
             history: vec![],
             user: format!(
@@ -138,8 +163,14 @@ impl Agent {
         }
 
         let mut stored = 0usize;
-        for item in items.iter().take(DISTILL_MAX_ITEMS) {
-            let cat = kind_to_cat(&item.kind);
+        for item in items.iter().take(max_items) {
+            // Failed tasks teach constraints only — the model's declared
+            // kind is overridden as a hard guard against contamination.
+            let cat = if report.success {
+                kind_to_cat(&item.kind)
+            } else {
+                SemanticCat::Constraint
+            };
             let statement = if item.body.is_empty() {
                 item.title.clone()
             } else {
@@ -284,6 +315,36 @@ mod tests {
     }
 
     // ── garbage JSON → Ok(0), no error ──────────────────────────────
+
+    #[tokio::test]
+    async fn distill_work_failed_task_forces_constraints() {
+        // Even if the model declares a "convention" on a failed task,
+        // the stored category is forced to Constraint — failed attempts
+        // must never teach conventions/facts.
+        let model = Arc::new(ScriptedModel::new(&[
+            r#"[{"kind":"convention","title":"use `exit 1` to verify","body":"works great"}]"#,
+        ]));
+        let agent = agent_with_model(model);
+        let (spec, mut report, ws) = spec_and_report();
+        report.success = false;
+
+        let count = agent.distill_work(&spec, &report).await.unwrap();
+        assert_eq!(count, 1, "failure lessons are stored");
+        let sem = agent
+            .recall(&Query::new("exit 1").tier(Tier::Semantic).limit(10))
+            .await
+            .unwrap();
+        assert_eq!(sem.len(), 1);
+        match &sem[0].item.kind {
+            MemoryKind::Semantic { category, .. } => assert_eq!(
+                *category,
+                SemanticCat::Constraint,
+                "failed tasks teach constraints only"
+            ),
+            other => panic!("expected semantic memory, got {other:?}"),
+        }
+        cleanup(&ws);
+    }
 
     #[tokio::test]
     async fn distill_work_garbage_json_returns_ok_zero() {

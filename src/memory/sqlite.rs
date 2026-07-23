@@ -1365,14 +1365,28 @@ mod tests {
         let writer = tokio::spawn(async move {
             let mut i = 0;
             while !stop_w.load(std::sync::atomic::Ordering::Relaxed) {
-                writer_store
-                    .remember(Memory::episodic(
-                        ws.clone(),
-                        format!("entry {i}"),
-                        "concurrent",
-                    ))
-                    .await
-                    .unwrap();
+                // The writer is load, not the assertion target: while
+                // consolidation holds BEGIN IMMEDIATE, transient
+                // "database is locked" errors are expected — retry
+                // briefly instead of panicking (this was the flake).
+                let mut attempts = 0;
+                loop {
+                    match writer_store
+                        .remember(Memory::episodic(
+                            ws.clone(),
+                            format!("entry {i}"),
+                            "concurrent",
+                        ))
+                        .await
+                    {
+                        Ok(_) => break,
+                        Err(e) if e.to_string().contains("locked") && attempts < 200 => {
+                            attempts += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                        Err(e) => panic!("writer failed with non-lock error: {e}"),
+                    }
+                }
                 i += 1;
             }
         });
