@@ -6,15 +6,21 @@
 //! of the nearest existing ancestor to handle not-yet-created files.
 //!
 //! **Security boundary for exec:** commands containing shell metacharacters
-//! (`;`, `|`, `&&`, `||`, backticks, `$()`, `${}`) are denied unless
-//! `default_exec` is `Allow`. Auto-allow uses word-boundary matching on
-//! the first token — `ls` allows `ls -la` but not `lsof`.
+//! (`;`, `|`, `&&`, `||`, backticks, `$()`, `${}`, `\n`, `\r`, `>`, `<`)
+//! are denied unless `default_exec` is `Allow`. Auto-allow uses exact /
+//! prefix-with-space matching — `ls` allows `ls -la` but not `lsof`,
+//! and `/usr/bin/ls` is allowed when `ls` is listed (basename symmetry).
 
 pub mod approval;
 
-/// Shell metacharacters that enable command chaining. Commands containing
-/// any of these are denied unless `default_exec` is `Allow`.
-const SHELL_METACHARACTERS: &[&str] = &[";", "|", "&&", "||", "`", "$(", "${"];
+/// Shell metacharacters that enable command chaining or I/O redirection.
+/// Commands containing any of these are denied unless `default_exec` is
+/// `Allow`. Newlines/carriage-returns prevent multi-line injection;
+/// redirects force writes through the write tool or approval.
+const SHELL_METACHARACTERS: &[&str] = &[
+    ";", "|", "&&", "||", "`", "$(", "${", "\n", "\r", // C1: newline injection
+    ">", "<", // M1: redirects (covers >>, 2>, here-docs)
+];
 
 use std::path::{Path, PathBuf};
 
@@ -191,14 +197,24 @@ impl Policy {
                         reason: "cwd is outside allowed roots".into(),
                     };
                 }
-                // Auto-allow: word-boundary match on first token.
+                // Auto-allow: exact match or prefix-with-space.
                 // `command == a` (exact) or `command.starts_with("{a} ")`
-                // (prefix followed by whitespace) — prevents `ls` from
-                // allowing `lsof` or `lsblk`.
+                // — prevents `ls` from allowing `lsof`, and `"cargo test"`
+                // from allowing bare `cargo`.
                 let first_token = command.split_whitespace().next().unwrap_or(command);
                 for a in &self.auto_allow {
-                    if first_token == a || command.starts_with(&format!("{a} ")) {
+                    if command == a || command.starts_with(&format!("{a} ")) {
                         return Verdict::Allow;
+                    }
+                    // Basename symmetry: for single-word entries, match
+                    // the first token's basename (like the deny side does),
+                    // so `/usr/bin/ls -la` is allowed when `ls` is listed.
+                    if !a.contains(' ') {
+                        if let Some(basename) = first_token.rsplit('/').next() {
+                            if basename == a {
+                                return Verdict::Allow;
+                            }
+                        }
                     }
                 }
                 // Default.
@@ -821,6 +837,132 @@ mod tests {
             v,
             Verdict::Allow,
             "Allow mode bypasses metachar check: {v:?}"
+        );
+    }
+
+    // ── C1: newline injection denial ─────────────────────────────────────
+
+    #[test]
+    fn newline_injection_denied() {
+        let root = PathBuf::from("/tmp");
+        let p = test_policy(root.clone());
+        // A newline in the command allows injecting a second command.
+        let v = p.evaluate(&Action::Exec {
+            command: "echo safe\nbash".into(),
+            cwd: root.clone(),
+        });
+        assert!(
+            matches!(v, Verdict::Deny { .. }),
+            "newline injection → deny: {v:?}"
+        );
+        // Carriage return variant.
+        let v2 = p.evaluate(&Action::Exec {
+            command: "echo safe\rbash".into(),
+            cwd: root,
+        });
+        assert!(
+            matches!(v2, Verdict::Deny { .. }),
+            "carriage-return injection → deny: {v2:?}"
+        );
+    }
+
+    // ── M1: redirect metacharacter denial ────────────────────────────────
+
+    #[test]
+    fn redirect_metacharacters_denied() {
+        let root = PathBuf::from("/tmp");
+        let p = test_policy(root.clone());
+        // Output redirect.
+        let v = p.evaluate(&Action::Exec {
+            command: "echo x > out".into(),
+            cwd: root.clone(),
+        });
+        assert!(
+            matches!(v, Verdict::Deny { .. }),
+            "output redirect → deny: {v:?}"
+        );
+        // Input redirect.
+        let v2 = p.evaluate(&Action::Exec {
+            command: "cat a < b".into(),
+            cwd: root,
+        });
+        assert!(
+            matches!(v2, Verdict::Deny { .. }),
+            "input redirect → deny: {v2:?}"
+        );
+    }
+
+    // ── M2: multi-word auto-allow exact match ────────────────────────────
+
+    #[test]
+    fn multi_word_auto_allow_exact_match() {
+        let root = PathBuf::from("/tmp");
+        let p = test_policy(root.clone());
+        // "cargo test" exact → Allow.
+        let v = p.evaluate(&Action::Exec {
+            command: "cargo test".into(),
+            cwd: root.clone(),
+        });
+        assert_eq!(v, Verdict::Allow, "bare 'cargo test' → allow");
+        // "git status" exact → Allow (add it to test policy).
+        let p2 = Policy {
+            roots: vec![root.clone()],
+            auto_allow: vec!["cargo test".into(), "git status".into(), "ls".into()],
+            deny: vec!["sudo".into()],
+            default_exec: DefaultExec::Ask,
+            ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
+        };
+        let v2 = p2.evaluate(&Action::Exec {
+            command: "git status".into(),
+            cwd: root.clone(),
+        });
+        assert_eq!(v2, Verdict::Allow, "bare 'git status' → allow");
+        // Bare "cargo" must NOT be allowed by "cargo test".
+        let v3 = p2.evaluate(&Action::Exec {
+            command: "cargo".into(),
+            cwd: root,
+        });
+        assert!(
+            matches!(v3, Verdict::Ask { .. }),
+            "bare 'cargo' must NOT match 'cargo test': {v3:?}"
+        );
+    }
+
+    // ── Auto-allow basename symmetry ─────────────────────────────────────
+
+    #[test]
+    fn auto_allow_basename_symmetry() {
+        let root = PathBuf::from("/tmp");
+        let p = test_policy(root.clone());
+        // "/usr/bin/ls -la" should be allowed when "ls" is listed.
+        let v = p.evaluate(&Action::Exec {
+            command: "/usr/bin/ls -la".into(),
+            cwd: root.clone(),
+        });
+        assert_eq!(
+            v,
+            Verdict::Allow,
+            "/usr/bin/ls -la should match auto-allow 'ls': {v:?}"
+        );
+        // Bare path "/usr/bin/ls" (no args) also allowed.
+        let v2 = p.evaluate(&Action::Exec {
+            command: "/usr/bin/ls".into(),
+            cwd: root.clone(),
+        });
+        assert_eq!(
+            v2,
+            Verdict::Allow,
+            "/usr/bin/ls should match auto-allow 'ls': {v2:?}"
+        );
+        // Deny side still works with basenames (existing behavior).
+        let v3 = p.evaluate(&Action::Exec {
+            command: "/usr/bin/sudo rm -rf /tmp/junk".into(),
+            cwd: root,
+        });
+        assert!(
+            matches!(v3, Verdict::Deny { .. }),
+            "/usr/bin/sudo should be denied: {v3:?}"
         );
     }
 }
