@@ -5,7 +5,7 @@
 > not tied to any external service or API; the memory engine is written from scratch in
 > native Rust, inside Lore (“Alaz from zero”).
 
-> **Status (514 tests passing + 1 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅. Next roadmap: `docs/superpowers/specs/2026-07-24-next-roadmap.md`.
+> **Status (540 tests passing + 1 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅. Next roadmap: `docs/superpowers/specs/2026-07-24-next-roadmap.md`.
 
 This document captures the design decisions and phased roadmap made after research
 (the 2026 “Memory in the Age of AI Agents” survey + Alaz's current architecture).
@@ -114,6 +114,7 @@ Rust ecosystem (local, lightweight stack):
 | D15 | Distillation: `Agent::distill_work` extracts conventions/constraints/facts from successful tasks into semantic memory; failed tasks produce constraint-only lessons | Procedural memory (Wilson-reinforced) is recorded after every run. Recalled conventions seed the next task's goal. `--no-distill` opts out per agent |
 | D16 | Sandbox: `Policy.sandbox_exec` (bubblewrap: `--ro-bind / /`, workspace rw, `--die-with-parent`) — `Off`/`IfAvailable`/`Required` | `Required` without bwrap fails closed; argv-built, never string-joined. Opt-in: the default build runs plain |
 | D17 | Parallel daemon: `lore daemon --concurrency N` — atomic `claim_next_queued` (`UPDATE…RETURNING`), per-worker connections, graceful shutdown with in-flight re-queue | Two workers can never take the same task. Team finalization is compare-and-swap; reviewer child enqueue via atomic `INSERT…WHERE NOT EXISTS` |
+| D18 | Orchestrator is a lib-API for embedded/demo use, not the production routing layer. Production team flow (daemon+pm) lives in `daemon.rs` + `task/store.rs`; `pm.rs` stays in `orchestrator/` as a decomposition helper (moving it to `team/` would churn without benefit — the Orchestrator's mailbox pattern is used by demo and tests, but HTTP+TaskStore drives production). Demo/tests exercise the Orchestrator's mailbox+blackboard directly; the daemon bypasses it for stateless SQL-backed operations. | Keeps the Orchestrator lightweight and purpose-scoped; avoids conflating the in-memory mailbox model with the persistent task queue that production actually uses |
 
 ---
 
@@ -132,7 +133,9 @@ src/
     mod.rs          # Agent struct: identity + handles
     persona.rs      # Persona: name, role, description, traits, system_prompt
     conversation.rs # Conversation: bounded verbatim window + Prompt.history
-    work.rs         # WorkSpec / WorkReport / Agent::work — plan→apply→verify→iterate
+    work/            # WorkSpec / WorkReport / Agent::work — plan→apply→verify→iterate
+      mod.rs          # loop, helpers (tail_bytes, extract_exit_code)
+      tests.rs        # work-loop + seeding + strategy tests
     distill.rs      # Agent::distill_work — extract conventions/facts into semantic memory
     roles.rs        # Role presets (backend, frontend, reviewer, pm) + identity extras
 
@@ -170,7 +173,8 @@ src/
     approval.rs     # Gate + Approver (CliApprover, AllowAll, DenyAll, QueueApprover)
 
   task/
-    mod.rs          # TaskStore (SQLite): task + approval CRUD, atomic claim, idempotent decisions
+    mod.rs          # Types (TaskStatus, Task, NewTask, ApprovalEntry, ApprovalStatus) + re-exports
+    store.rs        # TaskStore (SQLite): task + approval CRUD, atomic claim, idempotent decisions
     approver.rs     # QueueApprover: approval requests stored in DB until answered
 
   tool/
@@ -287,7 +291,7 @@ pub trait MemoryStore: Send + Sync {
 
 ## 10. Phased Roadmap (milestones)
 
-> **Status (514 tests passing + 1 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅. **Next roadmap:** see [`docs/superpowers/specs/2026-07-24-next-roadmap.md`](../docs/superpowers/specs/2026-07-24-next-roadmap.md) (Phase A: correctness sweep, Phase B: doc sync, Phase C: e2e harness, Phase D: task HTTP surface, Phase E: maintenance).
+> **Status (540 tests passing + 1 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅. **Next roadmap:** see [`docs/superpowers/specs/2026-07-24-next-roadmap.md`](../docs/superpowers/specs/2026-07-24-next-roadmap.md) (Phase A: correctness sweep, Phase B: doc sync, Phase C: e2e harness, Phase D: task HTTP surface, Phase E: maintenance).
 
 - ✅ **M0 — Skeleton:** crate layout, `error.rs`, `id.rs`, empty modules, `lib.rs` compiles.
 - ✅ **M1 — Memory core:** `Memory` types + `MemoryStore` trait + `InMemoryStore`
