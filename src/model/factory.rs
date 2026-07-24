@@ -34,6 +34,42 @@ pub enum AuthKind {
     Subs,
 }
 
+/// How `Agent::solve` drives tool calls for this model (spec N1/N2 in
+/// `docs/superpowers/specs/2026-07-24-native-tool-calling-design.md`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolMode {
+    /// Native tool calling when the provider supports it; runtime downgrade
+    /// to the text protocol on "does not support tools" errors.
+    #[default]
+    Auto,
+    /// Native only — an unsupported provider is a hard error.
+    Native,
+    /// Text protocol only (the pre-native behavior).
+    Text,
+}
+
+impl ToolMode {
+    /// Whether this is the default (`auto`) — keeps serialized configs tidy.
+    pub fn is_auto(&self) -> bool {
+        matches!(self, ToolMode::Auto)
+    }
+
+    /// Parse `LORE_TOOL_MODE` (`auto`|`native`|`text`). Unknown values warn
+    /// and fall back to `Auto` (mirrors `LORE_AUTH` handling).
+    pub fn from_env() -> Self {
+        match std::env::var("LORE_TOOL_MODE").ok().as_deref() {
+            Some("native") => ToolMode::Native,
+            Some("text") => ToolMode::Text,
+            Some("auto") | None => ToolMode::Auto,
+            Some(other) => {
+                tracing::warn!(value = other, "LORE_TOOL_MODE unrecognized, using auto");
+                ToolMode::Auto
+            }
+        }
+    }
+}
+
 /// Per-agent model configuration. Serializes cleanly; missing fields fall back
 /// to env defaults when `build_model` is called.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,6 +80,9 @@ pub struct ModelConfig {
     pub auth: Option<AuthKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Tool-call protocol selection; absent in old configs → `auto`.
+    #[serde(default, skip_serializing_if = "ToolMode::is_auto")]
+    pub tool_mode: ToolMode,
 }
 
 impl ModelConfig {
@@ -75,12 +114,14 @@ impl ModelConfig {
                     .unwrap_or_else(|_| "claude-sonnet-4-5".into()),
                 auth: Self::parse_auth_env(),
                 base_url: None,
+                tool_mode: ToolMode::from_env(),
             }),
             Some("openai") => Some(Self {
                 provider: ProviderKind::OpenAI,
                 model: std::env::var("LORE_LLM_MODEL").unwrap_or_else(|_| "gpt-5".into()),
                 auth: Self::parse_auth_env(),
                 base_url: None,
+                tool_mode: ToolMode::from_env(),
             }),
             _ => match std::env::var("LORE_LLM_BASE") {
                 Ok(base) => Some(Self {
@@ -88,6 +129,7 @@ impl ModelConfig {
                     model: std::env::var("LORE_LLM_MODEL").unwrap_or_else(|_| "llama3.2".into()),
                     auth: None, // OpenAiCompat doesn't use the key/subs distinction
                     base_url: Some(base),
+                    tool_mode: ToolMode::from_env(),
                 }),
                 Err(_) => None, // No provider configured at all → MockModel
             },
@@ -352,6 +394,7 @@ mod tests {
             model: "claude-sonnet-4-5-20250929".to_string(),
             auth: Some(AuthKind::Subs),
             base_url: None,
+            tool_mode: Default::default(),
         };
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         let back: ModelConfig = serde_json::from_str(&json).unwrap();
@@ -368,6 +411,7 @@ mod tests {
             model: "qwen3:8b".to_string(),
             auth: None,
             base_url: Some("http://localhost:11434/v1".to_string()),
+            tool_mode: Default::default(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         // auth should NOT appear in JSON (skip_serializing_if)
@@ -402,6 +446,7 @@ mod tests {
             model: "llama3.2".to_string(),
             auth: None,
             base_url: Some("http://localhost:11434/v1".to_string()),
+            tool_mode: Default::default(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: ModelConfig = serde_json::from_str(&json).unwrap();
@@ -420,6 +465,7 @@ mod tests {
             model: "claude-sonnet-4-5".to_string(),
             auth: Some(AuthKind::Key),
             base_url: None,
+            tool_mode: Default::default(),
         };
         let dir = std::env::temp_dir();
         let result = build_model(&cfg, &dir);
@@ -438,6 +484,7 @@ mod tests {
             model: "gpt-5".to_string(),
             auth: Some(AuthKind::Key),
             base_url: None,
+            tool_mode: Default::default(),
         };
         let result_openai = build_model(&cfg_openai, &dir);
         assert!(
@@ -454,6 +501,7 @@ mod tests {
             model: "claude-sonnet-4-5".to_string(),
             auth: None,
             base_url: None,
+            tool_mode: Default::default(),
         };
         let dir = std::env::temp_dir();
         let model = build_model(&cfg, &dir).unwrap();
@@ -467,6 +515,7 @@ mod tests {
             model: "mock".to_string(),
             auth: None,
             base_url: None,
+            tool_mode: Default::default(),
         };
         let dir = std::env::temp_dir();
         let _model = build_model(&cfg, &dir).unwrap();
@@ -479,6 +528,7 @@ mod tests {
             model: "mock".to_string(),
             auth: None,
             base_url: None,
+            tool_mode: Default::default(),
         };
         let dir = std::env::temp_dir();
         let model = build_model(&cfg, &dir).unwrap();
@@ -498,6 +548,7 @@ mod tests {
             model: "qwen3:8b".to_string(),
             auth: None,
             base_url: Some("http://localhost:11434/v1".to_string()),
+            tool_mode: Default::default(),
         };
         let dir = std::env::temp_dir();
         let model = build_model(&cfg, &dir).unwrap();

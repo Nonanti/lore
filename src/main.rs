@@ -251,6 +251,9 @@ enum AgentCmd {
         /// Base URL for OpenAI-compatible provider.
         #[arg(long)]
         base_url: Option<String>,
+        /// Tool-call protocol: auto (default), native, or text.
+        #[arg(long)]
+        tool_mode: Option<String>,
         /// Disable post-task memory distillation (opt-out).
         #[arg(long)]
         no_distill: bool,
@@ -385,6 +388,7 @@ fn handle_agent(data: &str, cmd: AgentCmd) -> anyhow::Result<()> {
             model,
             auth,
             base_url,
+            tool_mode,
             no_distill,
         } => {
             validate_agent_name(&name)?;
@@ -432,13 +436,25 @@ fn handle_agent(data: &str, cmd: AgentCmd) -> anyhow::Result<()> {
                     Some(other) => anyhow::bail!("unknown auth '{other}' (expected: key, subs)"),
                     None => None,
                 };
+                let tool_mode_kind = match tool_mode.as_deref() {
+                    Some("auto") | None => lore::model::ToolMode::Auto,
+                    Some("native") => lore::model::ToolMode::Native,
+                    Some("text") => lore::model::ToolMode::Text,
+                    Some(other) => {
+                        anyhow::bail!("unknown tool-mode '{other}' (expected: auto, native, text)")
+                    }
+                };
                 Some(ModelConfig {
                     provider: provider_kind,
                     model: model_name,
                     auth: auth_kind,
                     base_url: base_url.clone(),
+                    tool_mode: tool_mode_kind,
                 })
             } else {
+                if tool_mode.is_some() {
+                    anyhow::bail!("--tool-mode requires --provider (it lives in the model config)");
+                }
                 None
             };
 
@@ -1710,10 +1726,12 @@ mod tests {
                     model,
                     auth,
                     base_url,
+                    tool_mode,
                     no_distill,
                 } => {
                     assert_eq!(name, "devbot");
                     assert_eq!(role, "backend");
+                    assert!(tool_mode.is_none());
                     assert!(provider.is_none());
                     assert!(model.is_none());
                     assert!(auth.is_none());
@@ -1743,6 +1761,8 @@ mod tests {
             "subs",
             "--base-url",
             "http://localhost:11434/v1",
+            "--tool-mode",
+            "native",
         ]);
         match cli.cmd {
             Some(super::Cmd::Agent { agent_cmd }) => match agent_cmd {
@@ -1753,10 +1773,12 @@ mod tests {
                     model,
                     auth,
                     base_url,
+                    tool_mode,
                     no_distill,
                 } => {
                     assert_eq!(name, "devbot");
                     assert_eq!(role, "backend");
+                    assert_eq!(tool_mode.as_deref(), Some("native"));
                     assert_eq!(provider.as_deref(), Some("anthropic"));
                     assert_eq!(model.as_deref(), Some("claude-sonnet-4-5-20250929"));
                     assert_eq!(auth.as_deref(), Some("subs"));

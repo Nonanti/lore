@@ -13,7 +13,9 @@ mod thread;
 
 pub use anthropic::{AnthropicAuth, AnthropicModel};
 pub use codex::CodexModel;
-pub use factory::{build_model, build_model_from_env, AuthKind, ModelConfig, ProviderKind};
+pub use factory::{
+    build_model, build_model_from_env, AuthKind, ModelConfig, ProviderKind, ToolMode,
+};
 pub use mock::MockModel;
 pub use openai::OpenAiModel;
 pub use thread::{

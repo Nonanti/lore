@@ -21,11 +21,14 @@ use crate::memory::retrieval::wilson_lower_bound;
 use crate::memory::{
     Memory, MemoryKind, MemoryStore, Outcome, Query, Scope, Scored, SemanticCat, Tier,
 };
-use crate::model::{Model, Prompt, TokenStream, Turn};
-use crate::tool::{catalog, parse_tool_call, ToolCall, ToolContext, ToolRegistry, ToolRouter};
+use crate::model::{ChatMessage, ContentBlock, Model, Prompt, Thread, TokenStream, ToolMode, Turn};
+use crate::tool::{
+    catalog, parse_tool_call, tool_specs, ToolCall, ToolContext, ToolRegistry, ToolRouter,
+};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Number of memories included in the prompt during the `respond` loop (top-N most relevant).
@@ -87,6 +90,16 @@ struct AgentRecord {
 }
 
 /// An agent with identity, memory, and model.
+/// Prior-procedure bundle shared by both solve drivers.
+struct SolvePriors {
+    /// Recalled procedural candidates (dedup + reinforcement targets).
+    priors: Vec<Scored<Memory>>,
+    /// Proven-procedure hint lines injected into the prompt/system.
+    hints: Vec<String>,
+    /// Ids of injected procedures (Wilson failure attribution).
+    injected: Vec<MemoryId>,
+}
+
 #[derive(Clone)]
 pub struct Agent {
     /// Unique identity.
@@ -104,6 +117,12 @@ pub struct Agent {
     distill: Option<bool>,
     /// Optional tool context (registry + router).
     tools: Option<Arc<ToolContext>>,
+    /// Explicit tool-mode override (builder). Precedence:
+    /// builder > model_config.tool_mode > `LORE_TOOL_MODE` env > `Auto`.
+    tool_mode: Option<ToolMode>,
+    /// `auto` downgrade latch: once the endpoint proves it cannot do native
+    /// tools, later solves skip the doomed probe. Arc — shared by clones.
+    native_downgraded: Arc<AtomicBool>,
 }
 
 impl Agent {
@@ -117,6 +136,8 @@ impl Agent {
             model_config: None,
             distill: None, // None = true (default)
             tools: None,
+            tool_mode: None,
+            native_downgraded: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -135,6 +156,8 @@ impl Agent {
             model_config: None,
             distill: None,
             tools: None,
+            tool_mode: None,
+            native_downgraded: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -148,6 +171,27 @@ impl Agent {
     pub fn with_model_config(mut self, cfg: crate::model::ModelConfig) -> Self {
         self.model_config = Some(cfg);
         self
+    }
+
+    /// Sets the tool-call protocol explicitly (builder pattern). Overrides
+    /// model-config and env selection.
+    pub fn with_tool_mode(mut self, mode: ToolMode) -> Self {
+        self.tool_mode = Some(mode);
+        self
+    }
+
+    /// Effective tool mode: builder override > per-agent model config
+    /// (non-auto) > `LORE_TOOL_MODE` env > `Auto`.
+    fn effective_tool_mode(&self) -> ToolMode {
+        if let Some(m) = self.tool_mode {
+            return m;
+        }
+        if let Some(cfg) = &self.model_config {
+            if !cfg.tool_mode.is_auto() {
+                return cfg.tool_mode;
+            }
+        }
+        ToolMode::from_env()
     }
 
     /// Sets distill opt-out (builder pattern). `false` disables post-task distillation.
@@ -223,6 +267,8 @@ impl Agent {
             model_config: rec.model,
             distill: rec.distill,
             tools: None,
+            tool_mode: None,
+            native_downgraded: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -419,10 +465,38 @@ impl Agent {
     /// run (ended by step limit), injected procedures receive `Failure` — Wilson evidence accumulates bidirectionally.
     pub async fn solve(&self, ctx: &ToolContext, input: &str, max_steps: usize) -> Result<String> {
         let max_steps = max_steps.clamp(1, MAX_SOLVE_STEPS);
-        let catalog = catalog(&ctx.registry);
+        let priors = self.solve_priors(input).await;
+        match self.effective_tool_mode() {
+            ToolMode::Text => self.solve_text(ctx, input, max_steps, &priors).await,
+            // Explicit native: an unsupported provider is a hard error.
+            ToolMode::Native => self.solve_native(ctx, input, max_steps, &priors).await,
+            ToolMode::Auto => {
+                if !self.model.supports_native_tools()
+                    || self.native_downgraded.load(Ordering::Relaxed)
+                {
+                    return self.solve_text(ctx, input, max_steps, &priors).await;
+                }
+                match self.solve_native(ctx, input, max_steps, &priors).await {
+                    // Downgrade is only reachable from step 0 (no side effects
+                    // yet — solve_native converts later-step occurrences), so
+                    // the text rerun cannot repeat tool executions.
+                    Err(LoreError::NativeToolsUnsupported(m)) => {
+                        tracing::warn!(
+                            reason = %m,
+                            "native tool calling unavailable; downgrading agent to text protocol"
+                        );
+                        self.native_downgraded.store(true, Ordering::Relaxed);
+                        self.solve_text(ctx, input, max_steps, &priors).await
+                    }
+                    r => r,
+                }
+            }
+        }
+    }
 
-        // Prior procedures: both dedup candidates and (if proven) hints.
-        // A recall failure is logged but not fatal — solve proceeds without priors.
+    /// Prior procedures: both dedup candidates and (if proven) hints.
+    /// A recall failure is logged but not fatal — solve proceeds without priors.
+    async fn solve_priors(&self, input: &str) -> SolvePriors {
         let priors = match self
             .recall(
                 &Query::new(input)
@@ -457,7 +531,25 @@ impl Agent {
                 }
             }
         }
+        SolvePriors {
+            priors,
+            hints,
+            injected,
+        }
+    }
 
+    /// Text-protocol solve driver — the pre-native behavior, unchanged:
+    /// instruct the model to emit `{"tool":..,"args":..}` JSON and parse it
+    /// out of plain text. Serves `ToolMode::Text` and every provider without
+    /// native support (`auto` downgrades land here).
+    async fn solve_text(
+        &self,
+        ctx: &ToolContext,
+        input: &str,
+        max_steps: usize,
+        sp: &SolvePriors,
+    ) -> Result<String> {
+        let catalog = catalog(&ctx.registry);
         // `hints` and `scratchpad` (observations) are kept separate: the
         // final record/note logic only considers actual observations.
         let mut scratchpad: Vec<String> = Vec::new();
@@ -480,7 +572,7 @@ impl Agent {
             };
             let prompt = Prompt {
                 system: format!("{}\n\n{instruction}", self.persona.identity_prompt()),
-                context: hints.iter().chain(scratchpad.iter()).cloned().collect(),
+                context: sp.hints.iter().chain(scratchpad.iter()).cloned().collect(),
                 user: input.to_string(),
                 ..Default::default()
             };
@@ -512,54 +604,202 @@ impl Agent {
                 }
             }
 
-            // Final response: if tool traces exist, a procedural trace is also remembered.
-            // If the model ignores the instruction on the last step and returns a tool JSON again,
-            // do not leak raw JSON to the user: respond with the latest observation (reachable
-            // only from the `last` branch — on prior steps, JSON goes through `continue`
-            // into the tool loop).
+            // Final response. If the model ignores the instruction on the last step
+            // and returns a tool JSON again, do not leak raw JSON to the user
+            // (reachable only from the `last` branch — on prior steps, JSON goes
+            // through `continue` into the tool loop).
             let fell_back = parse_tool_call(&completion.text).is_some();
-            let text = if fell_back {
-                match scratchpad.last() {
-                    Some(obs) => format!("step limit reached; last info: {obs}"),
-                    None => "step limit reached; no final response generated.".to_string(),
-                }
-            } else {
-                completion.text
-            };
-            if fell_back && !injected.is_empty() && had_tool_error {
-                // Failure is processed ONLY if a tool error was seen along the procedure path.
-                // Hitting the step limit alone is not evidence against the procedure —
-                // the model may simply "not know when to stop" (no unfair penalty).
-                if let Err(e) = self
-                    .memory
-                    .reinforce_many(&injected, Outcome::Failure)
-                    .await
-                {
-                    tracing::warn!(error = %e, "procedure failure could not be processed");
-                }
-            }
-            if scratchpad.is_empty() {
-                self.remember_exchange(input, &text).await?;
-            } else {
-                // Automatic trace: unused, decay reclaims it; accessed, it is preserved.
-                self.note(
-                    format!(
-                        "completed task '{input}' with {} tool steps",
-                        scratchpad.len()
-                    ),
-                    format!("{}\nResult: {text}", scratchpad.join("\n")),
+            return self
+                .finish_solve(
+                    input,
+                    completion.text,
+                    fell_back,
+                    &scratchpad,
+                    &calls,
+                    had_tool_error,
+                    sp,
                 )
-                .await?;
-                if !fell_back && !calls.is_empty() {
-                    self.learn_procedure(input, &calls, &priors).await;
-                }
-            }
-            return Ok(text);
+                .await;
         }
         // Unreachable: last step always returns; safety belt just in case.
         Err(crate::error::LoreError::Model(
             "solve step limit exceeded".into(),
         ))
+    }
+
+    /// Native solve driver: the thread protocol every provider tool API is
+    /// trained on — assistant `tool_use` blocks answered by user
+    /// `tool_result` blocks, tools travelling as structured specs instead of
+    /// prompt text. One step = one model roundtrip; a step may execute
+    /// several parallel tool calls.
+    async fn solve_native(
+        &self,
+        ctx: &ToolContext,
+        input: &str,
+        max_steps: usize,
+        sp: &SolvePriors,
+    ) -> Result<String> {
+        let specs = tool_specs(&ctx.registry);
+        // Hints fold into system — the flat path does the same (providers
+        // append Prompt.context lines to their system slot).
+        let mut system = self.persona.identity_prompt();
+        if !sp.hints.is_empty() {
+            system.push_str("\n\nWhat you recall:\n");
+            for h in &sp.hints {
+                system.push_str("- ");
+                system.push_str(h);
+                system.push('\n');
+            }
+        }
+        let mut thread = Thread::new(system);
+        thread.push(ChatMessage::user_text(input));
+
+        let mut scratchpad: Vec<String> = Vec::new();
+        let mut calls: Vec<ToolCall> = Vec::new();
+        let mut had_tool_error = false;
+        for step in 0..max_steps {
+            let last = step + 1 == max_steps;
+            if last {
+                // Tools stay in the request (Anthropic rejects tool-blocked
+                // threads without a `tools` param) — the nudge plus the
+                // unexecuted-ToolUse guard below enforce termination instead.
+                thread.push(ChatMessage::user_text(
+                    "No more tool calls — give the final answer based on the results above.",
+                ));
+            }
+            let reply = match self.model.complete_thread(&thread, &specs).await {
+                Ok(r) => r,
+                // Step 0 unsupported is clean (nothing executed) — `auto` may
+                // downgrade and rerun. Later steps have run tools; a rerun
+                // would repeat side effects, so surface a plain model error.
+                Err(LoreError::NativeToolsUnsupported(m)) if step > 0 => {
+                    return Err(LoreError::Model(format!(
+                        "native tools became unavailable mid-run: {m}"
+                    )));
+                }
+                Err(e) => return Err(e),
+            };
+
+            // Owned copies release the borrow so reply.blocks can move below.
+            let uses: Vec<(String, String, serde_json::Value)> = reply
+                .tool_uses()
+                .iter()
+                .map(|u| (u.id.to_string(), u.name.to_string(), u.input.clone()))
+                .collect();
+            if !last && !uses.is_empty() {
+                let mut results: Vec<ContentBlock> = Vec::new();
+                for (id, name, input_v) in &uses {
+                    let (obs, ok, args) = match ctx.registry.get(name) {
+                        Some(tool) => {
+                            let args = tool.args_from_input(input_v);
+                            match tool.run(&args).await {
+                                Ok(o) => (o, true, args),
+                                // An error is also an observation: the model
+                                // can correct in the next step.
+                                Err(e) => (format!("ERROR: {e}"), false, args),
+                            }
+                        }
+                        None => (
+                            format!("ERROR: no such tool '{name}'"),
+                            false,
+                            serde_json::to_string(input_v).unwrap_or_default(),
+                        ),
+                    };
+                    // Only SUCCESSFUL calls enter the learned procedure —
+                    // failed attempts remain in observations.
+                    if ok {
+                        calls.push(ToolCall {
+                            tool: name.clone(),
+                            args: args.clone(),
+                        });
+                    } else {
+                        had_tool_error = true;
+                    }
+                    scratchpad.push(format!("[observation] {name}({args}) → {obs}"));
+                    results.push(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content: obs,
+                        is_error: !ok,
+                    });
+                }
+                thread.push(ChatMessage::assistant_blocks(reply.blocks));
+                thread.push(ChatMessage::tool_results(results));
+                continue;
+            }
+
+            // Final. An unexecuted ToolUse on the last step means the model
+            // ignored the nudge — the fell-back guard answers from the last
+            // observation (raw blocks never leak to the user).
+            let fell_back = !uses.is_empty();
+            return self
+                .finish_solve(
+                    input,
+                    reply.text(),
+                    fell_back,
+                    &scratchpad,
+                    &calls,
+                    had_tool_error,
+                    sp,
+                )
+                .await;
+        }
+        // Unreachable: last step always returns; safety belt just in case.
+        Err(crate::error::LoreError::Model(
+            "solve step limit exceeded".into(),
+        ))
+    }
+
+    /// Shared solve epilogue — identical for both drivers: fell-back text
+    /// substitution, Wilson failure attribution, exchange/note memory, and
+    /// procedure learning.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_solve(
+        &self,
+        input: &str,
+        final_text: String,
+        fell_back: bool,
+        scratchpad: &[String],
+        calls: &[ToolCall],
+        had_tool_error: bool,
+        sp: &SolvePriors,
+    ) -> Result<String> {
+        let text = if fell_back {
+            match scratchpad.last() {
+                Some(obs) => format!("step limit reached; last info: {obs}"),
+                None => "step limit reached; no final response generated.".to_string(),
+            }
+        } else {
+            final_text
+        };
+        if fell_back && !sp.injected.is_empty() && had_tool_error {
+            // Failure is processed ONLY if a tool error was seen along the procedure path.
+            // Hitting the step limit alone is not evidence against the procedure —
+            // the model may simply "not know when to stop" (no unfair penalty).
+            if let Err(e) = self
+                .memory
+                .reinforce_many(&sp.injected, Outcome::Failure)
+                .await
+            {
+                tracing::warn!(error = %e, "procedure failure could not be processed");
+            }
+        }
+        if scratchpad.is_empty() {
+            self.remember_exchange(input, &text).await?;
+        } else {
+            // Automatic trace: unused, decay reclaims it; accessed, it is preserved.
+            self.note(
+                format!(
+                    "completed task '{input}' with {} tool steps",
+                    scratchpad.len()
+                ),
+                format!("{}\nResult: {text}", scratchpad.join("\n")),
+            )
+            .await?;
+            if !fell_back && !calls.is_empty() {
+                self.learn_procedure(input, calls, &sp.priors).await;
+            }
+        }
+        Ok(text)
     }
 
     /// Learns a successful tool sequence as a procedure.
@@ -841,6 +1081,340 @@ mod tests {
             registry: reg,
             router: Arc::new(KeywordRouter::new()),
         }
+    }
+
+    // ── Native tool-calling driver ──────────────────────────────────
+
+    use crate::model::{ChatRole, StopReason, ThreadReply, ToolSpec};
+
+    /// Scripted native-tools model: queued thread outcomes + queued text
+    /// replies (text-protocol fallback), capturing every Thread and counting
+    /// `complete_thread` calls.
+    enum ThreadStep {
+        Reply(ThreadReply),
+        Unsupported(String),
+    }
+    struct ThreadSeqModel {
+        steps: std::sync::Mutex<std::collections::VecDeque<ThreadStep>>,
+        texts: std::sync::Mutex<std::collections::VecDeque<String>>,
+        threads: Arc<std::sync::Mutex<Vec<Thread>>>,
+        thread_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ThreadSeqModel {
+        fn new(steps: Vec<ThreadStep>, texts: &[&str]) -> Self {
+            Self {
+                steps: std::sync::Mutex::new(steps.into()),
+                texts: std::sync::Mutex::new(texts.iter().map(|s| s.to_string()).collect()),
+                threads: Arc::new(std::sync::Mutex::new(Vec::new())),
+                thread_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+        fn reply(blocks: Vec<ContentBlock>, stop: StopReason) -> ThreadStep {
+            ThreadStep::Reply(ThreadReply {
+                blocks,
+                stop,
+                reasoning_fallback: false,
+            })
+        }
+        fn use_block(id: &str, name: &str, args: &str) -> ContentBlock {
+            ContentBlock::ToolUse {
+                id: id.into(),
+                name: name.into(),
+                input: serde_json::json!({ "args": args }),
+            }
+        }
+        fn text_block(t: &str) -> ContentBlock {
+            ContentBlock::Text { text: t.into() }
+        }
+    }
+    #[async_trait::async_trait]
+    impl Model for ThreadSeqModel {
+        async fn complete(&self, _p: &Prompt) -> Result<crate::model::Completion> {
+            let text = self
+                .texts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| "no text reply left".into());
+            Ok(crate::model::Completion::new(text))
+        }
+        async fn complete_thread(
+            &self,
+            thread: &Thread,
+            _tools: &[ToolSpec],
+        ) -> Result<ThreadReply> {
+            self.thread_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.threads.lock().unwrap().push(thread.clone());
+            match self.steps.lock().unwrap().pop_front() {
+                Some(ThreadStep::Reply(r)) => Ok(r),
+                Some(ThreadStep::Unsupported(m)) => Err(LoreError::NativeToolsUnsupported(m)),
+                None => Ok(ThreadReply {
+                    blocks: vec![ThreadSeqModel::text_block("no reply left")],
+                    stop: StopReason::EndTurn,
+                    reasoning_fallback: false,
+                }),
+            }
+        }
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn solve_native_chains_tool_results_back() {
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = ThreadSeqModel::new(
+            vec![
+                ThreadSeqModel::reply(
+                    vec![ThreadSeqModel::use_block("t1", "calc", "3 + 4")],
+                    StopReason::ToolUse,
+                ),
+                ThreadSeqModel::reply(
+                    vec![ThreadSeqModel::text_block("The result is 7.")],
+                    StopReason::EndTurn,
+                ),
+            ],
+            &[],
+        );
+        let threads = model.threads.clone();
+        let agent = Agent::new(Persona::new("Aria", "solver"), store, Arc::new(model));
+
+        let out = agent.solve(&calc_ctx(), "3+4?", 5).await.unwrap();
+        assert_eq!(out, "The result is 7.");
+
+        // Second roundtrip carried the full native protocol: user task →
+        // assistant tool_use → user tool_result (correlated, no error flag).
+        // (Guard scoped: recall() awaits after this block.)
+        {
+            let seen = threads.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            let t2 = &seen[1];
+            assert!(t2.system.contains("Aria"), "identity in system");
+            assert_eq!(t2.messages.len(), 3);
+            assert_eq!(t2.messages[0].role, ChatRole::User);
+            assert_eq!(t2.messages[1].role, ChatRole::Assistant);
+            assert!(matches!(
+                &t2.messages[1].blocks[0],
+                ContentBlock::ToolUse { id, name, .. } if id == "t1" && name == "calc"
+            ));
+            assert_eq!(t2.messages[2].role, ChatRole::User);
+            match &t2.messages[2].blocks[0] {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    assert_eq!(tool_use_id, "t1");
+                    assert_eq!(content, "7");
+                    assert!(!is_error);
+                }
+                other => panic!("expected ToolResult, got {other:?}"),
+            }
+        }
+
+        // Tool trace remembered like the text path.
+        let mems = agent.recall(&Query::new("task")).await.unwrap();
+        assert!(mems
+            .iter()
+            .any(|m| m.item.summary().contains("1 tool steps")));
+    }
+
+    #[tokio::test]
+    async fn solve_native_executes_parallel_calls_in_order() {
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = ThreadSeqModel::new(
+            vec![
+                ThreadSeqModel::reply(
+                    vec![
+                        ThreadSeqModel::use_block("a", "calc", "1 + 1"),
+                        ThreadSeqModel::use_block("b", "calc", "2 + 2"),
+                    ],
+                    StopReason::ToolUse,
+                ),
+                ThreadSeqModel::reply(
+                    vec![ThreadSeqModel::text_block("2 and 4.")],
+                    StopReason::EndTurn,
+                ),
+            ],
+            &[],
+        );
+        let threads = model.threads.clone();
+        let agent = Agent::new(Persona::new("Aria", "solver"), store, Arc::new(model));
+
+        let out = agent.solve(&calc_ctx(), "1+1 and 2+2?", 5).await.unwrap();
+        assert_eq!(out, "2 and 4.");
+
+        // One results message carrying BOTH tool results, input order.
+        let seen = threads.lock().unwrap();
+        let results = &seen[1].messages[2].blocks;
+        assert_eq!(results.len(), 2);
+        match (&results[0], &results[1]) {
+            (
+                ContentBlock::ToolResult {
+                    tool_use_id: id0,
+                    content: c0,
+                    ..
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: id1,
+                    content: c1,
+                    ..
+                },
+            ) => {
+                assert_eq!((id0.as_str(), c0.as_str()), ("a", "2"));
+                assert_eq!((id1.as_str(), c1.as_str()), ("b", "4"));
+            }
+            other => panic!("expected two ToolResults, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn solve_native_flags_tool_errors_and_recovers() {
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = ThreadSeqModel::new(
+            vec![
+                // Unknown tool, then bad args, then a good call, then final.
+                ThreadSeqModel::reply(
+                    vec![ThreadSeqModel::use_block("x", "google", "q")],
+                    StopReason::ToolUse,
+                ),
+                ThreadSeqModel::reply(
+                    vec![ThreadSeqModel::use_block("y", "calc", "5 5")],
+                    StopReason::ToolUse,
+                ),
+                ThreadSeqModel::reply(
+                    vec![ThreadSeqModel::use_block("z", "calc", "5 + 5")],
+                    StopReason::ToolUse,
+                ),
+                ThreadSeqModel::reply(vec![ThreadSeqModel::text_block("10.")], StopReason::EndTurn),
+            ],
+            &[],
+        );
+        let threads = model.threads.clone();
+        let agent = Agent::new(Persona::new("Aria", "solver"), store, Arc::new(model));
+
+        let out = agent.solve(&calc_ctx(), "5+5?", 6).await.unwrap();
+        assert_eq!(out, "10.");
+
+        let seen = threads.lock().unwrap();
+        // Unknown tool → is_error with a helpful message.
+        match &seen[1].messages[2].blocks[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(is_error);
+                assert!(content.contains("no such tool 'google'"), "{content}");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        // Bad args → is_error from the tool itself.
+        match &seen[2].messages[4].blocks[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(is_error);
+                assert!(content.starts_with("ERROR:"), "{content}");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn solve_native_last_step_nudges_and_never_leaks_blocks() {
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = ThreadSeqModel::new(
+            vec![
+                ThreadSeqModel::reply(
+                    vec![ThreadSeqModel::use_block("t1", "calc", "1 + 1")],
+                    StopReason::ToolUse,
+                ),
+                // Last step: model ignores the nudge and calls a tool again.
+                ThreadSeqModel::reply(
+                    vec![ThreadSeqModel::use_block("t2", "calc", "9 + 9")],
+                    StopReason::ToolUse,
+                ),
+            ],
+            &[],
+        );
+        let threads = model.threads.clone();
+        let agent = Agent::new(Persona::new("Aria", "solver"), store, Arc::new(model));
+
+        let out = agent.solve(&calc_ctx(), "sum?", 2).await.unwrap();
+        // Unexecuted ToolUse → fell-back answer from the last observation.
+        assert!(out.contains("step limit reached"), "{out}");
+        assert!(out.contains("calc(1 + 1) → 2"), "{out}");
+
+        // The nudge was appended before the last roundtrip.
+        let seen = threads.lock().unwrap();
+        let last_thread = seen.last().unwrap();
+        let nudge = last_thread
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == ChatRole::User)
+            .unwrap();
+        assert!(matches!(
+            &nudge.blocks[0],
+            ContentBlock::Text { text } if text.contains("No more tool calls")
+        ));
+    }
+
+    #[tokio::test]
+    async fn solve_auto_downgrades_once_and_latches() {
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = ThreadSeqModel::new(
+            vec![ThreadStep::Unsupported("registry: no tools".into())],
+            &["first text answer", "second text answer"],
+        );
+        let calls_n = model.thread_calls.clone();
+        let agent = Agent::new(Persona::new("Aria", "solver"), store, Arc::new(model));
+
+        // First solve: native probe fails cleanly → text fallback answers.
+        let out = agent.solve(&calc_ctx(), "q1", 3).await.unwrap();
+        assert_eq!(out, "first text answer");
+        assert_eq!(calls_n.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Second solve: the latch skips the doomed probe entirely.
+        let out2 = agent.solve(&calc_ctx(), "q2", 3).await.unwrap();
+        assert_eq!(out2, "second text answer");
+        assert_eq!(calls_n.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn solve_native_mode_hard_errors_when_unsupported() {
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = ThreadSeqModel::new(
+            vec![ThreadStep::Unsupported("nope".into())],
+            &["should not be used"],
+        );
+        let agent = Agent::new(Persona::new("Aria", "solver"), store, Arc::new(model))
+            .with_tool_mode(ToolMode::Native);
+
+        let err = agent.solve(&calc_ctx(), "q", 3).await.unwrap_err();
+        assert!(
+            matches!(err, LoreError::NativeToolsUnsupported(_)),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn solve_text_mode_never_touches_complete_thread() {
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = ThreadSeqModel::new(
+            vec![ThreadSeqModel::reply(
+                vec![ThreadSeqModel::text_block("native would answer")],
+                StopReason::EndTurn,
+            )],
+            &["text answer"],
+        );
+        let calls_n = model.thread_calls.clone();
+        let agent = Agent::new(Persona::new("Aria", "solver"), store, Arc::new(model))
+            .with_tool_mode(ToolMode::Text);
+
+        let out = agent.solve(&calc_ctx(), "q", 3).await.unwrap();
+        assert_eq!(out, "text answer");
+        assert_eq!(calls_n.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1766,6 +2340,7 @@ mod backward_compat_tests {
                 model: "claude-sonnet-4-5-20250929".to_string(),
                 auth: Some(crate::model::AuthKind::Subs),
                 base_url: None,
+                tool_mode: Default::default(),
             });
 
         let json = agent.to_json().unwrap();
@@ -1848,6 +2423,7 @@ mod backward_compat_tests {
                 model: "mock".to_string(),
                 auth: None,
                 base_url: None,
+                tool_mode: Default::default(),
             });
         agent.save_to(&path).unwrap();
 
