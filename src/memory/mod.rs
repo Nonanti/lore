@@ -5,6 +5,7 @@
 //! `SqliteStore`) swappable/testable. Lore is fully self-contained; there is no
 //! external service/HTTP/API.
 
+mod composite;
 pub mod embed;
 pub mod evolution;
 pub mod graph;
@@ -14,6 +15,7 @@ pub mod retrieval;
 mod sqlite;
 mod types;
 
+pub use composite::CompositeStore;
 #[cfg(feature = "neural")]
 pub use embed::NeuralEmbedder;
 pub use embed::{Embedder, HashingEmbedder};

@@ -43,7 +43,8 @@ pub use memory::NeuralEmbedder;
 #[cfg(feature = "neural")]
 pub use memory::NeuralReranker;
 pub use memory::{
-    ConsolidationReport, Embedder, FiveW, ForgetPolicy, HashingEmbedder, InMemoryStore, Memory,
+    CompositeStore, ConsolidationReport, Embedder, FiveW, ForgetPolicy, HashingEmbedder,
+    InMemoryStore, Memory,
 };
 pub use memory::{
     MemoryGraph, MemoryKind, MemoryStore, NativeReranker, Outcome, Query, Reranker, Scope, Scored,
