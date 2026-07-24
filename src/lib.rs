@@ -48,8 +48,10 @@ pub use memory::{
     SemanticCat, Signal, SqliteStore, Tier,
 };
 pub use model::{
-    build_model, build_model_from_env, AnthropicAuth, AnthropicModel, AuthKind, CodexModel,
-    Completion, MockModel, Model, ModelConfig, OpenAiModel, Prompt, ProviderKind, Role, Turn,
+    build_model, build_model_from_env, AnthropicAuth, AnthropicModel, AuthKind, ChatMessage,
+    ChatRole, CodexModel, Completion, ContentBlock, MockModel, Model, ModelConfig, OpenAiModel,
+    Prompt, ProviderKind, Role, StopReason, Thread, ThreadReply, ToolMode, ToolSpec, ToolUseRef,
+    Turn,
 };
 pub use orchestrator::{Delivery, Envelope, MessageKind, Orchestrator, Party, Recipient, Registry};
 pub use policy::approval::{AllowAll, Approver, CliApprover, DenyAll, Gate};
@@ -61,6 +63,7 @@ pub use server::{
 pub use task::approver::QueueApprover;
 pub use task::{ApprovalEntry, ApprovalStatus, NewTask, Task, TaskStatus, TaskStore};
 pub use tool::{
-    parse_tool_call, CalcTool, FileEditTool, FileReadTool, FileWriteTool, KeywordRouter, LlmRouter,
-    ShellTool, TimeTool, Tool, ToolCall, ToolContext, ToolRegistry, ToolRouter, WebFetchTool,
+    parse_tool_call, tool_specs, CalcTool, FileEditTool, FileReadTool, FileWriteTool,
+    KeywordRouter, LlmRouter, ShellTool, TimeTool, Tool, ToolCall, ToolContext, ToolRegistry,
+    ToolRouter, WebFetchTool,
 };
