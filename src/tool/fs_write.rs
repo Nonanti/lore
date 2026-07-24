@@ -241,6 +241,9 @@ impl Tool for FileEditTool {
             .check(&Action::Write { path: full.clone() })
             .await?;
 
+        // TOCTOU narrowing: re-verify containment before reading the file.
+        reverify_containment(&full, &self.root)?;
+
         // Read existing file.
         let content = std::fs::read_to_string(&full)
             .map_err(|e| LoreError::NotFound(format!("cannot read {}: {e}", ea.path)))?;

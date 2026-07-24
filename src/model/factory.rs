@@ -18,6 +18,7 @@ use std::time::Duration;
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Anthropic,
+    #[serde(rename = "openai", alias = "open_a_i")]
     OpenAI,
     #[serde(rename = "openai_compat")]
     OpenAiCompat,
@@ -143,7 +144,7 @@ fn resolve_anthropic_auth(cfg: &ModelConfig, data_dir: &Path) -> Option<Anthropi
             .filter(|k| !k.trim().is_empty());
         if generic.is_some() {
             tracing::warn!(
-                "LORE_LLM_KEY used as fallback for Anthropic — \\n                 may cause cross-provider auth failures with mixed agents"
+                "LORE_LLM_KEY used as fallback for Anthropic — may cause cross-provider auth failures with mixed agents"
             );
         }
         generic
@@ -199,7 +200,7 @@ fn resolve_openai_auth(cfg: &ModelConfig, data_dir: &Path) -> OpenAiAuthResult {
                 .filter(|k| !k.trim().is_empty());
             if generic.is_some() {
                 tracing::warn!(
-                    "LORE_LLM_KEY used as fallback for OpenAI — \\n                     may cause cross-provider auth failures with mixed agents"
+                    "LORE_LLM_KEY used as fallback for OpenAI — may cause cross-provider auth failures with mixed agents"
                 );
             }
             generic
@@ -244,17 +245,17 @@ pub fn build_model(cfg: &ModelConfig, data_dir: &Path) -> Result<Arc<dyn Model>>
                 // not a silent MockModel fallback.
                 if cfg.auth == Some(AuthKind::Key) {
                     return Err(LoreError::Model(
-                        "anthropic provider with auth=key but no API key found                          (set ANTHROPIC_API_KEY or LORE_LLM_KEY)".to_string(),
+                        "anthropic provider with auth=key but no API key found (set ANTHROPIC_API_KEY or LORE_LLM_KEY)".to_string(),
                     ));
                 }
                 if cfg.auth == Some(AuthKind::Subs) {
                     return Err(LoreError::Model(
-                        "anthropic provider with auth=subs but no subscription credential                          (run `lore login anthropic`)".to_string(),
+                        "anthropic provider with auth=subs but no subscription credential (run `lore login anthropic`)".to_string(),
                     ));
                 }
                 // Auto-detect with no credentials → MockModel (dev/test mode).
                 tracing::warn!(
-                    "anthropic provider but no credential found                          (run `lore login anthropic` or set ANTHROPIC_API_KEY); using MockModel"
+                    "anthropic provider but no credential found (run `lore login anthropic` or set ANTHROPIC_API_KEY); using MockModel"
                 );
                 Ok(Arc::new(MockModel::new()))
             }
@@ -288,17 +289,17 @@ pub fn build_model(cfg: &ModelConfig, data_dir: &Path) -> Result<Arc<dyn Model>>
                         // M-1: explicit auth configuration without credentials is an error.
                         if cfg.auth == Some(AuthKind::Key) {
                             return Err(LoreError::Model(
-                                "openai provider with auth=key but no API key found                                  (set OPENAI_API_KEY or LORE_LLM_KEY)".to_string(),
+                                "openai provider with auth=key but no API key found (set OPENAI_API_KEY or LORE_LLM_KEY)".to_string(),
                             ));
                         }
                         if cfg.auth == Some(AuthKind::Subs) {
                             return Err(LoreError::Model(
-                                "openai provider with auth=subs but no subscription credential                                  (run `lore login openai`)".to_string(),
+                                "openai provider with auth=subs but no subscription credential (run `lore login openai`)".to_string(),
                             ));
                         }
                         // Auto-detect with no credentials → MockModel (dev/test mode).
                         tracing::warn!(
-                            "openai provider but no credential found                              (run `lore login openai` or set OPENAI_API_KEY); using MockModel"
+                            "openai provider but no credential found (run `lore login openai` or set OPENAI_API_KEY); using MockModel"
                         );
                         Ok(Arc::new(MockModel::new()))
                     }
@@ -517,15 +518,33 @@ mod tests {
             let back: ProviderKind = serde_json::from_str(&json).unwrap();
             assert_eq!(back, pk);
         }
-        // Verify JSON shapes.
+        // Verify JSON shapes for ALL variants.
         assert_eq!(
             serde_json::to_string(&ProviderKind::Anthropic).unwrap(),
             "\"anthropic\""
         );
         assert_eq!(
+            serde_json::to_string(&ProviderKind::OpenAI).unwrap(),
+            "\"openai\""
+        );
+        assert_eq!(
             serde_json::to_string(&ProviderKind::OpenAiCompat).unwrap(),
             "\"openai_compat\""
         );
+        assert_eq!(
+            serde_json::to_string(&ProviderKind::Mock).unwrap(),
+            "\"mock\""
+        );
+    }
+
+    #[test]
+    fn provider_kind_open_a_i_alias_compat() {
+        // Existing agent files containing "open_a_i" must still load.
+        let pk: ProviderKind = serde_json::from_str("\"open_a_i\"").unwrap();
+        assert_eq!(pk, ProviderKind::OpenAI);
+        // Canonical form also works.
+        let pk2: ProviderKind = serde_json::from_str("\"openai\"").unwrap();
+        assert_eq!(pk2, ProviderKind::OpenAI);
     }
 
     #[test]

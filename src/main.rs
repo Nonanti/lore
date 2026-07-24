@@ -360,6 +360,14 @@ fn build_state(data: &str) -> anyhow::Result<AppState> {
     }
     Ok(app)
 }
+/// Validates that an agent name does not contain path traversal characters.
+fn validate_agent_name(name: &str) -> anyhow::Result<()> {
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        anyhow::bail!("invalid agent name '{name}': must not contain '/', '\\', or '..'");
+    }
+    Ok(())
+}
+
 /// Handle agent subcommands: create with role preset + optional model, list.
 fn handle_agent(data: &str, cmd: AgentCmd) -> anyhow::Result<()> {
     let agents_dir = format!("{}/agents", data);
@@ -375,6 +383,8 @@ fn handle_agent(data: &str, cmd: AgentCmd) -> anyhow::Result<()> {
             base_url,
             no_distill,
         } => {
+            validate_agent_name(&name)?;
+
             // Resolve role preset or use the role string as-is.
             let role_preset = preset(&role);
             let (role_str, traits, extra_lines) = match &role_preset {
@@ -522,6 +532,21 @@ fn handle_task(data: &str, cmd: TaskCmd) -> anyhow::Result<()> {
             verify,
             team,
         } => {
+            validate_agent_name(&agent)?;
+
+            // --team early validation: pm.json must exist.
+            if team {
+                let pm_path = std::path::PathBuf::from(data)
+                    .join("agents")
+                    .join("pm.json");
+                if !pm_path.exists() {
+                    anyhow::bail!(
+                        "pm.json not found at {} — create it with: lore agent create --name pm --role pm",
+                        pm_path.display()
+                    );
+                }
+            }
+
             let final_agent = if team { "pm" } else { &agent };
             let ws = workspace.map(std::path::PathBuf::from).unwrap_or_else(|| {
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))

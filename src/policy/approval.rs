@@ -80,9 +80,13 @@ impl Approver for CliApprover {
         tokio::task::spawn_blocking(move || {
             use std::io::{self, BufRead, Write};
             print!("{prompt}");
-            io::stdout().flush().ok();
+            if let Err(e) = io::stdout().flush() {
+                tracing::warn!("CLI approver: stdout flush failed: {e}");
+            }
             let mut line = String::new();
-            io::stdin().lock().read_line(&mut line).ok();
+            if let Err(e) = io::stdin().lock().read_line(&mut line) {
+                tracing::warn!("CLI approver: stdin read_line failed: {e}");
+            }
             line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes")
         })
         .await

@@ -131,10 +131,8 @@ fn parse_subtasks(text: &str) -> Result<Vec<SubtaskSpec>> {
         let Some(Ok(v)) = stream.next() else {
             continue;
         };
-        if v.is_array() {
-            let specs: Vec<SubtaskSpec> = v
-                .as_array()
-                .unwrap()
+        if let Some(arr) = v.as_array() {
+            let specs: Vec<SubtaskSpec> = arr
                 .iter()
                 .filter_map(|item| serde_json::from_value(item.clone()).ok())
                 .collect();
@@ -164,10 +162,8 @@ fn parse_subtasks(text: &str) -> Result<Vec<SubtaskSpec>> {
         }
 
         // Accept a plain array if the JSON value itself is an array.
-        if v.is_array() {
-            let specs: Vec<SubtaskSpec> = v
-                .as_array()
-                .unwrap()
+        if let Some(arr) = v.as_array() {
+            let specs: Vec<SubtaskSpec> = arr
                 .iter()
                 .filter_map(|item| serde_json::from_value(item.clone()).ok())
                 .collect();
@@ -212,12 +208,14 @@ pub fn build_roster(data_dir: &Path) -> Result<Vec<AgentEntry>> {
                 continue;
             }
         };
-        let role = rec
+        let role_opt = rec
             .get("persona")
             .and_then(|p| p.get("role"))
-            .and_then(|r| r.as_str())
-            .unwrap_or("unknown")
-            .to_string();
+            .and_then(|r| r.as_str());
+        if role_opt.is_none() {
+            tracing::warn!(agent = %name, "agent file lacks persona.role, defaulting to 'unknown'");
+        }
+        let role = role_opt.unwrap_or("unknown").to_string();
         roster.push(AgentEntry { name, role });
     }
     roster.sort_by(|a, b| a.name.cmp(&b.name));
