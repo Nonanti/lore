@@ -142,6 +142,14 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
   final answer. Each `{` is now tried as the start of one complete JSON
   value; the first valid `{"tool":..}` wins and the solve loop re-prompts
   for the rest.
+- **Object-form tool args no longer collapse to empty** (found in live
+  daemon testing): `parse_tool_call` accepted `args` only as a JSON
+  string, so models emitting Anthropic-style nested objects
+  (`{"args":{"path":..}}`) saw args collapse to `""` and every
+  structured-args tool failed with "EOF while parsing" — agents'
+  edit/write calls silently no-oped while verify kept failing. Object
+  args are now re-serialized to text; string form passes through
+  unchanged.
 - **Recalled memories now reach the model**: prompt context injection used
   `Memory::summary()` — which for an **episodic** record is only its *title*, so
   the body (the actual remembered content) never reached the model. `ask`/
