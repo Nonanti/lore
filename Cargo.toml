@@ -50,6 +50,7 @@ neural = ["dep:fastembed"]
 tokio-tungstenite = "0.21"
 criterion = { version = "0.5", default-features = false }
 proptest = "1"
+libc = "0.2"
 
 [[bench]]
 name = "perf"
