@@ -197,10 +197,28 @@ impl Agent {
                 format!("{} — {}", item.title, item.body)
             };
             let goal80: String = spec.goal.chars().take(80).collect();
-            let mem = Memory::semantic(self.scope(), statement, cat)
+            // Team sharing (T3): conventions and constraints are durable and
+            // universal — they go to `Scope::World` so teammates' recall sees
+            // them (through the shared store under a CompositeStore; in a
+            // single-store setup World stays visible to the owner — graceful
+            // degradation). Facts stay personal; failed-task lessons are
+            // constraints and thus shared — "don't do X" is exactly what a
+            // teammate needs.
+            let scope = if self.should_share()
+                && matches!(cat, SemanticCat::Convention | SemanticCat::Constraint)
+            {
+                crate::memory::Scope::World
+            } else {
+                self.scope()
+            };
+            let mem = Memory::semantic(scope, statement, cat)
                 .with_importance(DISTILL_IMPORTANCE)
                 .with_key(format!("distilled:task:{goal80}:{stored}"));
-            if let Err(e) = self.remember(mem).await {
+            // Direct store write: `Agent::remember` deliberately stamps every
+            // record with the agent's own scope (isolation guard for external
+            // callers). Team sharing is the one reviewed exception — the
+            // World scope chosen above must survive.
+            if let Err(e) = self.memory.remember(mem).await {
                 tracing::warn!(error = %e, "distill_work: semantic record could not be written");
                 continue;
             }
@@ -327,6 +345,110 @@ mod tests {
         assert!(
             kinds.contains(&"Fact".to_string()),
             "should contain a Fact: {kinds:?}"
+        );
+
+        cleanup(&ws);
+    }
+
+    // ── team sharing: scope routing ────────────────────────────
+
+    #[tokio::test]
+    async fn distill_share_routes_conventions_to_world_facts_stay_personal() {
+        use crate::memory::Scope;
+        let model = Arc::new(ScriptedModel::new(&[
+            r#"[{"kind":"convention","title":"use conventional commits","body":"feat/fix prefixes"},{"kind":"fact","title":"api base is /v2","body":"gateway serves v2"}]"#,
+        ]));
+        let agent = agent_with_model(model);
+        let (spec, report, ws) = spec_and_report();
+
+        agent.distill_work(&spec, &report).await.unwrap();
+        let sem = agent
+            .recall(&Query::new("").tier(Tier::Semantic).limit(10))
+            .await
+            .unwrap();
+        let conv = sem
+            .iter()
+            .find(|s| s.item.searchable_text().contains("conventional commits"))
+            .expect("convention stored");
+        let fact = sem
+            .iter()
+            .find(|s| s.item.searchable_text().contains("api base"))
+            .expect("fact stored");
+        assert_eq!(conv.item.scope, Scope::World, "conventions are shared");
+        assert_eq!(fact.item.scope, agent.scope(), "facts stay personal");
+
+        cleanup(&ws);
+    }
+
+    #[tokio::test]
+    async fn distill_no_share_keeps_everything_personal() {
+        use crate::memory::Scope;
+        let model = Arc::new(ScriptedModel::new(&[
+            r#"[{"kind":"convention","title":"use conventional commits","body":"feat/fix prefixes"}]"#,
+        ]));
+        let agent = agent_with_model(model).with_share(false);
+        let (spec, report, ws) = spec_and_report();
+
+        agent.distill_work(&spec, &report).await.unwrap();
+        let sem = agent
+            .recall(&Query::new("").tier(Tier::Semantic).limit(10))
+            .await
+            .unwrap();
+        assert!(!sem.is_empty());
+        assert!(
+            sem.iter().all(|s| s.item.scope != Scope::World),
+            "no_share keeps every distillate personal"
+        );
+
+        cleanup(&ws);
+    }
+
+    #[tokio::test]
+    async fn distill_shared_convention_reaches_teammate_via_composite() {
+        use crate::memory::{CompositeStore, Scope};
+        // One shared store, two agents with separate personal stores — the
+        // daemon topology in miniature.
+        let shared: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let store_a: Arc<dyn MemoryStore> = Arc::new(CompositeStore::new(
+            Arc::new(InMemoryStore::new()),
+            shared.clone(),
+        ));
+        let store_b: Arc<dyn MemoryStore> = Arc::new(CompositeStore::new(
+            Arc::new(InMemoryStore::new()),
+            shared.clone(),
+        ));
+
+        let model_a = Arc::new(ScriptedModel::new(&[
+            r#"[{"kind":"convention","title":"tests run with cargo nextest","body":"repo standard"},{"kind":"fact","title":"staging url is internal","body":"vpn only"}]"#,
+        ]));
+        let agent_a = Agent::new(Persona::new("Backend", "backend"), store_a, model_a);
+        let agent_b = Agent::new(
+            Persona::new("Frontend", "frontend"),
+            store_b,
+            Arc::new(ScriptedModel::new(&[])),
+        );
+        let (spec, report, ws) = spec_and_report();
+
+        agent_a.distill_work(&spec, &report).await.unwrap();
+
+        // Teammate B's own recall sees A's convention…
+        let seen = agent_b.recall(&Query::new("nextest")).await.unwrap();
+        assert!(
+            seen.iter()
+                .any(|s| s.item.searchable_text().contains("cargo nextest")),
+            "teammate must see the shared convention"
+        );
+        assert!(
+            seen.iter().all(|s| s.item.scope == Scope::World),
+            "only World records cross"
+        );
+        // …but never A's personal fact.
+        let leak = agent_b.recall(&Query::new("staging url")).await.unwrap();
+        assert!(
+            !leak
+                .iter()
+                .any(|s| s.item.searchable_text().contains("staging")),
+            "personal facts must not cross agents"
         );
 
         cleanup(&ws);

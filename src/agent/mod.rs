@@ -87,6 +87,11 @@ struct AgentRecord {
     /// None (absent) = true (default). Set to Some(false) to opt out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     distill: Option<bool>,
+    /// Whether distilled conventions/constraints are shared to team memory
+    /// (`Scope::World`). None (absent) = true. Set to Some(false) to keep
+    /// every lesson personal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    share: Option<bool>,
 }
 
 /// An agent with identity, memory, and model.
@@ -115,6 +120,9 @@ pub struct Agent {
     /// Whether this agent distills knowledge after each task.
     /// None = true (default). Some(false) = opt-out.
     distill: Option<bool>,
+    /// Whether distilled conventions/constraints are shared to team memory
+    /// (`Scope::World`). None = true (default). Some(false) = personal only.
+    share: Option<bool>,
     /// Optional tool context (registry + router).
     tools: Option<Arc<ToolContext>>,
     /// Explicit tool-mode override (builder). Precedence:
@@ -138,6 +146,7 @@ impl Agent {
             model,
             model_config: None,
             distill: None, // None = true (default)
+            share: None,   // None = true (default)
             tools: None,
             tool_mode: None,
             native_downgraded: Arc::new(AtomicBool::new(false)),
@@ -158,6 +167,7 @@ impl Agent {
             model,
             model_config: None,
             distill: None,
+            share: None,
             tools: None,
             tool_mode: None,
             native_downgraded: Arc::new(AtomicBool::new(false)),
@@ -214,6 +224,19 @@ impl Agent {
         self.distill.unwrap_or(true)
     }
 
+    /// Sets team-sharing opt-out (builder pattern). `false` keeps distilled
+    /// conventions/constraints in personal scope.
+    pub fn with_share(mut self, v: bool) -> Self {
+        self.share = Some(v);
+        self
+    }
+
+    /// Whether distilled conventions/constraints go to team memory
+    /// (`Scope::World`). None/Some(true) → share; Some(false) → personal only.
+    pub fn should_share(&self) -> bool {
+        self.share.unwrap_or(true)
+    }
+
     /// This agent's personal memory scope.
     pub fn scope(&self) -> Scope {
         Scope::Agent(self.id.clone())
@@ -231,6 +254,7 @@ impl Agent {
             model: self.model_config.clone(),
             extra,
             distill: self.distill,
+            share: self.share,
         };
         Ok(serde_json::to_string_pretty(&rec)?)
     }
@@ -269,6 +293,7 @@ impl Agent {
             model,
             model_config: rec.model,
             distill: rec.distill,
+            share: rec.share,
             tools: None,
             tool_mode: None,
             native_downgraded: Arc::new(AtomicBool::new(false)),
@@ -2373,6 +2398,26 @@ mod backward_compat_tests {
             agent.persona.extra.is_empty(),
             "old schema should have no extra"
         );
+        assert!(
+            agent.should_distill() && agent.should_share(),
+            "absent distill/share fields default to enabled"
+        );
+    }
+
+    #[test]
+    fn share_flag_round_trips_through_record() {
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let agent = Agent::new(
+            Persona::new("NoShareBot", "worker"),
+            store.clone(),
+            Arc::new(MockModel::new()),
+        )
+        .with_share(false);
+        assert!(!agent.should_share());
+        let json = agent.to_json().unwrap();
+        let back = Agent::from_json(&json, store, Arc::new(MockModel::new())).unwrap();
+        assert!(!back.should_share(), "share opt-out survives persistence");
+        assert!(back.should_distill(), "distill untouched");
     }
 
     /// New schema with model and extra fields roundtrips cleanly.

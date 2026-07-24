@@ -257,6 +257,9 @@ enum AgentCmd {
         /// Disable post-task memory distillation (opt-out).
         #[arg(long)]
         no_distill: bool,
+        /// Keep distilled conventions/constraints personal (no team sharing).
+        #[arg(long)]
+        no_share: bool,
     },
     /// List agents (name, role, provider/model or '(env)').
     List,
@@ -412,6 +415,7 @@ fn handle_agent(data: &str, cmd: AgentCmd) -> anyhow::Result<()> {
             base_url,
             tool_mode,
             no_distill,
+            no_share,
         } => {
             validate_agent_name(&name)?;
 
@@ -494,6 +498,11 @@ fn handle_agent(data: &str, cmd: AgentCmd) -> anyhow::Result<()> {
             };
             let agent = if no_distill {
                 agent.with_distill(false)
+            } else {
+                agent
+            };
+            let agent = if no_share {
+                agent.with_share(false)
             } else {
                 agent
             };
@@ -1750,9 +1759,11 @@ mod tests {
                     base_url,
                     tool_mode,
                     no_distill,
+                    no_share,
                 } => {
                     assert_eq!(name, "devbot");
                     assert_eq!(role, "backend");
+                    assert!(!no_share);
                     assert!(tool_mode.is_none());
                     assert!(provider.is_none());
                     assert!(model.is_none());
@@ -1797,9 +1808,11 @@ mod tests {
                     base_url,
                     tool_mode,
                     no_distill,
+                    no_share,
                 } => {
                     assert_eq!(name, "devbot");
                     assert_eq!(role, "backend");
+                    assert!(!no_share);
                     assert_eq!(tool_mode.as_deref(), Some("native"));
                     assert_eq!(provider.as_deref(), Some("anthropic"));
                     assert_eq!(model.as_deref(), Some("claude-sonnet-4-5-20250929"));
