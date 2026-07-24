@@ -16,6 +16,19 @@ pub enum Scope {
     World,
 }
 
+impl Scope {
+    /// Whether a record in `record_scope` is visible to a query in `self`:
+    /// everyone sees `World`; an agent additionally sees its own records.
+    /// Single source of truth — both stores and the recall graph leg use it.
+    pub fn sees(&self, record_scope: &Scope) -> bool {
+        match (self, record_scope) {
+            (_, Scope::World) => true,
+            (Scope::Agent(a), Scope::Agent(b)) => a == b,
+            (Scope::World, Scope::Agent(_)) => false,
+        }
+    }
+}
+
 /// Semantic (factual) memory category. Mirrors Alaz's `core_memory`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SemanticCat {
@@ -319,6 +332,9 @@ pub struct Query {
     pub embed_text: Option<String>,
     /// Re-rank first-pass candidates with the native reranker.
     pub rerank: bool,
+    /// Graph expansion leg: top first-pass candidates pull 1-hop entity
+    /// neighbors into the result set with a damped score (multi-hop recall).
+    pub graph: bool,
     /// Minimum importance a record must have to be returned (None = no floor).
     /// Used to keep low-value automatic traces (exchange/tool/board logs, born
     /// at [`Memory::AUTO_IMPORTANCE`]) out of prompt context.
@@ -338,7 +354,14 @@ impl Query {
             min_importance: None,
             embed_text: None,
             rerank: false,
+            graph: false,
         }
+    }
+
+    /// Enables the graph expansion leg (builder).
+    pub fn graph(mut self) -> Self {
+        self.graph = true;
+        self
     }
 
     /// Filters by a single tier (builder).

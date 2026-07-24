@@ -26,7 +26,7 @@ fn sqlite_err(e: rusqlite::Error) -> LoreError {
 /// pool so that async runtime workers are not blocked by disk I/O.
 /// Schema version — `meta.schema`. v2: `search_text` + `emb` columns (split
 /// from JSON) + FTS5 index. Old files are automatically migrated at open.
-const SCHEMA_VERSION: &str = "2";
+const SCHEMA_VERSION: &str = "3";
 
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
@@ -170,6 +170,46 @@ impl SqliteStore {
              INSERT INTO memories_fts(memories_fts) VALUES('rebuild');",
         )
         .map_err(sqlite_err)?;
+
+        // v3: entity inverted index feeding the recall graph leg. Backfilled
+        // here (lazy row consumption, corrupt rows skipped — same policy as
+        // the v1→v2 backfill above); maintained incrementally by `remember`.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS entities (
+                memory_id TEXT NOT NULL,
+                entity    TEXT NOT NULL,
+                PRIMARY KEY (memory_id, entity)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS idx_entities_entity ON entities(entity);",
+        )
+        .map_err(sqlite_err)?;
+        let ent_rows: i64 = tx
+            .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
+            .map_err(sqlite_err)?;
+        if ent_rows == 0 {
+            let mut stmt = tx
+                .prepare("SELECT id, data FROM memories")
+                .map_err(sqlite_err)?;
+            let mut rows = stmt.query([]).map_err(sqlite_err)?;
+            while let Some(row) = rows.next().map_err(sqlite_err)? {
+                let id: String = row.get(0).map_err(sqlite_err)?;
+                let data: String = row.get(1).map_err(sqlite_err)?;
+                let mem: Memory = match serde_json::from_str(&data) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(id = %id, error = %e, "skipping corrupt row during entity backfill");
+                        continue;
+                    }
+                };
+                for ent in super::graph::extract_entities(&mem) {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO entities (memory_id, entity) VALUES (?1, ?2)",
+                        params![id, ent],
+                    )
+                    .map_err(sqlite_err)?;
+                }
+            }
+        }
 
         Self::meta_set(&tx, "schema", SCHEMA_VERSION)?;
         tx.commit().map_err(sqlite_err)?;
@@ -651,6 +691,20 @@ impl MemoryStore for SqliteStore {
             }
             let id = mem.id.clone();
             Self::upsert(conn, &mem)?;
+            // Refresh the entity index for this record (remember may overwrite
+            // an existing id). Reinforce paths skip this — text never changes.
+            conn.execute(
+                "DELETE FROM entities WHERE memory_id = ?1",
+                params![id.to_string()],
+            )
+            .map_err(sqlite_err)?;
+            for ent in super::graph::extract_entities(&mem) {
+                conn.execute(
+                    "INSERT OR IGNORE INTO entities (memory_id, entity) VALUES (?1, ?2)",
+                    params![id.to_string(), ent],
+                )
+                .map_err(sqlite_err)?;
+            }
             Ok(id)
         })
         .await
@@ -720,6 +774,77 @@ impl MemoryStore for SqliteStore {
                     score,
                     signals,
                 });
+            }
+
+            // Graph expansion leg: top seeds pull 1-hop entity neighbors in
+            // with a damped score — multi-hop answers no single record
+            // matches. Mirrors the InMemoryStore implementation.
+            if query.graph && has_text && !scored.is_empty() {
+                scored.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let seen: std::collections::HashSet<String> =
+                    scored.iter().map(|s| s.item.id.to_string()).collect();
+                let mut seed_entities: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for s in scored.iter().take(retrieval::GRAPH_SEED_K) {
+                    seed_entities.extend(super::graph::extract_entities(&s.item));
+                }
+                if !seed_entities.is_empty() {
+                    // Entities of ≤3 records stay far below the 500-param
+                    // SQLite ceiling; truncate defensively regardless.
+                    let mut ents: Vec<String> = seed_entities.into_iter().collect();
+                    ents.sort();
+                    ents.truncate(400);
+                    let placeholders: String = (0..ents.len())
+                        .map(|i| format!("?{}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let sql = format!(
+                        "SELECT memory_id, COUNT(*) AS c FROM entities
+                         WHERE entity IN ({placeholders})
+                         GROUP BY memory_id ORDER BY c DESC, memory_id ASC"
+                    );
+                    let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+                    let sql_params: Vec<&dyn rusqlite::types::ToSql> = ents
+                        .iter()
+                        .map(|e| e as &dyn rusqlite::types::ToSql)
+                        .collect();
+                    let mut rows = stmt.query(&sql_params[..]).map_err(sqlite_err)?;
+                    let mut nb_ids: Vec<String> = Vec::new();
+                    while let Some(row) = rows.next().map_err(sqlite_err)? {
+                        let nid: String = row.get(0).map_err(sqlite_err)?;
+                        if !seen.contains(&nid) {
+                            nb_ids.push(nid);
+                            if nb_ids.len() >= retrieval::GRAPH_NEIGHBOR_CAP {
+                                break;
+                            }
+                        }
+                    }
+                    let best_seed = scored.first().map(|s| s.score).unwrap_or(0.0);
+                    let mut neighbors: Vec<Memory> = Vec::new();
+                    for mem in Self::load_by_ids(conn, &nb_ids)? {
+                        if !scope.sees(&mem.scope)
+                            || (mem.deleted_at.is_some() && !query.include_deleted)
+                        {
+                            continue;
+                        }
+                        if let Some(tiers) = &query.tiers {
+                            if !tiers.contains(&mem.tier()) {
+                                continue;
+                            }
+                        }
+                        if let Some(min_imp) = query.min_importance {
+                            if mem.importance < min_imp {
+                                continue;
+                            }
+                        }
+                        neighbors.push(mem);
+                    }
+                    retrieval::append_graph_neighbors(&mut scored, neighbors, best_seed);
+                }
             }
 
             Ok(retrieval::finalize(scored, &query))
@@ -971,7 +1096,7 @@ mod tests {
             SqliteStore::meta_get(&store.conn.lock().unwrap(), "schema")
                 .unwrap()
                 .as_deref(),
-            Some("2"),
+            Some(SCHEMA_VERSION),
             "schema version stamped"
         );
     }
@@ -1349,6 +1474,82 @@ mod tests {
         assert_eq!(
             ma.last_access, mb.last_access,
             "both updated with the same `now` timestamp in one transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_leg_pulls_entity_bridge_neighbor_and_persists() {
+        let db = TmpDb::new();
+        let scope = scope();
+        {
+            let store = SqliteStore::open(&db.0).unwrap();
+            store
+                .remember(Memory::semantic(
+                    scope.clone(),
+                    "Aylin adopted a tabby cat and named it Paspas",
+                    SemanticCat::Fact,
+                ))
+                .await
+                .unwrap();
+            store
+                .remember(Memory::semantic(
+                    scope.clone(),
+                    "Paspas was vaccinated at the veterinary clinic",
+                    SemanticCat::Fact,
+                ))
+                .await
+                .unwrap();
+        }
+        // Reopen: the entity index must survive restarts (it is a table, not
+        // a cache) and feed the graph leg identically.
+        let store = SqliteStore::open(&db.0).unwrap();
+        let res = store
+            .recall(&scope, &Query::new("aylin cat").graph().limit(5))
+            .await
+            .unwrap();
+        let pulled = res
+            .iter()
+            .find(|s| s.item.searchable_text().contains("vaccinated"))
+            .expect("graph leg should pull the vaccination record after reopen");
+        assert!(pulled.signals.iter().any(|s| s.name == "graph"));
+    }
+
+    #[tokio::test]
+    async fn schema_v3_backfills_entities_for_v2_files() {
+        let db = TmpDb::new();
+        let scope = scope();
+        // Build a store, then simulate a pre-v3 file: drop the entities
+        // table and stamp schema=2. Opening must recreate + backfill.
+        {
+            let store = SqliteStore::open(&db.0).unwrap();
+            store
+                .remember(Memory::semantic(
+                    scope.clone(),
+                    "Paspas was vaccinated at the veterinary clinic",
+                    SemanticCat::Fact,
+                ))
+                .await
+                .unwrap();
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TABLE entities;
+                 UPDATE meta SET value = '2' WHERE key = 'schema';",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&db.0).unwrap();
+        let n: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
+            .unwrap();
+        assert!(n > 0, "v2→v3 open must backfill the entities table");
+        assert_eq!(
+            SqliteStore::meta_get(&store.conn.lock().unwrap(), "schema")
+                .unwrap()
+                .as_deref(),
+            Some("3")
         );
     }
 

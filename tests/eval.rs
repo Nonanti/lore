@@ -276,7 +276,7 @@ async fn retrieval_golden_set_metrics() {
 
     for (q, want, cat, note) in QUERIES {
         let res = store
-            .recall(&Scope::World, &Query::new(*q).semantic().limit(5))
+            .recall(&Scope::World, &Query::new(*q).semantic().graph().limit(5))
             .await
             .unwrap();
         let want_text = CORPUS[*want];
@@ -337,21 +337,22 @@ async fn retrieval_golden_set_metrics() {
     }
 
     // ── Regression alarms (BELOW measured baseline; only ever raised) ──
-    // Measured baseline 2026-07-24 (HashingEmbedder, no graph leg):
-    //   hit@1 21/32 (66%), hit@5 23/32 (72%), MRR@5 0.682
-    //   Exact 7/7 · Morphology 8/8 · Paraphrase 0/7 · MultiHop 2/4 · Distractor 6/6
-    // Paraphrase misses are the neural layer's headroom; MultiHop is the
-    // graph leg's. Raise these floors as those phases land.
+    // Baseline history (HashingEmbedder):
+    //   2026-07-24 pre-graph:  hit@1 66% · hit@5 72% · MRR .682 · MultiHop 2/4
+    //   2026-07-24 graph leg:  hit@1 66% · hit@5 78% · MRR .701 · MultiHop 4/4
+    //     (acronym entities NAS/TLS-style + damped 1-hop expansion;
+    //      Exact 7/7 · Morphology 8/8 · Distractor 6/6 unchanged)
+    // Paraphrase 0/7 is the neural layer's documented headroom.
     assert!(
-        h5 >= 0.68,
+        h5 >= 0.75,
         "hit@5 = {hits5}/{total} — regression below floor:\n{}",
         misses.join("\n")
     );
     assert!(
-        h1 >= 0.50,
+        h1 >= 0.60,
         "hit@1 = {hits1}/{total} — regression below floor"
     );
-    assert!(mrr5 >= 0.60, "MRR@5 = {mrr5:.3} — regression below floor");
+    assert!(mrr5 >= 0.65, "MRR@5 = {mrr5:.3} — regression below floor");
     let floor = |c: Cat| {
         let s = &cats.iter().find(|(cc, _)| *cc == c).unwrap().1;
         s.hits5 as f64 / s.total as f64
@@ -364,6 +365,10 @@ async fn retrieval_golden_set_metrics() {
     assert!(
         floor(Cat::Distractor) >= 0.80,
         "Distractor category regressed"
+    );
+    assert!(
+        floor(Cat::MultiHop) >= 0.75,
+        "MultiHop category regressed (graph leg)"
     );
 }
 

@@ -137,6 +137,39 @@ pub mod stats {
 /// Default conflict band (`HashingEmbedder` calibration).
 pub const CONFLICT_BAND: (f32, f32) = (0.6, 0.9);
 
+// --- Graph expansion leg (Query.graph) ---
+
+/// How many top first-pass candidates seed the entity-neighbor expansion.
+pub const GRAPH_SEED_K: usize = 3;
+/// Max neighbors pulled per expansion (before filtering).
+pub const GRAPH_NEIGHBOR_CAP: usize = 16;
+/// Damping applied to the best seed score when scoring a pulled neighbor —
+/// a hop is supporting evidence, never stronger than its source.
+pub const GRAPH_DAMP: f32 = 0.5;
+
+/// Appends graph-pulled neighbors to a first-pass candidate list with the
+/// damped seed score and a `graph` signal. `hits` need not be pre-sorted;
+/// the caller runs [`finalize`] afterwards (which sorts). Neighbors are
+/// assumed pre-filtered (visibility/tier/importance) and deduplicated
+/// against `hits` by the caller.
+pub fn append_graph_neighbors(
+    hits: &mut Vec<Scored<Memory>>,
+    neighbors: Vec<Memory>,
+    best_seed_score: f32,
+) {
+    let damped = best_seed_score * GRAPH_DAMP;
+    for mem in neighbors {
+        hits.push(Scored {
+            item: mem,
+            score: damped,
+            signals: vec![Signal {
+                name: "graph".into(),
+                value: damped,
+            }],
+        });
+    }
+}
+
 /// Whether two embeddings fall in the conflict range (default band): similar
 /// topic, likely different information. Used for write-time conflict detection
 /// (too low=unrelated, too high=duplicate).

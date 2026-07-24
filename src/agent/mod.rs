@@ -975,6 +975,11 @@ impl Agent {
                 &Query::new(input)
                     .limit(RESPOND_RECALL_LIMIT)
                     .semantic()
+                    // Graph leg: entity-bridged neighbors join the context —
+                    // multi-hop recall ("X's owner's job") measured on the
+                    // golden set: MultiHop 2/4 → 4/4, zero regression.
+                    // min_importance below still floors pulled neighbors.
+                    .graph()
                     .min_importance(CONTEXT_MIN_IMPORTANCE),
             )
             .await?;

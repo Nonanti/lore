@@ -19,7 +19,9 @@ const STOPWORDS: &[&str] = &[
 ];
 
 /// Extracts entities from a memory: 5W cues + content tokens (len>=4).
-fn extract_entities(mem: &Memory) -> HashSet<String> {
+/// `pub(crate)`: the stores maintain incremental entity indexes with the
+/// SAME rules (recall's graph leg and this analysis graph cannot drift).
+pub(crate) fn extract_entities(mem: &Memory) -> HashSet<String> {
     let mut set = HashSet::new();
 
     // Episodic 5W cues are a strong entity source (no length requirement).
@@ -34,9 +36,25 @@ fn extract_entities(mem: &Memory) -> HashSet<String> {
     }
 
     // Content tokens (meaningful words).
-    for t in tokenize(&mem.searchable_text()) {
+    let text = mem.searchable_text();
+    for t in tokenize(&text) {
         if t.chars().count() >= 4 && !STOPWORDS.contains(&t.as_str()) {
             set.insert(t);
+        }
+    }
+    // Short ALL-CAPS acronyms (NAS, TLS, GPU, 8TB…) are high-value entities
+    // the ≥4-char floor would drop — they are exactly the tokens that bridge
+    // technical records. Detected on the RAW text (case carries the signal),
+    // stored lowercased like every other entity.
+    for raw in text.split(|c: char| !c.is_alphanumeric()) {
+        let n = raw.chars().count();
+        if (2..=4).contains(&n)
+            && raw
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+            && raw.chars().filter(|c| c.is_ascii_uppercase()).count() >= 2
+        {
+            set.insert(raw.to_lowercase());
         }
     }
     set

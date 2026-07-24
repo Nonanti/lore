@@ -19,6 +19,11 @@ use tokio::sync::RwLock;
 #[derive(Default)]
 pub struct InMemoryStore {
     inner: RwLock<HashMap<String, Memory>>,
+    /// Incremental entity inverted index (entity → record ids) feeding the
+    /// recall graph leg. Maintained on `remember` only; stale entries for
+    /// deleted records are filtered at read time (the record itself carries
+    /// `deleted_at`), so no removal bookkeeping is needed.
+    entity_idx: RwLock<HashMap<String, std::collections::HashSet<String>>>,
     embedder: Option<Arc<dyn Embedder>>,
 }
 
@@ -77,12 +82,21 @@ impl InMemoryStore {
 
     /// Creates a store from a list of records.
     pub fn from_memories(memories: Vec<Memory>) -> Self {
+        // Snapshot loads must rebuild the entity index too — otherwise the
+        // recall graph leg would be blind for restored stores.
+        let mut idx: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for m in &memories {
+            for ent in super::graph::extract_entities(m) {
+                idx.entry(ent).or_default().insert(m.id.to_string());
+            }
+        }
         let map = memories
             .into_iter()
             .map(|m| (m.id.to_string(), m))
             .collect();
         Self {
             inner: RwLock::new(map),
+            entity_idx: RwLock::new(idx),
             embedder: None,
         }
     }
@@ -107,11 +121,7 @@ impl InMemoryStore {
 /// Determines whether a query scope can see a record's scope.
 /// Agent(a) → own records + World; World → only World.
 fn scope_visible(query_scope: &Scope, mem_scope: &Scope) -> bool {
-    match (query_scope, mem_scope) {
-        (_, Scope::World) => true,
-        (Scope::Agent(a), Scope::Agent(b)) => a == b,
-        (Scope::World, Scope::Agent(_)) => false,
-    }
+    query_scope.sees(mem_scope)
 }
 
 #[async_trait]
@@ -127,7 +137,17 @@ impl MemoryStore for InMemoryStore {
             }
         }
         let id = mem.id.clone();
+        // Lock discipline: recall nests inner.read → entity.read, so remember
+        // must NEVER hold both locks at once (inverse nesting would deadlock).
+        // Entities are extracted first; the two writes are sequential.
+        let ents = super::graph::extract_entities(&mem);
         self.inner.write().await.insert(id.to_string(), mem);
+        {
+            let mut idx = self.entity_idx.write().await;
+            for ent in ents {
+                idx.entry(ent).or_default().insert(id.to_string());
+            }
+        }
         Ok(id)
     }
 
@@ -170,14 +190,15 @@ impl MemoryStore for InMemoryStore {
             hits.push((score, signals, mem));
         }
 
-        // In the plain path (no rerank/diverse), clone AFTER truncation, not before:
-        // a 10k-match limit-10 query clones 10 `Memory` instead of 10k.
-        // Rerank/MMR needs the full candidate list — no early truncation there.
-        if !query.rerank && !query.diverse {
+        // In the plain path (no rerank/diverse/graph), clone AFTER truncation,
+        // not before: a 10k-match limit-10 query clones 10 `Memory` instead of
+        // 10k. Rerank/MMR needs the full candidate list — no early truncation
+        // there. The graph leg needs the top seeds intact, so it sorts first.
+        if !(query.rerank || query.diverse || (query.graph && has_text)) {
             hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
             hits.truncate(query.limit);
         }
-        let scored = hits
+        let mut scored: Vec<Scored<Memory>> = hits
             .into_iter()
             .map(|(score, signals, mem)| Scored {
                 item: mem.clone(),
@@ -185,6 +206,62 @@ impl MemoryStore for InMemoryStore {
                 signals,
             })
             .collect();
+
+        // Graph expansion leg: top seeds pull 1-hop entity neighbors in with
+        // a damped score — multi-hop answers no single record matches.
+        if query.graph && has_text && !scored.is_empty() {
+            scored.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let seen: std::collections::HashSet<String> =
+                scored.iter().map(|s| s.item.id.to_string()).collect();
+            let mut seed_entities: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for s in scored.iter().take(retrieval::GRAPH_SEED_K) {
+                seed_entities.extend(super::graph::extract_entities(&s.item));
+            }
+            // Rank neighbor ids by shared-entity count, cap, then filter.
+            let idx = self.entity_idx.read().await;
+            let mut counts: HashMap<String, usize> = HashMap::new();
+            for ent in &seed_entities {
+                if let Some(ids) = idx.get(ent) {
+                    for nid in ids {
+                        if !seen.contains(nid) {
+                            *counts.entry(nid.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            drop(idx);
+            let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            ranked.truncate(retrieval::GRAPH_NEIGHBOR_CAP);
+
+            let best_seed = scored.first().map(|s| s.score).unwrap_or(0.0);
+            let mut neighbors: Vec<Memory> = Vec::new();
+            for (nid, _) in ranked {
+                let Some(mem) = guard.get(&nid) else { continue };
+                if !scope_visible(scope, &mem.scope)
+                    || (mem.deleted_at.is_some() && !query.include_deleted)
+                {
+                    continue;
+                }
+                if let Some(tiers) = &query.tiers {
+                    if !tiers.contains(&mem.tier()) {
+                        continue;
+                    }
+                }
+                if let Some(min_imp) = query.min_importance {
+                    if mem.importance < min_imp {
+                        continue;
+                    }
+                }
+                neighbors.push(mem.clone());
+            }
+            retrieval::append_graph_neighbors(&mut scored, neighbors, best_seed);
+        }
 
         Ok(retrieval::finalize(scored, query))
     }
@@ -278,6 +355,104 @@ mod tests {
         let a = AgentId::new();
         let s = Scope::Agent(a.clone());
         (a, s)
+    }
+
+    #[tokio::test]
+    async fn graph_leg_pulls_entity_bridge_neighbor() {
+        let store = InMemoryStore::new();
+        let (_a, scope) = agent_scope();
+        store
+            .remember(Memory::semantic(
+                scope.clone(),
+                "Aylin adopted a tabby cat and named it Paspas",
+                SemanticCat::Fact,
+            ))
+            .await
+            .unwrap();
+        store
+            .remember(Memory::semantic(
+                scope.clone(),
+                "Paspas was vaccinated at the veterinary clinic",
+                SemanticCat::Fact,
+            ))
+            .await
+            .unwrap();
+        store
+            .remember(Memory::semantic(
+                scope.clone(),
+                "The garden fence was painted green",
+                SemanticCat::Fact,
+            ))
+            .await
+            .unwrap();
+
+        // "aylin cat" matches only record 1 lexically; the vaccination
+        // record shares the `paspas` entity — the graph leg must pull it.
+        let plain = store
+            .recall(&scope, &Query::new("aylin cat").limit(5))
+            .await
+            .unwrap();
+        assert!(
+            !plain
+                .iter()
+                .any(|s| s.item.searchable_text().contains("vaccinated")),
+            "without graph the bridge record must NOT appear (test premise)"
+        );
+
+        let with_graph = store
+            .recall(&scope, &Query::new("aylin cat").graph().limit(5))
+            .await
+            .unwrap();
+        let pulled = with_graph
+            .iter()
+            .find(|s| s.item.searchable_text().contains("vaccinated"))
+            .expect("graph leg should pull the vaccination record");
+        assert!(
+            pulled.signals.iter().any(|s| s.name == "graph"),
+            "pulled neighbor carries the graph signal"
+        );
+        // Damped: never stronger than the best seed.
+        let best = with_graph.first().unwrap().score;
+        assert!(pulled.score <= best * retrieval::GRAPH_DAMP + f32::EPSILON);
+        // Unrelated record is not dragged in.
+        assert!(!with_graph
+            .iter()
+            .any(|s| s.item.searchable_text().contains("fence")));
+    }
+
+    #[tokio::test]
+    async fn graph_leg_respects_filters() {
+        let store = InMemoryStore::new();
+        let (_a, scope) = agent_scope();
+        store
+            .remember(Memory::semantic(
+                scope.clone(),
+                "Aylin adopted a tabby cat and named it Paspas",
+                SemanticCat::Fact,
+            ))
+            .await
+            .unwrap();
+        let bridge_id = store
+            .remember(Memory::semantic(
+                scope.clone(),
+                "Paspas was vaccinated at the veterinary clinic",
+                SemanticCat::Fact,
+            ))
+            .await
+            .unwrap();
+
+        // Soft-deleted neighbor must not be pulled (stale index entries are
+        // filtered at read — the maintenance-free index invariant).
+        store.forget(&bridge_id).await.unwrap();
+        let res = store
+            .recall(&scope, &Query::new("aylin cat").graph().limit(5))
+            .await
+            .unwrap();
+        assert!(
+            !res.iter()
+                .any(|s| s.item.searchable_text().contains("vaccinated")),
+            "soft-deleted neighbor must be filtered out of the graph leg"
+        );
     }
 
     #[tokio::test]
