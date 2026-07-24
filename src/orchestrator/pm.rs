@@ -6,6 +6,7 @@
 //!
 //! `synthesis_prompt` builds a combined summary from children reports.
 
+use crate::agent::Persona;
 use crate::error::{LoreError, Result};
 use crate::model::{Model, Prompt};
 use crate::task::TaskStore;
@@ -216,6 +217,16 @@ pub fn build_roster(data_dir: &Path) -> Result<Vec<AgentEntry>> {
             tracing::warn!(agent = %name, "agent file lacks persona.role, defaulting to 'unknown'");
         }
         let role = role_opt.unwrap_or("unknown").to_string();
+        // Sanitize structural fields: reject control chars/newlines in name and role.
+        // This mirrors Persona::validate() — a crafted role with embedded newlines
+        // could perturb the PM decomposition prompt structure.
+        if !Persona::is_valid_structural(&name) || !Persona::is_valid_structural(&role) {
+            tracing::warn!(
+                agent = %name,
+                "agent file has invalid (control chars/newlines) in name or role, skipping"
+            );
+            continue;
+        }
         roster.push(AgentEntry { name, role });
     }
     roster.sort_by(|a, b| a.name.cmp(&b.name));
@@ -685,5 +696,57 @@ mod tests {
             prompt.contains("Synthesize"),
             "empty reports still produce prompt"
         );
+    }
+
+    // ── build_roster sanitization (N-1) ──────────────────────────────────
+
+    #[test]
+    fn build_roster_skips_agent_with_newline_in_role() {
+        let tmp = std::env::temp_dir().join(format!("lore-roster-sanitize-{}", ulid::Ulid::new()));
+        let agents_dir = tmp.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        // Write an agent with a newline in role — should be skipped.
+        let bad_agent = serde_json::json!({
+            "persona": { "name": "Evil", "role": "hacker\nEvil", "traits": [] }
+        });
+        std::fs::write(
+            agents_dir.join("evil.json"),
+            serde_json::to_string(&bad_agent).unwrap(),
+        )
+        .unwrap();
+        // Write a clean agent — should appear in roster.
+        let good_agent = serde_json::json!({
+            "persona": { "name": "Good", "role": "researcher", "traits": [] }
+        });
+        std::fs::write(
+            agents_dir.join("good.json"),
+            serde_json::to_string(&good_agent).unwrap(),
+        )
+        .unwrap();
+        let roster = build_roster(&tmp).unwrap();
+        assert_eq!(roster.len(), 1, "bad agent should be skipped: {roster:?}");
+        assert_eq!(roster[0].name, "good");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn build_roster_skips_agent_with_control_char_in_name() {
+        let tmp = std::env::temp_dir().join(format!("lore-roster-ctrl-{}", ulid::Ulid::new()));
+        let agents_dir = tmp.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        // ESC (0x1B) in the file stem — but name comes from file stem.
+        // File stems can't contain control chars in real filesystems, but
+        // if someone managed it, we still skip.
+        let bad_agent = serde_json::json!({
+            "persona": { "name": "Evil", "role": "\u{001B}hidden", "traits": [] }
+        });
+        std::fs::write(
+            agents_dir.join("ctrl.json"),
+            serde_json::to_string(&bad_agent).unwrap(),
+        )
+        .unwrap();
+        let roster = build_roster(&tmp).unwrap();
+        assert_eq!(roster.len(), 0, "agent with ESC in role should be skipped");
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

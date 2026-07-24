@@ -10,7 +10,7 @@
 //! - [`store`] — [`TaskStore`] implementation (SQLite CRUD, migrations, row mappers)
 
 pub mod approver;
-pub mod store;
+pub(crate) mod store;
 
 use crate::error::{LoreError, Result};
 use chrono::{DateTime, Utc};

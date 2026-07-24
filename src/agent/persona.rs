@@ -102,6 +102,25 @@ impl Persona {
         self
     }
 
+    /// Checks whether a single structural field value is valid (no control chars
+    /// except TAB, no newlines, not empty/whitespace-only). Public so that
+    /// external callers (e.g. `build_roster`) can reuse the same sanitization logic
+    /// without constructing a full `Persona`.
+    pub fn is_valid_structural(value: &str) -> bool {
+        if value.trim().is_empty() {
+            return false;
+        }
+        for ch in value.chars() {
+            if ch == '\n' || ch == '\r' {
+                return false;
+            }
+            if ch as u32 <= 0x1F && ch != '\t' {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Validates structural persona fields, rejecting control characters and
     /// newlines in `name`, `role`, and `traits`.
     ///
@@ -123,7 +142,7 @@ impl Persona {
 
     /// Validates a single persona field value: rejects control chars (except TAB)
     /// and newlines, and rejects empty/whitespace-only strings.
-    fn validate_field(label: &'static str, value: &str, errors: &mut Vec<&'static str>) {
+    pub(crate) fn validate_field(label: &'static str, value: &str, errors: &mut Vec<&'static str>) {
         if value.trim().is_empty() {
             errors.push(label);
             return;
@@ -335,5 +354,37 @@ mod tests {
         let p = Persona::new("Aria", "researcher").with_trait("curious🔍");
         let bad = p.validate();
         assert!(bad.is_empty(), "emoji in trait should pass: {bad:?}");
+    }
+
+    // ── is_valid_structural helper tests ────────────────────────────────
+
+    #[test]
+    fn is_valid_structural_accepts_clean_values() {
+        assert!(Persona::is_valid_structural("Aria"));
+        assert!(Persona::is_valid_structural("researcher"));
+        assert!(Persona::is_valid_structural("Árvíztűrő"));
+    }
+
+    #[test]
+    fn is_valid_structural_rejects_newlines() {
+        assert!(!Persona::is_valid_structural("Aria\nEvil"));
+        assert!(!Persona::is_valid_structural("role\rEvil"));
+    }
+
+    #[test]
+    fn is_valid_structural_rejects_control_chars() {
+        assert!(!Persona::is_valid_structural("name\x01"));
+        assert!(!Persona::is_valid_structural("role\x1B"));
+    }
+
+    #[test]
+    fn is_valid_structural_allows_tab() {
+        assert!(Persona::is_valid_structural("Aria\tSmith"));
+    }
+
+    #[test]
+    fn is_valid_structural_rejects_empty() {
+        assert!(!Persona::is_valid_structural(""));
+        assert!(!Persona::is_valid_structural("   \t  "));
     }
 }

@@ -204,6 +204,17 @@ impl Agent {
                 persona.extra.push(line.clone());
             }
         }
+        // Validate persona: agents loaded from disk must also pass sanitization.
+        // An agent file written before sanitization (or edited on disk with control
+        // chars) would bypass the HTTP-level validate() gate. This closes the
+        // bypass — loaded agents are rejected just like newly created ones.
+        let bad = persona.validate();
+        if !bad.is_empty() {
+            return Err(LoreError::InvalidInput(format!(
+                "persona loaded from disk has invalid fields: {}",
+                bad.join(", ")
+            )));
+        }
         Ok(Self {
             id: rec.id,
             persona,
@@ -1921,5 +1932,77 @@ mod backward_compat_tests {
         let model = Arc::new(MockModel::new());
         let agent = Agent::from_json(json_with_true, store, model).unwrap();
         assert!(agent.should_distill(), "distill=true → ON");
+    }
+
+    /// M-1: from_json must reject personas with control chars / newlines,
+    /// closing the load-from-disk bypass that the reviewer flagged.
+    #[test]
+    fn from_json_rejects_persona_with_control_chars() {
+        let json_with_newline_name = serde_json::to_string_pretty(&serde_json::json!({
+            "id": "01ARYZ6S19Q2VTMRZ",
+            "persona": {
+                "name": "Aria\nEvil",
+                "role": "researcher",
+                "description": "",
+                "traits": [],
+                "system_prompt": "",
+                "extra": [],
+                "version": 1
+            }
+        }))
+        .unwrap();
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = Arc::new(MockModel::new());
+        let result = Agent::from_json(&json_with_newline_name, store, model);
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("newline in name must be rejected on load"),
+        };
+        assert!(
+            err.contains("invalid fields") && err.contains("name"),
+            "error should mention name: {err}"
+        );
+    }
+
+    #[test]
+    fn from_json_rejects_persona_with_esc_in_role() {
+        let json_with_esc_role = serde_json::to_string_pretty(&serde_json::json!({
+            "id": "01ARYZ6S19Q2VTMRZ",
+            "persona": {
+                "name": "Aria",
+                "role": "researcher\u{001B}hidden",
+                "description": "",
+                "traits": [],
+                "system_prompt": "",
+                "extra": [],
+                "version": 1
+            }
+        }))
+        .unwrap();
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = Arc::new(MockModel::new());
+        let result = Agent::from_json(&json_with_esc_role, store, model);
+        assert!(result.is_err(), "ESC in role must be rejected on load");
+    }
+
+    #[test]
+    fn from_json_accepts_clean_persona() {
+        let json_clean = serde_json::to_string_pretty(&serde_json::json!({
+            "id": "01ARYZ6S19Q2VTMRZ",
+            "persona": {
+                "name": "Aria",
+                "role": "researcher",
+                "description": "",
+                "traits": ["curious"],
+                "system_prompt": "",
+                "extra": [],
+                "version": 1
+            }
+        }))
+        .unwrap();
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = Arc::new(MockModel::new());
+        let agent = Agent::from_json(&json_clean, store, model).unwrap();
+        assert_eq!(agent.persona.name, "Aria");
     }
 }

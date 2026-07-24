@@ -5,7 +5,7 @@
 > not tied to any external service or API; the memory engine is written from scratch in
 > native Rust, inside Lore (“Alaz from zero”).
 
-> **Status (540 tests passing + 1 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅. Next roadmap: `docs/superpowers/specs/2026-07-24-next-roadmap.md`.
+> **Status (570 tests passing + 1 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅ + Phase E hardening ✅ + Phase E review hardening ✅. Next roadmap: `docs/superpowers/specs/2026-07-24-next-roadmap.md`.
 
 This document captures the design decisions and phased roadmap made after research
 (the 2026 “Memory in the Age of AI Agents” survey + Alaz's current architecture).
@@ -291,7 +291,7 @@ pub trait MemoryStore: Send + Sync {
 
 ## 10. Phased Roadmap (milestones)
 
-> **Status (540 tests passing + 1 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅. **Next roadmap:** see [`docs/superpowers/specs/2026-07-24-next-roadmap.md`](../docs/superpowers/specs/2026-07-24-next-roadmap.md) (Phase A: correctness sweep, Phase B: doc sync, Phase C: e2e harness, Phase D: task HTTP surface, Phase E: maintenance).
+> **Status (570 tests passing + 1 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅ + Phase E hardening ✅ + Phase E review hardening ✅. **Next roadmap:** see [`docs/superpowers/specs/2026-07-24-next-roadmap.md`](../docs/superpowers/specs/2026-07-24-next-roadmap.md) (Phase A: correctness sweep, Phase B: doc sync, Phase C: e2e harness, Phase D: task HTTP surface, Phase E: maintenance).
 
 - ✅ **M0 — Skeleton:** crate layout, `error.rs`, `id.rs`, empty modules, `lib.rs` compiles.
 - ✅ **M1 — Memory core:** `Memory` types + `MemoryStore` trait + `InMemoryStore`

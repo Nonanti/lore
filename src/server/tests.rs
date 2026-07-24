@@ -728,7 +728,10 @@ async fn create_agent_rejects_control_chars_via_persona_validate() {
     let st = state();
     // Newline in name → server should reject (422 path via LoreError::InvalidInput).
     let err = st.create_agent("Aria\nEvil", "role", vec![]).await;
-    assert!(err.is_err(), "newline in name should be rejected at server level");
+    assert!(
+        err.is_err(),
+        "newline in name should be rejected at server level"
+    );
     if let Err(LoreError::InvalidInput(msg)) = err {
         assert!(msg.contains("name"), "error should mention name: {msg}");
     }
@@ -763,8 +766,14 @@ async fn patch_agent_rejects_control_chars_via_persona_validate() {
     // Original persona must remain unchanged (no partial update).
     let agent_map = st.inner.agents.read().await;
     let agent = agent_map.get(&id).unwrap();
-    assert_eq!(agent.persona.name, "Aria", "name must not change on rejected patch");
-    assert_eq!(agent.persona.version, 1, "version must not bump on rejected patch");
+    assert_eq!(
+        agent.persona.name, "Aria",
+        "name must not change on rejected patch"
+    );
+    assert_eq!(
+        agent.persona.version, 1,
+        "version must not bump on rejected patch"
+    );
 }
 
 #[tokio::test]
@@ -787,7 +796,10 @@ async fn create_agent_rejects_empty_after_trim_name() {
     let st = state();
     // Name becomes empty after trimming.
     let err = st.create_agent("  \t  ", "role", vec![]).await;
-    assert!(err.is_err(), "whitespace-only name (with tabs) should be rejected");
+    assert!(
+        err.is_err(),
+        "whitespace-only name (with tabs) should be rejected"
+    );
 }
 
 #[tokio::test]
