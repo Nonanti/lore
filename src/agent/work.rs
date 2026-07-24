@@ -85,12 +85,12 @@ impl WorkSpec {
             .canonicalize()
             .map_err(|e| LoreError::InvalidInput(format!("workspace does not exist: {e}")))?;
 
-        let verify = if workspace.join("Cargo.toml").exists() {
+        let verify = if workspace.join("Cargo.toml").is_file() {
             vec!["cargo test".to_string()]
-        } else if workspace.join("package.json").exists() {
+        } else if workspace.join("package.json").is_file() {
             vec!["npm test".to_string()]
-        } else if workspace.join("pyproject.toml").exists()
-            || workspace.join("requirements.txt").exists()
+        } else if workspace.join("pyproject.toml").is_file()
+            || workspace.join("requirements.txt").is_file()
         {
             vec!["python -m pytest".to_string()]
         } else {
@@ -126,7 +126,10 @@ fn clamp_iterations(n: usize) -> usize {
 
 /// Keep only the last `cap` bytes of a string, with a truncation marker
 /// if truncated. Uses char-boundary-safe truncation.
-fn tail(s: &str, cap: usize) -> String {
+///
+/// Shared helper for both work and distill modules — each passes its own
+/// marker string.
+pub(crate) fn tail_bytes(s: &str, cap: usize, marker: &str) -> String {
     if s.len() <= cap {
         return s.to_string();
     }
@@ -136,7 +139,7 @@ fn tail(s: &str, cap: usize) -> String {
     while !s.is_char_boundary(i) {
         i -= 1;
     }
-    format!("{}{}", TAIL_TRUNCATION_MARKER, &s[i..])
+    format!("{}{}", marker, &s[i..])
 }
 
 use crate::agent::Agent;
@@ -181,7 +184,7 @@ impl Agent {
                 seeded_goal.clone()
             } else {
                 format!(
-                    "{}\n\nPrevious attempt FAILED verification. Output (tail):\n{}\nFix the failure, then verify again.",
+                    "{}\n\nPrevious attempt FAILED verification. Output (tail):\n<verify_output>\n{}\n</verify_output>\nFix the failure, then verify again.",
                     seeded_goal,
                     last_verify_log
                 )
@@ -197,12 +200,15 @@ impl Agent {
                 let output = shell.run(cmd).await?;
                 // Extract exit code from ShellTool output format: "[exit code: N]".
                 let code = extract_exit_code(&output);
-                let tailed = tail(&output, VERIFY_TAIL_CAP);
+                let tailed = tail_bytes(&output, VERIFY_TAIL_CAP, TAIL_TRUNCATION_MARKER);
                 if !combined.is_empty() {
                     combined.push('\n');
                 }
                 combined.push_str(&tailed);
                 if code != Some(0) {
+                    if code.is_none() {
+                        tracing::warn!(cmd = %cmd, "extract_exit_code returned None — treating as failure");
+                    }
                     all_passed = false;
                 }
             }
@@ -271,10 +277,11 @@ impl Agent {
     }
 
     /// Writes a procedural strategy memory after work completion (success or failure).
-    /// Uses `remember` so existing dedup/merge/Wilson machinery applies.
+    /// Uses `remember` so existing dedup/merge/Wilson machinery applies;
+    /// near-duplicate dedup happens at [`MemoryStore::consolidate`] time.
     /// A write failure is logged but never fails the task.
     async fn record_strategy(&self, spec: &WorkSpec, report: &WorkReport) {
-        let goal_summary = &spec.goal[..spec.goal.len().min(80)];
+        let goal_summary: String = spec.goal.chars().take(80).collect();
         let mem = crate::memory::Memory::procedural(
             self.scope(),
             format!("task: {goal_summary}"),
@@ -645,13 +652,13 @@ mod tests {
     #[test]
     fn tail_no_truncation_when_short() {
         let s = "hello";
-        assert_eq!(tail(s, 1024), s);
+        assert_eq!(tail_bytes(s, 1024, TAIL_TRUNCATION_MARKER), s);
     }
 
     #[test]
     fn tail_truncates_long_output() {
         let s = "A".repeat(10000);
-        let t = tail(&s, 8192);
+        let t = tail_bytes(&s, 8192, TAIL_TRUNCATION_MARKER);
         assert!(t.contains(TAIL_TRUNCATION_MARKER));
         assert!(t.len() < s.len());
     }
@@ -748,7 +755,7 @@ mod tests {
         // 4-byte UTF-8 characters (emoji). Each '🎉' is 4 bytes.
         let emoji = "🎉";
         let s = emoji.repeat(3000); // 12000 bytes
-        let t = tail(&s, 8192);
+        let t = tail_bytes(&s, 8192, TAIL_TRUNCATION_MARKER);
         assert!(t.contains(TAIL_TRUNCATION_MARKER));
         // The result should be valid UTF-8 (no char boundary splits).
         assert!(
@@ -762,7 +769,7 @@ mod tests {
     #[test]
     fn tail_at_exact_cap_is_not_truncated() {
         let s = "A".repeat(VERIFY_TAIL_CAP); // exactly 8 KiB
-        let t = tail(&s, VERIFY_TAIL_CAP);
+        let t = tail_bytes(&s, VERIFY_TAIL_CAP, TAIL_TRUNCATION_MARKER);
         assert!(
             !t.contains(TAIL_TRUNCATION_MARKER),
             "exact cap → no truncation"
@@ -774,7 +781,7 @@ mod tests {
     #[test]
     fn tail_one_byte_over_cap_truncates() {
         let s = "A".repeat(VERIFY_TAIL_CAP + 1); // 8 KiB + 1 byte
-        let t = tail(&s, VERIFY_TAIL_CAP);
+        let t = tail_bytes(&s, VERIFY_TAIL_CAP, TAIL_TRUNCATION_MARKER);
         assert!(t.contains(TAIL_TRUNCATION_MARKER), "over cap → truncated");
     }
 
@@ -1369,5 +1376,74 @@ mod tests {
             panic!("expected procedural memory");
         }
         cleanup(&root);
+    }
+
+    // ── B2: byte-slice panic test (multibyte at char-boundary 80) ─────────
+
+    #[tokio::test]
+    async fn work_multibyte_goal_at_boundary_no_panic() {
+        // 79 ASCII + "üş" → byte 80 lands inside "ü" (2-byte UTF-8).
+        // record_strategy must NOT panic on this goal.
+        let root = make_temp_dir("multibyte-goal");
+        let goal = format!("{}üş", "A".repeat(79));
+        let model = Arc::new(ScriptedModel::new(&["done"]));
+        let agent = agent_with_model(model);
+
+        let spec = WorkSpec::new(goal, root.clone(), vec!["exit 0".to_string()])
+            .unwrap()
+            .with_max_iterations(1);
+
+        let report = agent
+            .work(&empty_ctx(), allow_gate(root.clone()), &spec)
+            .await
+            .unwrap();
+        assert!(report.success, "should succeed without panic");
+        cleanup(&root);
+    }
+
+    // ── B2: verify_output delimiters in iteration input ──────────────────
+
+    #[tokio::test]
+    async fn work_verify_output_delimiters_in_iteration_input() {
+        let root = make_temp_dir("verify-delimiters");
+        let model = Arc::new(ScriptedModel::new(&["attempt1", "attempt2"]));
+        let agent = agent_with_model(model.clone());
+
+        let spec = WorkSpec::new("task", root.clone(), vec!["exit 1".to_string()])
+            .unwrap()
+            .with_max_iterations(2);
+
+        let _ = agent
+            .work(&empty_ctx(), allow_gate(root.clone()), &spec)
+            .await
+            .unwrap();
+
+        let inputs = model.captured_inputs();
+        assert!(
+            inputs[1].contains("<verify_output>"),
+            "second iteration input must contain <verify_output> delimiter"
+        );
+        assert!(
+            inputs[1].contains("</verify_output>"),
+            "second iteration input must contain </verify_output> delimiter"
+        );
+        cleanup(&root);
+    }
+
+    // ── B2: for_workspace directory-named-as-file does not detect ─────────
+
+    #[test]
+    fn for_workspace_directory_named_cargo_toml_not_detected() {
+        let dir = make_temp_dir("dir-cargo-detect");
+        // Create a *directory* named Cargo.toml — .is_file() should reject it.
+        std::fs::create_dir_all(dir.join("Cargo.toml")).unwrap();
+        let canon = dir.canonicalize().unwrap();
+
+        let spec = WorkSpec::for_workspace("build it", canon).unwrap();
+        assert!(
+            spec.verify.is_empty(),
+            "directory named Cargo.toml should not be detected as a project file"
+        );
+        cleanup(&dir);
     }
 }
