@@ -53,16 +53,16 @@ const WS_MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/agents", post(create_h).get(list_h))
-        .route("/agents/:id", patch(patch_h).delete(delete_h))
-        .route("/agents/:id/ask", post(ask_h))
-        .route("/agents/:id/ask/stream", post(ask_stream_h))
-        .route("/agents/:id/act", post(act_h))
-        .route("/agents/:id/solve", post(solve_h))
-        .route("/agents/:id/message", post(message_h))
-        .route("/agents/:id/experience", post(exp_h))
-        .route("/agents/:id/reinforce", post(reinforce_h))
-        .route("/agents/:id/reflect", post(reflect_h))
-        .route("/agents/:id/recall", get(recall_h))
+        .route("/agents/{id}", patch(patch_h).delete(delete_h))
+        .route("/agents/{id}/ask", post(ask_h))
+        .route("/agents/{id}/ask/stream", post(ask_stream_h))
+        .route("/agents/{id}/act", post(act_h))
+        .route("/agents/{id}/solve", post(solve_h))
+        .route("/agents/{id}/message", post(message_h))
+        .route("/agents/{id}/experience", post(exp_h))
+        .route("/agents/{id}/reinforce", post(reinforce_h))
+        .route("/agents/{id}/reflect", post(reflect_h))
+        .route("/agents/{id}/recall", get(recall_h))
         .route("/deliberate", post(deliberate_h))
         .route("/deliberate/live", get(deliberate_ws_h))
         .route("/board", get(board_h))
@@ -70,11 +70,11 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", get(metrics_h))
         // Task queue HTTP surface (Phase D).
         .route("/tasks", post(enqueue_task_h).get(list_tasks_h))
-        .route("/tasks/:id", get(get_task_h))
-        .route("/tasks/:id/log", get(task_log_h))
+        .route("/tasks/{id}", get(get_task_h))
+        .route("/tasks/{id}/log", get(task_log_h))
         .route("/inbox", get(inbox_h))
-        .route("/approvals/:id/approve", post(approve_h))
-        .route("/approvals/:id/deny", post(deny_h))
+        .route("/approvals/{id}/approve", post(approve_h))
+        .route("/approvals/{id}/deny", post(deny_h))
         .route_layer(middleware::from_fn_with_state(state.clone(), security_mw))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024)); // 2 MiB
 
@@ -168,7 +168,7 @@ pub async fn serve(addr: &str, state: AppState) -> Result<()> {
 /// Request metadata middleware (all endpoints): increments the counter, generates a
 /// unique request ID (`x-request-id` response header + span field in all logs), feeds
 /// route-based latency histograms, and writes a structured completion log.
-/// Route label is a template (`/agents/:id/ask`) — cardinality does not explode;
+/// Route label is a template (`/agents/{id}/ask`) — cardinality does not explode;
 /// unmatched (404) requests are grouped under a single "(unmatched)" label.
 async fn request_mw(State(st): State<AppState>, req: Request, next: Next) -> Response {
     use tracing::Instrument;
@@ -436,7 +436,7 @@ async fn deliberate_ws(st: AppState, mut socket: WebSocket) {
 
     // First text frame = question (with timeout — idle connections are not held indefinitely).
     let question = match tokio::time::timeout(WS_QUESTION_TIMEOUT, socket.recv()).await {
-        Ok(Some(Ok(WsMsg::Text(q)))) => q,
+        Ok(Some(Ok(WsMsg::Text(q)))) => q.to_string(),
         _ => return,
     };
     if let Err(e) = st.board_note("Question", question.clone()).await {
@@ -444,7 +444,7 @@ async fn deliberate_ws(st: AppState, mut socket: WebSocket) {
         // hard to debug from the client side).
         tracing::warn!(error = %e, "ws deliberate: board note could not be written");
         let err_frame = serde_json::json!({"error": "board note failed"}).to_string();
-        let _ = socket.send(WsMsg::Text(err_frame)).await;
+        let _ = socket.send(WsMsg::Text(err_frame.into())).await;
         return;
     }
     // Replies are collected IN PARALLEL and streamed as soon as ready — serial waiting
@@ -484,7 +484,7 @@ async fn deliberate_ws(st: AppState, mut socket: WebSocket) {
             node: None,
         })
         .unwrap_or_default();
-        if socket.send(WsMsg::Text(frame)).await.is_err() {
+        if socket.send(WsMsg::Text(frame.into())).await.is_err() {
             return; // client disconnected
         }
     }
@@ -492,7 +492,7 @@ async fn deliberate_ws(st: AppState, mut socket: WebSocket) {
     // as HTTP /deliberate. peer_fanout also writes to the local board.
     for reply in st.peer_fanout(&question).await {
         let frame = serde_json::to_string(&reply).unwrap_or_default();
-        if socket.send(WsMsg::Text(frame)).await.is_err() {
+        if socket.send(WsMsg::Text(frame.into())).await.is_err() {
             return; // client disconnected
         }
     }

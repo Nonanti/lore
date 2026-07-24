@@ -1149,7 +1149,7 @@ impl AppState {
         Ok(self.task_to_view(&task))
     }
 
-    /// Lists tasks (compact, newest-first). Omits report (available on GET /tasks/:id).
+    /// Lists tasks (compact, newest-first). Omits report (available on GET /tasks/{id}).
     pub fn list_tasks(&self, limit: usize) -> Result<Vec<CompactTaskView>> {
         let store = self.open_task_store()?;
         let limit = limit.clamp(0, 1000); // 0 → empty list; MAX_QUERY_LIMIT same as api.rs
@@ -1157,7 +1157,7 @@ impl AppState {
         Ok(tasks.iter().map(|t| self.task_to_compact(t)).collect())
     }
 
-    /// Gets a full task record (HTTP: GET /tasks/:id).
+    /// Gets a full task record (HTTP: GET /tasks/{id}).
     /// Includes report + children when present.
     pub fn get_task_full(&self, id: &str) -> Result<TaskFullView> {
         let store = self.open_task_store()?;
@@ -1171,7 +1171,7 @@ impl AppState {
         })
     }
 
-    /// Reads a task log file (HTTP: GET /tasks/:id/log?tail=N).
+    /// Reads a task log file (HTTP: GET /tasks/{id}/log?tail=N).
     /// Uses the same path traversal validation as the CLI.
     pub fn read_task_log(&self, id: &str, tail: Option<usize>) -> Result<String> {
         // Path traversal validation (same as CLI: reject / \ ..).
@@ -1207,7 +1207,7 @@ impl AppState {
         store.pending_approvals()
     }
 
-    /// Decides an approval: approve or deny (HTTP: POST /approvals/:id/approve|deny).
+    /// Decides an approval: approve or deny (HTTP: POST /approvals/{id}/approve|deny).
     /// Idempotent: deciding a non-Pending approval -> Conflict (409) with clear message;
     /// unknown id -> NotFound (404).
     pub fn decide_approval(&self, id: &str, approve: bool) -> Result<()> {

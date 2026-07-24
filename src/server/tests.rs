@@ -701,7 +701,7 @@ async fn ws_rejects_oversized_question() {
     // HTTP body limit is 2MB while WS accepted ~64MB — oversized questions
     // should not be processed: no reply frame arrives (close/error instead).
     let big = "s".repeat(100_000);
-    ws.send(TMsg::Text(big)).await.unwrap();
+    ws.send(TMsg::Text(big.into())).await.unwrap();
     match ws.next().await {
         None | Some(Err(_)) | Some(Ok(TMsg::Close(_))) => {} // expected: rejected
         Some(Ok(m)) => {

@@ -15,23 +15,23 @@
 //! - `GET  /metrics`                     → Prometheus-style metrics (protected)
 //! - `POST /agents`                      → create agent (name, role, traits)
 //! - `GET  /agents`                      → list agents
-//! - `PATCH/DELETE /agents/:id`          → update persona / delete agent
-//! - `POST /agents/:id/ask`              → ask agent (message) → reply
-//! - `POST /agents/:id/ask/stream`       → stream response as SSE
-//! - `POST /agents/:id/act`              → run tool if matched, otherwise respond
-//! - `POST /agents/:id/message`          → inter-agent message (ask → reply, tell → 204)
-//! - `POST /agents/:id/experience`       → add episodic memory (title, body)
-//! - `GET  /agents/:id/recall?q=&limit=` → recall (`semantic=true` for semantic)
+//! - `PATCH/DELETE /agents/{id}`          → update persona / delete agent
+//! - `POST /agents/{id}/ask`              → ask agent (message) → reply
+//! - `POST /agents/{id}/ask/stream`       → stream response as SSE
+//! - `POST /agents/{id}/act`              → run tool if matched, otherwise respond
+//! - `POST /agents/{id}/message`          → inter-agent message (ask → reply, tell → 204)
+//! - `POST /agents/{id}/experience`       → add episodic memory (title, body)
+//! - `GET  /agents/{id}/recall?q=&limit=` → recall (`semantic=true` for semantic)
 //! - `POST /deliberate`                  → collective deliberation (+synthesizer, +local)
 //! - `GET  /deliberate/live`             → WebSocket live deliberate
 //! - `GET  /board?limit=`                → read shared board
 //! - `POST /tasks`                         → enqueue task (agent, goal, workspace?, verify[])
 //! - `GET  /tasks?limit=N`                 → list tasks (compact)
-//! - `GET  /tasks/:id`                      → full task record (report + children)
-//! - `GET  /tasks/:id/log?tail=N`          → read task log (traversal validated)
+//! - `GET  /tasks/{id}`                      → full task record (report + children)
+//! - `GET  /tasks/{id}/log?tail=N`          → read task log (traversal validated)
 //! - `GET  /inbox`                          → pending approvals
-//! - `POST /approvals/:id/approve`          → approve (non-Pending → 409)
-//! - `POST /approvals/:id/deny`             → deny (non-Pending → 409)
+//! - `POST /approvals/{id}/approve`          → approve (non-Pending → 409)
+//! - `POST /approvals/{id}/deny`             → deny (non-Pending → 409)
 //!
 //! All endpoints except `/health` go through auth + rate-limit middleware.
 

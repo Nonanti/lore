@@ -142,7 +142,7 @@ pub(super) struct ReflectResp {
 
 /// HTTP response DTO for a task (full detail): workspace relativised to
 /// data_dir so absolute server paths are not leaked.
-/// Used for GET /tasks/:id, POST /tasks, and TaskFullView children.
+/// Used for GET /tasks/{id}, POST /tasks, and TaskFullView children.
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskView {
     /// ULID identifier.
@@ -195,7 +195,7 @@ pub struct CompactTaskView {
 }
 
 /// Full task view: the task itself + child tasks (when present).
-/// Used for GET /tasks/:id — includes report + children.
+/// Used for GET /tasks/{id} — includes report + children.
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskFullView {
     /// The task record (workspace relativised).
