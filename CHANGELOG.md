@@ -58,7 +58,31 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
   refusal, sandbox escape rejection, and a live agent (any
   OpenAI-compatible endpoint) writing + verifying files through the tools.
 
-### Fixed
+### Fixed — consolidated review hardening (4-way review, all findings verified)
+
+- **Shell policy**: newline (`\n`,`\r`) and redirect (`>`,`<`) added to the
+  metacharacter deny set — `echo safe\nbash evil` chaining and
+  `echo x > /etc/passwd` no longer slip through auto-allowed commands;
+  multi-word auto-allow entries now match their bare form (`cargo test`
+  alone is allowed by `"cargo test"`); auto-allow matches path basenames
+  like the deny side (`/usr/bin/ls` allowed by `"ls"`).
+- **Work/distill**: byte-slice panic on multibyte goals (chars-based
+  truncation); distill JSON parsing tolerates markdown fences and prose
+  (scan-based extraction); verify output wrapped in `<verify_output>`
+  delimiters + distill prompt marks the log as untrusted data;
+  `extract_exit_code=None` now warns; project detection uses `is_file()`;
+  distilled keys are unique per item.
+- **Daemon/task**: reviewer pass can't be skipped by a parallel worker
+  (re-check after failed enqueue); shutdown re-queue is compare-and-swap
+  (a completed task is never demoted back to Queued); unknown task/
+  approval statuses surface as errors instead of silently becoming
+  Queued/Pending; v1→v2 migration is one atomic transaction; per-worker
+  model cache (persona/credential files read once per agent per worker).
+- **Config/CLI**: `ProviderKind::OpenAI` serializes as `"openai"` (was
+  `"open_a_i"`; old files load via alias); agent names with `/`, `\`,
+  `..` rejected in `task add` and `agent create`; `task add --team`
+  validates `pm.json` upfront; FileEditTool re-verifies containment
+  before reading; CliApprover logs I/O errors instead of swallowing.
 - **Concurrent store opens no longer fail with SQLITE_BUSY_SNAPSHOT**:
   memory-store migrations now use BEGIN IMMEDIATE (write lock upfront,
   waits via busy_timeout) — two parallel daemon workers opening the same
