@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use crate::agent::{Agent, WorkReport, WorkSpec};
 use crate::error::{LoreError, Result};
-use crate::memory::{HashingEmbedder, MemoryStore, SqliteStore};
+use crate::memory::{CompositeStore, HashingEmbedder, MemoryStore, SqliteStore};
 use crate::model::{Model, ModelConfig};
 use crate::orchestrator::pm::{
     build_roster, collect_child_reports, decompose_with_retry, has_reviewer, synthesis_prompt,
@@ -132,20 +132,12 @@ pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Resu
         return Err(crate::error::LoreError::InvalidInput(msg));
     }
 
-    // Scoped memory: <data>/memory/<agent_name>.db (same pattern as AppState).
-    let mem_path = deps
-        .data_dir
-        .join("memory")
-        .join(format!("{}.db", task.agent));
-    let parent = mem_path
-        .parent()
-        .ok_or_else(|| crate::error::LoreError::Storage("memory dir has no parent".into()))?;
-    std::fs::create_dir_all(parent).map_err(|e| crate::error::LoreError::Storage(e.to_string()))?;
-    let mem_store: Arc<dyn MemoryStore> = Arc::new(
-        SqliteStore::open(&mem_path.to_string_lossy())
-            .map_err(|e| crate::error::LoreError::Storage(e.to_string()))?
-            .with_embedder(Arc::new(HashingEmbedder::new())),
-    );
+    // Scoped memory: personal <data>/memory/<agent_name>.db composed with
+    // the shared team store <data>/memory/team.db — `Scope::World` records
+    // (distilled team conventions) route to the shared file, so every agent
+    // on this daemon learns from every other. Concurrency posture matches
+    // tasks.db: WAL + IMMEDIATE write transactions, one file, many workers.
+    let mem_store: Arc<dyn MemoryStore> = Arc::new(build_agent_store(&deps.data_dir, &task.agent)?);
 
     let agent = Agent::load_from(&persona_path, mem_store.clone(), model.clone())?;
 
@@ -596,6 +588,25 @@ pub async fn run_daemon(data_dir: &Path, db_path: &Path, concurrency: usize) -> 
 
 /// Build per-task model: if the agent record has a ModelConfig, use it;
 /// otherwise fall back to env config.
+/// Builds an agent's memory store: personal SQLite file composed with the
+/// daemon-wide shared team store (`memory/team.db`). World-scope records
+/// (shared conventions) live in the team file; everything else stays
+/// personal. Both files share the offline embedder.
+fn build_agent_store(data_dir: &Path, agent_name: &str) -> Result<CompositeStore> {
+    let mem_dir = data_dir.join("memory");
+    std::fs::create_dir_all(&mem_dir)
+        .map_err(|e| crate::error::LoreError::Storage(e.to_string()))?;
+    let personal_path = mem_dir.join(format!("{agent_name}.db"));
+    let personal = SqliteStore::open(&personal_path.to_string_lossy())
+        .map_err(|e| crate::error::LoreError::Storage(e.to_string()))?
+        .with_embedder(Arc::new(HashingEmbedder::new()));
+    let team_path = mem_dir.join("team.db");
+    let team = SqliteStore::open(&team_path.to_string_lossy())
+        .map_err(|e| crate::error::LoreError::Storage(e.to_string()))?
+        .with_embedder(Arc::new(HashingEmbedder::new()));
+    Ok(CompositeStore::new(Arc::new(personal), Arc::new(team)))
+}
+
 fn build_per_task_model(
     data_dir: &Path,
     agent_name: &str,
@@ -977,6 +988,59 @@ mod tests {
 
     fn cleanup(dir: &PathBuf) {
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_stores_share_world_records_through_team_db() {
+        use crate::memory::{Memory, Query, Scope, SemanticCat};
+        let data = make_temp_dir("team-mem");
+
+        // Backend's store writes a shared convention + a personal fact…
+        let backend = build_agent_store(&data, "backend").unwrap();
+        backend
+            .remember(Memory::semantic(
+                Scope::World,
+                "tests run with cargo nextest",
+                SemanticCat::Convention,
+            ))
+            .await
+            .unwrap();
+        backend
+            .remember(Memory::semantic(
+                Scope::Agent(crate::id::AgentId::new()),
+                "backend private staging note",
+                SemanticCat::Fact,
+            ))
+            .await
+            .unwrap();
+
+        // …frontend's store (separate personal file, same team.db) sees the
+        // convention but never the private fact.
+        let frontend = build_agent_store(&data, "frontend").unwrap();
+        let scope = Scope::Agent(crate::id::AgentId::new());
+        let seen = frontend
+            .recall(&scope, &Query::new("nextest").limit(5))
+            .await
+            .unwrap();
+        assert!(
+            seen.iter()
+                .any(|s| s.item.searchable_text().contains("cargo nextest")),
+            "team convention must cross agent stores via team.db"
+        );
+        let leak = frontend
+            .recall(&scope, &Query::new("staging").limit(5))
+            .await
+            .unwrap();
+        assert!(
+            leak.is_empty(),
+            "personal records must stay in the personal file"
+        );
+        assert!(
+            data.join("memory").join("team.db").exists(),
+            "shared team file created"
+        );
+
+        cleanup(&data);
     }
 
     /// Save a persona file for the given agent name using Agent::save_to
