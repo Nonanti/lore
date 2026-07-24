@@ -122,7 +122,7 @@
           <input id="tAgent" placeholder="agent" required>
           <input id="tGoal" placeholder="goal" required>
           <input id="tWs" placeholder="workspace (optional)">
-          <input id="tVerify" placeholder="verify cmd (optional)">
+          <input id="tVerify" placeholder="verify cmds (comma-separated, optional)">
           <button class="act" type="submit">Enqueue</button>
         </form>
       </div>
@@ -195,12 +195,17 @@ async function probe() {
 
 // ── tasks ───────────────────────────────────────────────────────────
 const openDetails = new Set();
+// Generation counter: a rebuild invalidates every in-flight fetch from the
+// previous polling cycle — stale promises must not overwrite fresh DOM.
+let taskGen = 0;
 function fmtTime(t) { return new Date(t).toLocaleString(); }
 function shortId(id) { return id.length > 10 ? id.slice(0, 10) + "…" : id; }
 
 async function loadTasks() {
+  const gen = ++taskGen;
   try {
     const tasks = await api("/tasks");
+    if (gen !== taskGen) return; // a newer cycle owns the DOM
     $("#taskCount").textContent = tasks.length + " total";
     if (!tasks.length) { $("#tasks").innerHTML = '<div class="empty">no tasks yet</div>'; return; }
     const rows = tasks.map(t => `
@@ -226,6 +231,7 @@ function toggleTask(id) {
   if (!drawer.hidden) { openDetails.add(id); fillDetail(id); } else { openDetails.delete(id); }
 }
 async function fillDetail(id) {
+  const gen = taskGen;
   const drawer = $(`tr.drawer[data-for="${CSS.escape(id)}"]`);
   if (!drawer || drawer.hidden) return;
   try {
@@ -233,6 +239,7 @@ async function fillDetail(id) {
       api("/tasks/" + encodeURIComponent(id)),
       api("/tasks/" + encodeURIComponent(id) + "/log").catch(() => "")
     ]);
+    if (gen !== taskGen) return; // table was rebuilt while we fetched
     const t = full.task;
     let report = "";
     if (t.report) { try { report = JSON.stringify(JSON.parse(t.report), null, 2); } catch (_e) { report = t.report; } }
@@ -251,12 +258,12 @@ async function fillDetail(id) {
 }
 $("#taskForm").addEventListener("submit", async ev => {
   ev.preventDefault();
-  const verify = $("#tVerify").value.trim();
+  const verify = $("#tVerify").value.split(",").map(s => s.trim()).filter(Boolean);
   try {
     const body = {
       agent: $("#tAgent").value.trim(),
       goal: $("#tGoal").value.trim(),
-      verify: verify ? [verify] : []
+      verify
     };
     const ws = $("#tWs").value.trim();
     if (ws) body.workspace = ws;
@@ -288,8 +295,9 @@ async function loadInbox() {
     }).join("");
     $$("#inbox button.act").forEach(b => b.addEventListener("click", async () => {
       try {
-        await api("/approvals/" + encodeURIComponent(b.dataset.id) + "/" + b.dataset.dec, { method: "POST" });
-        toast(b.dataset.dec + "d");
+        await api("/approvals/" + encodeURIComponent(b.dataset.id) + "/" +
+          encodeURIComponent(b.dataset.dec), { method: "POST" });
+        toast(b.dataset.dec === "approve" ? "approved" : "denied");
         loadInbox(); loadTasks();
       } catch (e) { toast(b.dataset.dec + " failed — " + e.message, true); }
     }));
@@ -328,7 +336,7 @@ async function recall(id) {
     const mems = await api("/agents/" + encodeURIComponent(id) +
       "/recall?semantic=true&limit=8&q=" + encodeURIComponent(q));
     out.innerHTML = mems.length
-      ? mems.map(m => `<div class="mem"><span class="score">${Number(m.score).toFixed(2)}</span>${esc(m.summary)}</div>`).join("")
+      ? mems.map(m => `<div class="mem"><span class="score">${esc(Number(m.score).toFixed(2))}</span>${esc(m.summary)}</div>`).join("")
       : '<div class="empty">no matches</div>';
   } catch (e) { out.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
 }
@@ -341,7 +349,9 @@ function refresh() {
   else if (t === "inbox") { loadInbox(); loadTasks(); }
   else loadAgents();
 }
-setInterval(() => { if ($("#autorefresh").checked) refresh(); }, 4000);
+setInterval(() => {
+  if ($("#autorefresh").checked && document.visibilityState !== "hidden") refresh();
+}, 4000);
 refresh();
 </script>
 </body>

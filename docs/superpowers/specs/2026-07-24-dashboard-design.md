@@ -36,7 +36,35 @@ HTTP API, with zero new dependencies.
 - Existing protected-endpoint auth tests keep passing (no route-group
   regression).
 
-## 4. Out of scope
+## 4. Addendum (2026-07-24): review fixes
+
+Independent review (2 major, 4 minor, 4 nits):
+
+- **M2 fixed**: `/ui` now sends `X-Frame-Options: DENY` (the approve/deny
+  buttons must not be clickjackable), `X-Content-Type-Options: nosniff`,
+  and a CSP that allows exactly what the shell is (`default-src 'none';
+  style-src/script-src 'unsafe-inline'; connect-src 'self'`) — a CDN
+  reference would be browser-blocked even if the self-containment test
+  were dodged. Tests assert all three.
+- **M1 decided (documented, no code change)**: `ApprovalEntry.action` may
+  contain command arguments/env values. The dashboard adds **no new
+  exposure** — `GET /inbox` has returned this field to API-key holders
+  since the Phase-D task surface; the key IS the operator boundary
+  (single-operator threat model, README security notes). Server-side
+  redaction would be heuristic (the policy `Action` has no structured
+  env-vs-literal distinction) and is deferred until a multi-operator
+  story exists.
+- Minors fixed: `verify` input now comma-separated (matches
+  `Vec<String>`), polling pauses in hidden tabs, stale in-flight detail
+  fetches are dropped via a generation counter, decision path segment
+  URL-encoded, toast grammar, score esc() uniformity.
+- Self-containment test hardened: the shell has NO `src=`/`href=`
+  attributes at all (catches protocol-relative and `data:` URIs).
+- N4 (space injection via status CSS class) acknowledged, not changed:
+  `TaskStatus` is a server-side enum; `esc()` already covers the
+  injection-relevant characters.
+
+## 5. Out of scope
 
 - Live streams (U4), persona editing UI, task cancellation (no such
   endpoint), charts/metrics visualization, multi-server switching.

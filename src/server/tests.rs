@@ -544,13 +544,32 @@ async fn dashboard_shell_is_public_and_self_contained() {
         .unwrap()
         .to_string();
     assert!(ct.starts_with("text/html"), "content-type: {ct}");
+    // Security headers (review M2): clickjacking + CDN-creep defense.
+    let hdr = |name: &str| {
+        res.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default()
+    };
+    assert_eq!(hdr("x-frame-options"), "DENY");
+    assert_eq!(hdr("x-content-type-options"), "nosniff");
+    assert!(
+        hdr("content-security-policy").contains("connect-src 'self'"),
+        "CSP restricts fetches to same origin"
+    );
     let body = res.text().await.unwrap();
     assert!(body.contains("Lore Dashboard"), "shell marker present");
     // Self-containment (spec U1): no external asset can creep in — the
-    // binary IS the dashboard. Any http(s):// reference is a regression.
+    // binary IS the dashboard. Any http(s):// reference is a regression,
+    // and the shell deliberately has NO src=/href= attributes at all
+    // (catches protocol-relative //cdn… and data: URIs too).
     assert!(
         !body.contains("http://") && !body.contains("https://"),
         "shell must reference no external URLs"
+    );
+    assert!(
+        !body.contains("src=") && !body.contains("href="),
+        "shell must have no asset/link attributes at all"
     );
     assert!(
         !body.contains("secret"),

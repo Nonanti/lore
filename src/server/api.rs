@@ -211,9 +211,22 @@ async fn request_mw(State(st): State<AppState>, req: Request, next: Next) -> Res
 /// Embedded dashboard (single self-contained HTML file, zero external
 /// assets — the "everything lives inside the binary" rule applies to the
 /// UI too). Static + secret-free, hence outside the auth wall.
+/// Headers (review M2): frame-deny kills clickjacking on the action
+/// buttons; the CSP allows exactly what the shell is (inline style+script,
+/// same-origin fetches) and nothing else — a CDN reference would be
+/// blocked by the browser even if the self-containment test were dodged.
 async fn ui_h() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; \
+                 script-src 'unsafe-inline'; connect-src 'self'",
+            ),
+        ],
         include_str!("assets/dashboard.html"),
     )
 }
