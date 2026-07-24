@@ -1196,15 +1196,11 @@ async fn reflect_endpoint_distills_hot_memories() {
 use crate::task::TaskStore;
 
 fn task_state() -> AppState {
-    let dir = std::env::temp_dir().join(format!("lore-task-srv-{}", ulid::Ulid::new()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db_path = dir.join("tasks.db");
-    let data_dir = dir.clone();
-    // Create the logs dir so log reading works.
-    std::fs::create_dir_all(dir.join("logs")).unwrap();
+    // Minimal AppState without task store — callers provide their own
+    // via TaskSrvDir + .with_task_store() to avoid leaked temp dirs.
     let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
     let model: Arc<dyn Model> = Arc::new(MockModel::new());
-    AppState::new(store, model).with_task_store(data_dir, db_path)
+    AppState::new(store, model)
 }
 
 struct TaskSrvDir(std::path::PathBuf);
@@ -1738,8 +1734,8 @@ async fn task_enqueue_verify_empty_vs_omitted() {
 
 #[tokio::test]
 async fn task_list_limit_clamping() {
-    // GET /tasks?limit=N — values are clamped to [1, 1000];
-    // limit=0 → 1, limit=999999 → 1000.
+    // GET /tasks?limit=N — values are clamped to [0, 1000];
+    // limit=0 → empty list, limit=999999 → clamped to 1000.
     let td = TaskSrvDir::new();
     let db_path = td.0.join("tasks.db");
     let st = task_state().with_task_store(td.0.clone(), db_path.clone());
@@ -1760,7 +1756,7 @@ async fn task_list_limit_clamping() {
             .unwrap();
     }
 
-    // limit=0 → clamped to 1.
+    // limit=0 → empty list (lower bound is 0).
     let list0: Vec<serde_json::Value> = client
         .get(format!("{base}/tasks?limit=0"))
         .send()
@@ -1769,7 +1765,7 @@ async fn task_list_limit_clamping() {
         .json()
         .await
         .unwrap();
-    assert_eq!(list0.len(), 1, "limit=0 clamped to 1");
+    assert!(list0.is_empty(), "limit=0 returns empty list");
 
     // Default (no limit param) → 20.
     let list_default: Vec<serde_json::Value> = client
@@ -2030,4 +2026,89 @@ async fn task_log_tail_larger_than_file_returns_full() {
         tail1.contains("c") && !tail1.contains("a"),
         "tail=1 returns last line: {tail1}"
     );
+}
+
+#[tokio::test]
+async fn task_workspace_containment_and_relativisation() {
+    // M1 + S2: workspace containment + relativisation in HTTP responses.
+    // 1) Absolute workspace outside data_dir → 422.
+    // 2) Absolute workspace under data_dir → accepted, relativised in response.
+    // 3) No workspace (default) → relativised in response.
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Absolute workspace outside data_dir → 422.
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "sneaky", "goal": "escape", "workspace": "/etc"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        422,
+        "workspace outside data_dir rejected"
+    );
+
+    // Absolute workspace under data_dir → accepted.
+    let ws_path = td.0.join("workspaces").join("safe");
+    let task: serde_json::Value = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "safe", "goal": "safe goal", "workspace": ws_path.to_string_lossy().to_string()}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // Workspace should be relativised: "workspaces/safe" not the full path.
+    let ws_val = task["workspace"].as_str().unwrap();
+    assert!(
+        !ws_val.contains("lore-task-http"),
+        "workspace relativised, no temp dir prefix"
+    );
+    assert_eq!(ws_val, "workspaces/safe", "workspace is relative path");
+
+    // No workspace (default) → relativised in response.
+    let task2: serde_json::Value = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "defbot", "goal": "default ws"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ws_val2 = task2["workspace"].as_str().unwrap();
+    assert_eq!(
+        ws_val2, "workspaces/defbot",
+        "default workspace relativised"
+    );
+
+    // List endpoint should also show relativised workspace and omit report.
+    let list: Vec<serde_json::Value> = client
+        .get(format!("{base}/tasks?limit=1000"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for item in &list {
+        assert!(
+            !item["workspace"]
+                .as_str()
+                .unwrap()
+                .contains("lore-task-http"),
+            "list items have relativised workspace"
+        );
+        assert!(item.get("report").is_none(), "compact list omits report");
+    }
 }

@@ -104,6 +104,8 @@ pub struct ApprovalEntry {
     /// Which task this approval belongs to.
     pub task_id: String,
     /// The action being considered (JSON-serialized `policy::Action`).
+    /// **Warning:** may contain command arguments with environment variable
+    /// values — consider redacting before exposing to untrusted clients.
     pub action: String,
     /// Why the action requires approval.
     pub reason: String,

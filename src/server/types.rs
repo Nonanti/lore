@@ -140,15 +140,69 @@ pub(super) struct ReflectResp {
     pub(super) distilled: usize,
 }
 
+/// HTTP response DTO for a task (full detail): workspace relativised to
+/// data_dir so absolute server paths are not leaked.
+/// Used for GET /tasks/:id, POST /tasks, and TaskFullView children.
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskView {
+    /// ULID identifier.
+    pub id: String,
+    /// Agent name (persona file stem).
+    pub agent: String,
+    /// What the agent should achieve.
+    pub goal: String,
+    /// Workspace path (relative to data_dir; or basename if outside).
+    pub workspace: String,
+    /// Verification commands.
+    pub verify: Vec<String>,
+    /// Current lifecycle status.
+    pub status: crate::task::TaskStatus,
+    /// When the task was created.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Last status change.
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// WorkReport JSON (present when Completed or Failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
+    /// Parent task id (for team hierarchy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+}
+
+/// HTTP response DTO for task list items: compact (no report), workspace
+/// relativised. Used for GET /tasks.
+#[derive(Clone, Debug, Serialize)]
+pub struct CompactTaskView {
+    /// ULID identifier.
+    pub id: String,
+    /// Agent name.
+    pub agent: String,
+    /// Goal description.
+    pub goal: String,
+    /// Workspace path (relative to data_dir; or basename if outside).
+    pub workspace: String,
+    /// Verification commands.
+    pub verify: Vec<String>,
+    /// Current lifecycle status.
+    pub status: crate::task::TaskStatus,
+    /// When the task was created.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Last status change.
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// Parent task id (for team hierarchy).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+}
+
 /// Full task view: the task itself + child tasks (when present).
 /// Used for GET /tasks/:id — includes report + children.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TaskFullView {
-    /// The task record.
-    pub task: crate::task::Task,
+    /// The task record (workspace relativised).
+    pub task: TaskView,
     /// Children (subtasks) of this task, empty for standalone tasks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub children: Vec<crate::task::Task>,
+    pub children: Vec<TaskView>,
 }
 
 /// Outcome field for `reinforce` request (lowercase JSON: "accessed" etc.).

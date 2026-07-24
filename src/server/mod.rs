@@ -54,6 +54,6 @@ mod tests;
 pub use api::{router, serve};
 pub use state::AppState;
 pub use types::{
-    ActResp, AgentView, AskResp, DeliberateReply, DeliberateResp, MemoryView, PersonaPatch,
-    TaskFullView,
+    ActResp, AgentView, AskResp, CompactTaskView, DeliberateReply, DeliberateResp, MemoryView,
+    PersonaPatch, TaskFullView, TaskView,
 };

@@ -4,7 +4,7 @@
 //! Collective deliberation (deliberate/federation) is in `deliberate.rs`,
 //! the HTTP layer is in `api.rs`.
 
-use super::types::{AgentView, MemoryView, PersonaPatch, TaskFullView};
+use super::types::{AgentView, CompactTaskView, MemoryView, PersonaPatch, TaskFullView, TaskView};
 use crate::agent::{Agent, Conversation, Persona};
 use crate::error::{LoreError, Result};
 use crate::id::AgentId;
@@ -1045,15 +1045,68 @@ impl AppState {
         crate::task::TaskStore::open(path)
     }
 
+    /// Relativises a workspace path against data_dir to avoid leaking
+    /// absolute server filesystem paths in HTTP responses.
+    /// Returns the relative portion ("workspaces/myagent") when under data_dir,
+    /// or just the basename ("myagent") as a fallback.
+    fn relativise_workspace(&self, workspace: &std::path::Path) -> String {
+        if let Some(data_dir) = &self.data_dir {
+            if let Ok(rel) = workspace.strip_prefix(data_dir) {
+                // Remove leading separator so it looks like "workspaces/myagent"
+                // instead of "/workspaces/myagent".
+                let s = rel.to_string_lossy();
+                return s.strip_prefix('/').unwrap_or(&s).to_string();
+            }
+        }
+        // Fallback: basename only (prevents full path disclosure).
+        workspace
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| workspace.to_string_lossy().to_string())
+    }
+
+    /// Converts a `Task` into an HTTP view (workspace relativised, report included).
+    fn task_to_view(&self, task: &crate::task::Task) -> TaskView {
+        TaskView {
+            id: task.id.clone(),
+            agent: task.agent.clone(),
+            goal: task.goal.clone(),
+            workspace: self.relativise_workspace(&task.workspace),
+            verify: task.verify.clone(),
+            status: task.status.clone(),
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+            report: task.report.clone(),
+            parent_id: task.parent_id.clone(),
+        }
+    }
+
+    /// Converts a `Task` into a compact HTTP view (workspace relativised, report omitted).
+    fn task_to_compact(&self, task: &crate::task::Task) -> CompactTaskView {
+        CompactTaskView {
+            id: task.id.clone(),
+            agent: task.agent.clone(),
+            goal: task.goal.clone(),
+            workspace: self.relativise_workspace(&task.workspace),
+            verify: task.verify.clone(),
+            status: task.status.clone(),
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+            parent_id: task.parent_id.clone(),
+        }
+    }
+
     /// Enqueues a new task (HTTP: POST /tasks).
     /// Workspace defaults to `<data_dir>/workspaces/<agent>` when not provided.
+    /// If an explicit absolute workspace is provided, it must be under data_dir
+    /// (server-side containment check; daemon-side Gate provides a second layer).
     pub fn enqueue_task(
         &self,
         agent: &str,
         goal: &str,
         workspace: Option<PathBuf>,
         verify: Vec<String>,
-    ) -> Result<crate::task::Task> {
+    ) -> Result<TaskView> {
         let store = self.open_task_store()?;
         let agent = agent.trim();
         let goal = goal.trim();
@@ -1075,6 +1128,16 @@ impl AppState {
                 .map(|d| d.join("workspaces").join(agent))
                 .unwrap_or_else(|| PathBuf::from(format!("/tmp/lore-{agent}")))
         });
+        // Server-side containment: absolute workspace must be under data_dir.
+        if workspace.is_absolute() {
+            if let Some(data_dir) = &self.data_dir {
+                if !workspace.starts_with(data_dir) {
+                    return Err(LoreError::InvalidInput(
+                        "workspace must be within data directory".into(),
+                    ));
+                }
+            }
+        }
         let new_task = crate::task::NewTask {
             agent: agent.to_string(),
             goal: goal.to_string(),
@@ -1082,14 +1145,16 @@ impl AppState {
             verify,
             parent_id: None,
         };
-        store.enqueue(new_task)
+        let task = store.enqueue(new_task)?;
+        Ok(self.task_to_view(&task))
     }
 
-    /// Lists tasks (compact, newest-first).
-    pub fn list_tasks(&self, limit: usize) -> Result<Vec<crate::task::Task>> {
+    /// Lists tasks (compact, newest-first). Omits report (available on GET /tasks/:id).
+    pub fn list_tasks(&self, limit: usize) -> Result<Vec<CompactTaskView>> {
         let store = self.open_task_store()?;
-        let limit = limit.clamp(1, 1000); // MAX_QUERY_LIMIT same as api.rs
-        store.list(limit)
+        let limit = limit.clamp(0, 1000); // 0 → empty list; MAX_QUERY_LIMIT same as api.rs
+        let tasks = store.list(limit)?;
+        Ok(tasks.iter().map(|t| self.task_to_compact(t)).collect())
     }
 
     /// Gets a full task record (HTTP: GET /tasks/:id).
@@ -1100,7 +1165,10 @@ impl AppState {
             .get(id)?
             .ok_or_else(|| LoreError::NotFound(format!("task {id}")))?;
         let children = store.children_of(id)?;
-        Ok(TaskFullView { task, children })
+        Ok(TaskFullView {
+            task: self.task_to_view(&task),
+            children: children.iter().map(|c| self.task_to_view(c)).collect(),
+        })
     }
 
     /// Reads a task log file (HTTP: GET /tasks/:id/log?tail=N).

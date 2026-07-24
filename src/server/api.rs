@@ -6,9 +6,10 @@
 use super::security::security_mw;
 use super::state::AppState;
 use super::types::{
-    ActReq, ActResp, AgentView, AskReq, AskResp, BoardParams, CreateReq, DeliberateReply,
-    DeliberateReq, DeliberateResp, EnqueueTaskReq, ExperienceReq, MemoryView, MessageReq, MsgKind,
-    PersonaPatch, RecallParams, ReflectResp, ReinforceReq, SolveReq, TaskListParams, TaskLogParams,
+    ActReq, ActResp, AgentView, AskReq, AskResp, BoardParams, CompactTaskView, CreateReq,
+    DeliberateReply, DeliberateReq, DeliberateResp, EnqueueTaskReq, ExperienceReq, MemoryView,
+    MessageReq, MsgKind, PersonaPatch, RecallParams, ReflectResp, ReinforceReq, SolveReq,
+    TaskListParams, TaskLogParams, TaskView,
 };
 use crate::agent::DEFAULT_SOLVE_STEPS;
 use crate::error::{LoreError, Result};
@@ -513,7 +514,7 @@ async fn board_h(
 async fn enqueue_task_h(
     State(st): State<AppState>,
     Json(req): Json<EnqueueTaskReq>,
-) -> std::result::Result<(StatusCode, Json<crate::task::Task>), ApiError> {
+) -> std::result::Result<(StatusCode, Json<TaskView>), ApiError> {
     let workspace = req.workspace.map(std::path::PathBuf::from);
     let task = st.enqueue_task(&req.agent, &req.goal, workspace, req.verify)?;
     Ok((StatusCode::CREATED, Json(task)))
@@ -522,7 +523,7 @@ async fn enqueue_task_h(
 async fn list_tasks_h(
     State(st): State<AppState>,
     AxQuery(p): AxQuery<TaskListParams>,
-) -> std::result::Result<Json<Vec<crate::task::Task>>, ApiError> {
+) -> std::result::Result<Json<Vec<CompactTaskView>>, ApiError> {
     let limit = p.limit.unwrap_or(20);
     Ok(Json(st.list_tasks(limit)?))
 }
