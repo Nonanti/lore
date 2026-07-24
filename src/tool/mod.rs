@@ -63,6 +63,11 @@ pub trait Tool: Send + Sync {
         if let serde_json::Value::String(s) = input {
             return s.clone();
         }
+        // A null/missing input must not become the literal string "null" —
+        // an empty args string gives the tool a clean parse error instead.
+        if input.is_null() {
+            return String::new();
+        }
         match input.get("args") {
             Some(serde_json::Value::String(s)) => s.clone(),
             Some(other) if input.as_object().is_some_and(|o| o.len() == 1) => {
@@ -334,6 +339,8 @@ mod tests {
             t.args_from_input(&serde_json::Value::String("raw text".into())),
             "raw text"
         );
+        // Null input → empty args, never the literal string "null".
+        assert_eq!(t.args_from_input(&serde_json::Value::Null), "");
     }
 
     #[test]

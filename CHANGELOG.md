@@ -117,6 +117,29 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
   thread types, both providers, and all three modes; 1 new live-LLM
   ignored smoke test.
 
+### Fixed — native tool calling review (independent review, findings verified)
+
+- **OpenAI `content: null` deserialization (critical)**: the real API
+  sends an explicit `"content": null` alongside `tool_calls`;
+  `#[serde(default)]` on a bare `String` only covers a MISSING field, so
+  every real native tool-use turn failed to parse. `content` is now
+  `Option<String>` (both parse paths tolerate null; regression-tested).
+- **Downgrade classification gated to 4xx**: a transient 5xx whose body
+  mentioned tools could permanently latch the text-protocol downgrade;
+  `tools_unsupported` now requires a client error (llama.cpp's `--jinja`
+  marker excepted — a permanent config condition some versions report
+  as 500).
+- **Null tool input → empty args**: a `tool_use` block with null/missing
+  input produced the literal args string `"null"`; now an empty string
+  (clean tool-side parse error instead of a confusing one).
+- **Hardening**: warn on empty Anthropic thread replies (thinking-only
+  content) and on empty non-fellback final answers; mid-run
+  `NativeToolsUnsupported` conversion (side-effect safety) now has a
+  dedicated test proving the downgrade latch stays unset.
+- Rejected with rationale: last-step nudge before any tool ran at
+  `max_steps=1` — deliberate parity with text mode (its only step also
+  carries the no-tools final-answer instruction); documented in code.
+
 ### Changed
 
 - **axum 0.7 → 0.8** (`{id}` path syntax, Utf8Bytes WS, explicit body

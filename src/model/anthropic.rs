@@ -321,6 +321,11 @@ impl AnthropicModel {
             Some("end_turn") => StopReason::EndTurn,
             _ => StopReason::Other,
         };
+        if blocks.is_empty() {
+            // E.g. extended thinking producing only thinking blocks — the
+            // caller would otherwise propagate a silent empty answer.
+            tracing::warn!("anthropic thread reply contained no text/tool_use blocks");
+        }
         Ok(ThreadReply {
             blocks,
             stop,

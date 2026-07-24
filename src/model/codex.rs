@@ -256,7 +256,7 @@ impl CodexModel {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            if classify_tools && super::openai::OpenAiModel::tools_unsupported(&body) {
+            if classify_tools && super::openai::OpenAiModel::tools_unsupported(status, &body) {
                 return Err(LoreError::NativeToolsUnsupported(format!(
                     "{status}: {body}"
                 )));

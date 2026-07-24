@@ -122,6 +122,9 @@ pub struct Agent {
     tool_mode: Option<ToolMode>,
     /// `auto` downgrade latch: once the endpoint proves it cannot do native
     /// tools, later solves skip the doomed probe. Arc — shared by clones.
+    /// `Relaxed` ordering everywhere: a standalone set-once flag guarding
+    /// no dependent memory — stronger orderings would imply synchronization
+    /// that does not exist.
     native_downgraded: Arc<AtomicBool>,
 }
 
@@ -663,6 +666,10 @@ impl Agent {
                 // Tools stay in the request (Anthropic rejects tool-blocked
                 // threads without a `tools` param) — the nudge plus the
                 // unexecuted-ToolUse guard below enforce termination instead.
+                // With max_steps == 1 the nudge lands before any tool ran;
+                // that mirrors text mode exactly (its only step carries the
+                // no-tools final-answer instruction) — deliberate parity,
+                // not a bug.
                 thread.push(ChatMessage::user_text(
                     "No more tool calls — give the final answer based on the results above.",
                 ));
@@ -769,6 +776,11 @@ impl Agent {
                 None => "step limit reached; no final response generated.".to_string(),
             }
         } else {
+            if final_text.trim().is_empty() {
+                // Same propagation as always (both drivers, both protocols) —
+                // but an empty final is worth a diagnostic trail.
+                tracing::warn!(input, "solve produced an empty final answer");
+            }
             final_text
         };
         if fell_back && !sp.injected.is_empty() && had_tool_error {
@@ -1379,6 +1391,34 @@ mod tests {
         let out2 = agent.solve(&calc_ctx(), "q2", 3).await.unwrap();
         assert_eq!(out2, "second text answer");
         assert_eq!(calls_n.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn solve_native_midrun_unsupported_is_plain_model_error() {
+        // Side-effect safety invariant: NativeToolsUnsupported AFTER tools
+        // ran (step > 0) must surface as a plain Model error — never as the
+        // typed downgrade error — so auto mode cannot rerun executed tools.
+        let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+        let model = ThreadSeqModel::new(
+            vec![
+                ThreadSeqModel::reply(
+                    vec![ThreadSeqModel::use_block("t1", "calc", "1 + 1")],
+                    StopReason::ToolUse,
+                ),
+                ThreadStep::Unsupported("backend flipped mid-run".into()),
+            ],
+            &["text fallback must NOT be reached"],
+        );
+        let calls_n = model.thread_calls.clone();
+        let agent = Agent::new(Persona::new("Aria", "solver"), store, Arc::new(model));
+
+        let err = agent.solve(&calc_ctx(), "sum?", 4).await.unwrap_err();
+        assert!(matches!(err, LoreError::Model(_)), "got: {err}");
+        assert!(err.to_string().contains("mid-run"), "got: {err}");
+        // The downgrade latch must NOT be set: the next solve still probes
+        // native (two prior thread calls + one new).
+        let _ = agent.solve(&calc_ctx(), "again?", 2).await;
+        assert_eq!(calls_n.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

@@ -50,8 +50,12 @@ pub struct OpenAiModel {
 #[derive(Serialize, Deserialize)]
 struct ChatMessage {
     role: String,
+    /// `Option`: the real OpenAI API sends an explicit `"content": null`
+    /// (not `""`) on assistant messages that carry `tool_calls` —
+    /// `#[serde(default)]` on a bare `String` only covers a MISSING field
+    /// and fails on explicit null (review finding #1).
     #[serde(default)]
-    content: String,
+    content: Option<String>,
     /// Reasoning area of reasoning models (GLM-4.6, o-series alike).
     /// Never written to the request body; falls back to this when content is
     /// empty in the response.
@@ -88,7 +92,7 @@ impl ChatMessage {
     fn new(role: &str, content: String) -> Self {
         Self {
             role: role.into(),
-            content,
+            content: Some(content),
             reasoning_content: None,
             tool_calls: None,
         }
@@ -370,7 +374,7 @@ impl OpenAiModel {
 
         let mut blocks: Vec<ContentBlock> = Vec::new();
         let mut reasoning_fallback = false;
-        let content = strip_think(&msg.content);
+        let content = strip_think(msg.content.as_deref().unwrap_or(""));
         let calls = msg.tool_calls.unwrap_or_default();
         if content.trim().is_empty() && calls.is_empty() {
             if let Some(r) = msg.reasoning_content {
@@ -426,12 +430,21 @@ impl OpenAiModel {
     /// - strict compat proxies: `"unknown field"` for `tools`
     ///
     /// `pub(super)`: CodexModel shares the same classification.
-    pub(super) fn tools_unsupported(body: &str) -> bool {
+    ///
+    /// Status gate (review finding #2): pattern matching only applies to
+    /// 4xx client errors — a transient 5xx whose body happens to mention
+    /// tools must never latch a permanent downgrade. The one exception is
+    /// llama.cpp's `--jinja` marker, a permanent server-config condition
+    /// that some versions report as 500.
+    pub(super) fn tools_unsupported(status: reqwest::StatusCode, body: &str) -> bool {
         let b = body.to_lowercase();
-        if b.contains("does not support tools") {
+        if b.contains("--jinja") {
             return true;
         }
-        if b.contains("--jinja") {
+        if !status.is_client_error() {
+            return false;
+        }
+        if b.contains("does not support tools") {
             return true;
         }
         (b.contains("tools") || b.contains("tool_choice"))
@@ -464,7 +477,7 @@ impl OpenAiModel {
             .map(|c| c.message)
             .ok_or_else(|| LoreError::Model("empty 'choices' in response".into()))?;
         // Strip <think> blocks that reasoning models leak into content.
-        let content = strip_think(&msg.content);
+        let content = strip_think(msg.content.as_deref().unwrap_or(""));
         if content.trim().is_empty() {
             if let Some(r) = msg.reasoning_content {
                 let r = strip_think(&r);
@@ -669,7 +682,7 @@ impl Model for OpenAiModel {
             if !status.is_success() {
                 // Tool-incapable endpoint → typed error so `auto` mode can
                 // downgrade to the text protocol instead of failing the task.
-                if Self::tools_unsupported(&body) {
+                if Self::tools_unsupported(status, &body) {
                     return Err(LoreError::NativeToolsUnsupported(format!(
                         "{status}: {body}"
                     )));
@@ -954,29 +967,68 @@ mod tests {
 
     #[test]
     fn tools_unsupported_detection_matrix() {
+        use reqwest::StatusCode;
+        let bad = StatusCode::BAD_REQUEST;
         // ollama
         assert!(OpenAiModel::tools_unsupported(
+            bad,
             r#"{"error":{"message":"registry.ollama.ai/library/gemma3:4b does not support tools"}}"#
         ));
-        // llama.cpp server
+        // llama.cpp server — permanent config marker, matches even on 500.
         assert!(OpenAiModel::tools_unsupported(
+            StatusCode::INTERNAL_SERVER_ERROR,
             r#"{"error":"tools param requires --jinja flag"}"#
         ));
         // vLLM-style
         assert!(OpenAiModel::tools_unsupported(
+            bad,
             r#"{"error":"tool_choice option is unsupported on this server"}"#
         ));
         // strict proxy
         assert!(OpenAiModel::tools_unsupported(
+            bad,
             r#"{"error":"unknown field 'tools'"}"#
         ));
         // Unrelated 400s must NOT downgrade.
         assert!(!OpenAiModel::tools_unsupported(
+            bad,
             r#"{"error":"context length exceeded"}"#
         ));
         assert!(!OpenAiModel::tools_unsupported(
+            bad,
             r#"{"error":"invalid model name"}"#
         ));
+        // Transient 5xx that happens to mention tools must NOT latch a
+        // permanent downgrade (review finding #2).
+        assert!(!OpenAiModel::tools_unsupported(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":"tools backend temporarily not supported due to overload"}"#
+        ));
+        assert!(!OpenAiModel::tools_unsupported(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":"internal error in tools pipeline: unsupported state"}"#
+        ));
+    }
+
+    #[test]
+    fn parse_thread_accepts_explicit_null_content() {
+        // The REAL OpenAI API sends "content": null (not "") alongside
+        // tool_calls — regression for review finding #1.
+        let body = r#"{"choices":[{"finish_reason":"tool_calls","message":{
+            "role":"assistant","content":null,
+            "tool_calls":[{"id":"c1","type":"function",
+                "function":{"name":"calc","arguments":"{\"args\":\"1+1\"}"}}]}}]}"#;
+        let r = OpenAiModel::parse_thread_response(body).unwrap();
+        assert_eq!(r.stop, StopReason::ToolUse);
+        assert_eq!(r.tool_uses().len(), 1);
+        assert_eq!(r.text(), "");
+
+        // Plain-chat parse path tolerates it too.
+        let c = OpenAiModel::parse_response(
+            r#"{"choices":[{"message":{"role":"assistant","content":null}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.text, "");
     }
 
     #[tokio::test]
@@ -1082,11 +1134,11 @@ mod tests {
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].role, "system");
         assert_eq!(msgs[1].role, "user");
-        assert_eq!(msgs[1].content, "hello");
+        assert_eq!(msgs[1].content.as_deref(), Some("hello"));
         assert_eq!(msgs[2].role, "assistant");
-        assert_eq!(msgs[2].content, "hello to you too");
+        assert_eq!(msgs[2].content.as_deref(), Some("hello to you too"));
         assert_eq!(msgs[3].role, "user");
-        assert_eq!(msgs[3].content, "what did I say?");
+        assert_eq!(msgs[3].content.as_deref(), Some("what did I say?"));
     }
 
     #[test]
