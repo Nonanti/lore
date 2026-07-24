@@ -58,6 +58,35 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
   refusal, sandbox escape rejection, and a live agent (any
   OpenAI-compatible endpoint) writing + verifying files through the tools.
 
+### Added — next roadmap (post-review phases A–E)
+
+- **Task HTTP surface** — `POST/GET /tasks`, `GET /tasks/:id`,
+  `GET /tasks/:id/log`, `GET /inbox`, `POST /approvals/:id/approve|deny`
+  (all behind the API key). Compact list DTO omits reports; workspace
+  paths are relativised to the data dir; approval decisions are
+  idempotent (409 on re-decide, 404 on unknown). openapi.json synced.
+- **E2E harness** — real-binary daemon tests: task completion,
+  SIGKILL-during-task → restart → recovery sweep (proven, not assumed),
+  team decomposition path, bwrap smoke (skip-gated), distill golden-set.
+  Child processes are forced hermetic (`LORE_PROVIDER=mock`, LLM env
+  cleared), process-group cleanup, no fixed-sleep synchronization.
+- **Persona input sanitization** — `Persona::validate()` rejects control
+  chars/newlines/empty names on server create/patch, `Agent::from_json`
+  (disk loads), and PM roster building; speculative-persona validation
+  on PATCH (no partial mutation on rejection).
+- **Documentation sync** — README documents the full coworkers platform
+  (hands/policy, work loop, daemon+task CLI, team/PM, distillation,
+  sandbox, parallelism) with corrected endpoint tables; DESIGN.md gains
+  D11–D18 decision records and a current module map.
+
+### Changed
+
+- **axum 0.7 → 0.8** (`{id}` path syntax, Utf8Bytes WS, explicit body
+  limit), **rusqlite 0.32 → 0.33**, tokio-tungstenite 0.26.
+- **Module splits** — `task/mod.rs` → types + `store.rs` + `tests.rs`;
+  `agent/work.rs` → `work/mod.rs` + `work/tests.rs`. Public API paths
+  unchanged.
+
 ### Fixed — consolidated review hardening (4-way review, all findings verified)
 
 - **Shell policy**: newline (`\n`,`\r`) and redirect (`>`,`<`) added to the
