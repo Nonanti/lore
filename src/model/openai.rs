@@ -424,7 +424,9 @@ impl OpenAiModel {
     /// - vLLM without `--enable-auto-tool-choice`: 400 mentioning
     ///   `tool_choice`/tools being unsupported
     /// - strict compat proxies: `"unknown field"` for `tools`
-    fn tools_unsupported(body: &str) -> bool {
+    ///
+    /// `pub(super)`: CodexModel shares the same classification.
+    pub(super) fn tools_unsupported(body: &str) -> bool {
         let b = body.to_lowercase();
         if b.contains("does not support tools") {
             return true;

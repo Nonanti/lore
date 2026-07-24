@@ -189,7 +189,8 @@ to Lore — still no external service.
   own services), `file` (reading within the data-directory sandbox), `calc` (calculator).
 - **Native tool calling (protocol):** `solve` speaks each provider's native tool
   protocol — Anthropic `tool_use`/`tool_result` content blocks, OpenAI-compatible
-  `tool_calls` + `role:"tool"` messages — with structured JSON Schemas per tool, parallel
+  `tool_calls` + `role:"tool"` messages, Codex (ChatGPT subscription) Responses
+  `function_call` items — with structured JSON Schemas per tool, parallel
   calls in one step, and native error flags. Select with `tool_mode` (`auto` default ⁄
   `native` ⁄ `text`): per-agent in the model config, `--tool-mode` on `agent create`, or
   `LORE_TOOL_MODE`. In `auto`, tool-incapable endpoints (gemma, R1 distills, vLLM without

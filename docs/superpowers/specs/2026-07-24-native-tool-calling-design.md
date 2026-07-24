@@ -248,7 +248,38 @@ Conventional commits, one phase per commit minimum. 5× stress not required
 ## 8. Out of scope (explicit)
 
 - **Codex native** (Responses API `function_call` items) — follow-up phase.
+  *Addendum 2026-07-24: completed — see §9.*
 - **Streaming tool use** — enabled by this block model, not built now.
+  *Addendum 2026-07-24: deliberately deferred as decision D20 — no consumer
+  exists (chat streaming carries no tools; solve is batch). Building SSE
+  tool-use assembly without a consumer is dead code; the block model makes
+  it a bounded add when a consumer appears.*
 - **Thinking-block passthrough** (Anthropic `thinking` + tools) — blocks
-  remain ignored in parsing, as today.
-- **LlmRouter migration** — the router keeps using the text catalog.
+  remain ignored in parsing, as today. Correct while Lore never sends a
+  `thinking` parameter; if extended thinking is ever enabled alongside
+  tools, thinking blocks must round-trip in assistant messages.
+- **LlmRouter migration** — the router keeps using the text catalog (it
+  picks one tool for `act()`; it is not part of the tool-call protocol).
+
+## 9. Addendum (2026-07-24): Codex native follow-up — done
+
+Codex (Responses API over the ChatGPT subscription backend) now implements
+`complete_thread`:
+
+- Request: Responses `tools` entries are **flat** (`name`/`description`/
+  `parameters` at top level — no nested `function` object). Thread blocks
+  map to input items: Text → `message` (`input_text`⁄`output_text`),
+  ToolUse → `function_call` (arguments as a JSON string), ToolResult →
+  `function_call_output` correlated by `call_id`.
+- Response: completed calls are read from `response.output_item.done`
+  events (`function_call_arguments.delta` events are skipped — the done
+  item is the single source of truth); text via `output_text.delta` as
+  before. Same argument tolerance as chat completions (unparseable → raw
+  string, missing ids synthesized).
+- Unsupported classification is shared with `OpenAiModel` and applied
+  **only when the request carried tools**, so plain-chat 400s can never
+  masquerade as downgrades. `supports_native_tools = true`; the backend
+  remains live-unverified (as all of `codex.rs`), and `auto` mode
+  downgrades safely if the backend rejects tools.
+
+Mock remains text-only by design (deterministic test double).

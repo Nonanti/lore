@@ -105,7 +105,11 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
   `tool_calls` (JSON-string `arguments`), `role:"tool"` result messages;
   ollama ("does not support tools"), llama.cpp (`--jinja`), vLLM and
   strict-proxy errors are classified into the typed downgrade error.
-  Codex and Mock stay on the text protocol (Codex native is a follow-up).
+  **Codex native**: Responses `function_call`/`function_call_output`
+  items with flat tool entries; completed calls read from
+  `response.output_item.done`; unsupported classification shared with
+  OpenAI and applied only when the request carried tools. Mock stays
+  text-only by design.
 - **Tool schemas** — `Tool::input_schema` (default wraps `args_hint` as
   one required string arg; write/edit expose real schemas) +
   `Tool::args_from_input` (string / sole-object / structured / bare-string
