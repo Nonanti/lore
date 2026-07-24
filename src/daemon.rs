@@ -188,15 +188,18 @@ pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Resu
         WorkSpec::new(&task.goal, task.workspace.clone(), task.verify)?
     };
 
+    // (Hand-testing find: this line used to print the GOAL as the verify
+    // label — misleading when diagnosing failed verifies from the log.)
+    let verify_label = if spec.verify.is_empty() {
+        "(auto-detect)".to_string()
+    } else {
+        spec.verify.join(" && ")
+    };
     log.write_line(&format!(
         "[daemon] task {} running — workspace: {}, verify: {}",
         task.id,
         task.workspace.display(),
-        if spec.verify.is_empty() {
-            "(auto-detect)"
-        } else {
-            &task.goal
-        }
+        verify_label
     ));
 
     // Run the work loop. Errors from agent/model/policy are caught and
