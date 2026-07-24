@@ -308,6 +308,27 @@ impl TaskStore {
             .map_err(sqlite_err)
     }
 
+    /// Atomically claim the next Queued task: sets status to Running and
+    /// returns the full Task in a single SQL statement (RETURNING clause).
+    /// Under WAL mode, two concurrent claims on separate connections can
+    /// never claim the same task — one gets the task, the other gets `None`.
+    pub fn claim_next_queued(&self) -> Result<Option<Task>> {
+        let now = Utc::now().to_rfc3339();
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "UPDATE tasks SET status='Running', updated_at=?1
+                 WHERE id = (SELECT id FROM tasks WHERE status='Queued'
+                             ORDER BY created_at ASC, id ASC LIMIT 1)
+                   AND status='Queued'
+                 RETURNING id, agent, goal, workspace, verify, status, created_at, updated_at, report, parent_id",
+                params![now],
+                |r| self.read_task_row(r),
+            )
+            .optional()
+            .map_err(sqlite_err)
+    }
+
     /// Set task status (updates `updated_at`).
     pub fn set_status(&self, id: &str, status: TaskStatus) -> Result<()> {
         let now = Utc::now().to_rfc3339();
@@ -1403,5 +1424,74 @@ mod tests {
             !store.all_children_done(&parent.id).unwrap(),
             "WaitingApproval child means not all done"
         );
+    }
+
+    // ── claim_next_queued ────────────────────────────────────────────
+
+    #[test]
+    fn claim_next_queued_returns_none_when_empty() {
+        let store = TaskStore::in_memory().unwrap();
+        assert!(store.claim_next_queued().unwrap().is_none());
+    }
+
+    #[test]
+    fn claim_next_queued_fifo() {
+        let store = TaskStore::in_memory().unwrap();
+        let t1 = store.enqueue(new_task("a1", "first goal")).unwrap();
+        let t2 = store.enqueue(new_task("a2", "second goal")).unwrap();
+
+        let claimed = store.claim_next_queued().unwrap().unwrap();
+        assert_eq!(claimed.id, t1.id, "FIFO: first task claimed first");
+        assert_eq!(claimed.status, TaskStatus::Running, "status set to Running");
+
+        let claimed2 = store.claim_next_queued().unwrap().unwrap();
+        assert_eq!(claimed2.id, t2.id, "FIFO: second task claimed second");
+        assert_eq!(claimed2.status, TaskStatus::Running);
+
+        assert!(
+            store.claim_next_queued().unwrap().is_none(),
+            "no more tasks"
+        );
+    }
+
+    #[test]
+    fn claim_next_queued_atomic_double_claim_one_task() {
+        // Two connections, one task: first claim gets it, second gets None.
+        let db = TmpDb::new();
+        let conn1 = TaskStore::open(db.path()).unwrap();
+        let conn2 = TaskStore::open(db.path()).unwrap();
+
+        let t1 = conn1.enqueue(new_task("a", "only task")).unwrap();
+
+        let claimed = conn1.claim_next_queued().unwrap().unwrap();
+        assert_eq!(claimed.id, t1.id);
+
+        // conn2 tries to claim the same task — should get None.
+        let claimed2 = conn2.claim_next_queued().unwrap();
+        assert!(
+            claimed2.is_none(),
+            "second claim on same task must return None"
+        );
+    }
+
+    #[test]
+    fn claim_next_queued_atomic_two_tasks_two_connections() {
+        // Two connections, two tasks: both get different tasks (FIFO preserved).
+        let db = TmpDb::new();
+        let conn1 = TaskStore::open(db.path()).unwrap();
+        let conn2 = TaskStore::open(db.path()).unwrap();
+
+        let t1 = conn1.enqueue(new_task("a1", "first")).unwrap();
+        let t2 = conn1.enqueue(new_task("a2", "second")).unwrap();
+
+        let claimed1 = conn1.claim_next_queued().unwrap().unwrap();
+        assert_eq!(claimed1.id, t1.id, "first connection gets first task");
+
+        let claimed2 = conn2.claim_next_queued().unwrap().unwrap();
+        assert_eq!(claimed2.id, t2.id, "second connection gets second task");
+
+        // Neither can claim again.
+        assert!(conn1.claim_next_queued().unwrap().is_none());
+        assert!(conn2.claim_next_queued().unwrap().is_none());
     }
 }

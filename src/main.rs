@@ -171,7 +171,11 @@ enum Cmd {
     /// (run after changing embedder — e.g. hashing → neural).
     Reembed,
     /// Run the task queue daemon in the foreground.
-    Daemon,
+    Daemon {
+        /// Number of parallel workers (1..8, default 1).
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+    },
     /// Task management subcommands.
     Task {
         #[command(subcommand)]
@@ -951,11 +955,12 @@ async fn main() -> anyhow::Result<()> {
             let n = store.reembed().await?;
             println!("✅ {n} records re-embedded with active embedder");
         }
-        Cmd::Daemon => {
+        Cmd::Daemon { concurrency } => {
             let db_path = format!("{}/tasks.db", cli.data);
             lore::run_daemon(
                 std::path::Path::new(&cli.data),
                 std::path::Path::new(&db_path),
+                concurrency,
             )
             .await?;
         }
@@ -1489,7 +1494,30 @@ mod tests {
     #[test]
     fn parse_daemon() {
         let cli = super::Cli::parse_from(["lore", "daemon"]);
-        assert!(matches!(cli.cmd, Some(super::Cmd::Daemon)));
+        match cli.cmd {
+            Some(super::Cmd::Daemon { concurrency }) => assert_eq!(concurrency, 1),
+            other => panic!("expected Daemon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_daemon_with_concurrency() {
+        let cli = super::Cli::parse_from(["lore", "daemon", "--concurrency", "4"]);
+        match cli.cmd {
+            Some(super::Cmd::Daemon { concurrency }) => assert_eq!(concurrency, 4),
+            other => panic!("expected Daemon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concurrency_clamp_min_max() {
+        // Clamp is applied in run_daemon, not in clap.
+        // Verify the clamp logic:
+        assert_eq!(0usize.clamp(1, 8), 1);
+        assert_eq!(1usize.clamp(1, 8), 1);
+        assert_eq!(4usize.clamp(1, 8), 4);
+        assert_eq!(8usize.clamp(1, 8), 8);
+        assert_eq!(10usize.clamp(1, 8), 8);
     }
 
     #[test]

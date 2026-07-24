@@ -269,86 +269,147 @@ pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Resu
     Ok(report)
 }
 
-/// Daemon entry: sequential loop that dequeues and runs tasks.
-///
-/// Graceful shutdown on SIGTERM/SIGINT: marks the currently-running task
-/// back as Queued so it can be resumed later, then exits.
-pub async fn run_daemon(data_dir: &Path, db_path: &Path) -> Result<()> {
-    tracing::info!("daemon starting — data: {}", data_dir.display());
+/// Tracks in-flight tasks for same-workspace warnings and concurrency monitoring.
+/// Shared across all workers via `Arc<InFlightRegistry>`.
+struct InFlightRegistry {
+    tasks: std::sync::Mutex<Vec<(String, PathBuf)>>,
+    peak: std::sync::atomic::AtomicUsize,
+}
 
-    let store = TaskStore::open(db_path)?;
-    let model = build_model_from_env(data_dir)?;
-
-    // Crash recovery: sweep orphaned tasks left from a previous crash
-    // or kill. Resets Running/WaitingApproval → Queued and denies
-    // stale Pending approvals.
-    let recovered = store.recover_orphaned()?;
-    if recovered > 0 {
-        tracing::info!(
-            count = recovered,
-            "re-queued orphaned tasks from previous run"
-        );
+impl InFlightRegistry {
+    fn new() -> Self {
+        Self {
+            tasks: std::sync::Mutex::new(Vec::new()),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
+    /// Register a task as in-flight. Returns the id of an existing task
+    /// sharing the same workspace (for the `tracing::warn`), or `None`.
+    fn add(&self, task_id: &str, workspace: PathBuf) -> Option<String> {
+        let mut tasks = self.tasks.lock().unwrap();
+        let same_ws = tasks.iter().find(|(_, ws)| ws == &workspace);
+        let warning_id = same_ws.map(|(id, _)| id.clone());
+        tasks.push((task_id.to_string(), workspace));
+        let size = tasks.len();
+        // Track peak concurrency.
+        let mut p = self.peak.load(std::sync::atomic::Ordering::Relaxed);
+        while size > p {
+            match self.peak.compare_exchange(
+                p,
+                size,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(old) => p = old,
+            }
+        }
+        warning_id
+    }
+
+    /// Remove a task from the in-flight registry.
+    fn remove(&self, task_id: &str) {
+        self.tasks.lock().unwrap().retain(|(id, _)| id != task_id);
+    }
+
+    /// Peak number of tasks that were in-flight simultaneously.
+    #[allow(dead_code)] // Used in tests.
+    pub(crate) fn peak(&self) -> usize {
+        self.peak.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Single worker loop: claim → run → repeat. Each worker owns its own
+/// `TaskStore` connection (WAL permits concurrent access).
+async fn worker_loop(
+    worker_id: usize,
+    data_dir: PathBuf,
+    db_path: PathBuf,
+    model: Arc<dyn Model>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    in_flight: Arc<InFlightRegistry>,
+) -> Result<()> {
+    let store = TaskStore::open(&db_path)?;
     let deps = TaskDeps {
-        data_dir: data_dir.to_path_buf(),
+        data_dir,
         model,
-        db_path: db_path.to_path_buf(),
+        db_path,
     };
 
-    // C-1 recovery: finalize stuck WaitingSubtasks parents whose children
-    // are all terminal (crash left parent waiting with no active children).
-    let _stuck_recovered = recover_stuck_parents(&store, &deps).await?;
-
-    // Graceful shutdown: listen for SIGTERM/SIGINT.
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let shutdown_task = tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        tracing::info!("shutdown signal received — finishing current task");
-        let _ = shutdown_tx.send(()).await;
-    });
+    tracing::info!(worker_id, "worker started");
 
     loop {
-        // Check for shutdown before polling.
-        if shutdown_rx.try_recv().is_ok() {
-            tracing::info!("daemon exiting (idle, no mid-run task)");
-            break;
+        // Check shutdown before claiming.
+        if *shutdown_rx.borrow() {
+            tracing::info!(worker_id, "worker exiting (shutdown, idle)");
+            return Ok(());
         }
 
-        // Poll for next queued task.
-        let task = store.next_queued()?;
+        // Atomic claim: sets status to Running + returns the task.
+        let task = store.claim_next_queued()?;
         if task.is_none() {
-            tokio::time::sleep(Duration::from_secs(IDLE_POLL_SECS)).await;
+            // Wait: either a new task appears or shutdown signal.
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(IDLE_POLL_SECS)) => {},
+                _ = shutdown_rx.changed() => {
+                    tracing::info!(worker_id, "worker exiting (shutdown while idle)");
+                    return Ok(());
+                }
+            }
             continue;
         }
 
         let task = task.expect("checked above");
-        tracing::info!(task_id = %task.id, agent = %task.agent, "dequeued task");
-        store.set_status(&task.id, TaskStatus::Running)?;
+        tracing::info!(worker_id, task_id = %task.id, agent = %task.agent, "claimed task");
 
-        // Team task: PM agent decomposes goal into subtasks (not run_task).
+        // Register in-flight + same-workspace check.
+        if let Some(existing_id) = in_flight.add(&task.id, task.workspace.clone()) {
+            tracing::warn!(
+                worker_id,
+                task_id = %task.id,
+                workspace = %task.workspace.display(),
+                existing_task_id = %existing_id,
+                "same workspace as another in-flight task — proceeding with caution"
+            );
+        }
+
+        // Team task: PM agent decomposes goal into subtasks.
         let is_team = task.agent == "pm";
         if is_team {
-            let result = decompose_team_task(&store, &task.id, &deps).await;
-            if let Err(e) = &result {
-                // decompose_team_task already records failures.
-                tracing::error!(task_id = %task.id, error = %e, "PM decomposition failed — daemon continues");
-            }
-        } else {
-            // Regular task: run_task, with shutdown-awareness.
             let result = tokio::select! {
-                r = run_task(&store, &task.id, &deps) => r,
-                _ = shutdown_rx.recv() => {
-                    tracing::warn!(task_id = %task.id, "shutdown mid-run — re-queuing task + denying stale approvals");
+                r = decompose_team_task(&store, &task.id, &deps) => r,
+                _ = shutdown_rx.changed() => {
+                    tracing::warn!(worker_id, task_id = %task.id, "shutdown mid-run (team) — re-queuing");
                     store.set_status(&task.id, TaskStatus::Queued)?;
                     store.deny_pending_approvals_for_task(&task.id)?;
-                    break;
+                    in_flight.remove(&task.id);
+                    return Ok(());
                 }
             };
+            if let Err(e) = &result {
+                tracing::error!(worker_id, task_id = %task.id, error = %e, "PM decomposition failed");
+            }
+        } else {
+            // Regular task.
+            let result = tokio::select! {
+                r = run_task(&store, &task.id, &deps) => r,
+                _ = shutdown_rx.changed() => {
+                    tracing::warn!(worker_id, task_id = %task.id, "shutdown mid-run — re-queuing");
+                    store.set_status(&task.id, TaskStatus::Queued)?;
+                    store.deny_pending_approvals_for_task(&task.id)?;
+                    in_flight.remove(&task.id);
+                    return Ok(());
+                }
+            };
+
+            // Remove from in-flight registry.
+            in_flight.remove(&task.id);
 
             match result {
                 Ok(report) => {
                     tracing::info!(
+                        worker_id,
                         task_id = %task.id,
                         success = report.success,
                         iterations = report.iterations,
@@ -356,8 +417,7 @@ pub async fn run_daemon(data_dir: &Path, db_path: &Path) -> Result<()> {
                     );
                 }
                 Err(e) => {
-                    // run_task already records failures (persona missing, etc.)
-                    // in the task store. If it failed before recording, do it now.
+                    // run_task already records failures; catch residual.
                     if store
                         .get(&task.id)?
                         .is_none_or(|t| t.status != TaskStatus::Failed)
@@ -370,7 +430,7 @@ pub async fn run_daemon(data_dir: &Path, db_path: &Path) -> Result<()> {
                         })?;
                         store.fail(&task.id, &report_json)?;
                     }
-                    tracing::error!(task_id = %task.id, error = %e, "task failed — daemon continues");
+                    tracing::error!(worker_id, task_id = %task.id, error = %e, "task failed — worker continues");
                 }
             }
         }
@@ -378,15 +438,88 @@ pub async fn run_daemon(data_dir: &Path, db_path: &Path) -> Result<()> {
         // After any task completion/failure, check parent.
         if let Ok(completed) = maybe_complete_parent(&store, &task.id, &deps).await {
             if completed {
-                tracing::info!(
-                    child_task_id = %task.id,
-                    "parent task finalized"
-                );
+                tracing::info!(worker_id, child_task_id = %task.id, "parent task finalized");
             }
         }
     }
+}
 
-    shutdown_task.abort();
+/// Daemon entry: spawns N worker loops, broadcasts shutdown via
+/// `tokio::sync::watch`, and joins all workers on ctrl_c.
+///
+/// `concurrency` is clamped to 1..=8. Recovery sweeps run once at
+/// startup before workers spawn.
+pub async fn run_daemon(data_dir: &Path, db_path: &Path, concurrency: usize) -> Result<()> {
+    let concurrency = concurrency.clamp(1, 8);
+    tracing::info!(
+        concurrency,
+        "daemon starting — data: {}",
+        data_dir.display()
+    );
+
+    // Startup: open store for recovery sweeps.
+    let store = TaskStore::open(db_path)?;
+
+    // Crash recovery: sweep orphaned tasks left from a previous crash
+    // or kill. Resets Running/WaitingApproval → Queued and denies
+    // stale Pending approvals.
+    let recovered = store.recover_orphaned()?;
+    if recovered > 0 {
+        tracing::info!(
+            count = recovered,
+            "re-queued orphaned tasks from previous run"
+        );
+    }
+
+    let model = build_model_from_env(data_dir)?;
+
+    let deps = TaskDeps {
+        data_dir: data_dir.to_path_buf(),
+        model: model.clone(),
+        db_path: db_path.to_path_buf(),
+    };
+
+    // C-1 recovery: finalize stuck WaitingSubtasks parents whose children
+    // are all terminal (crash left parent waiting with no active children).
+    let _stuck_recovered = recover_stuck_parents(&store, &deps).await?;
+
+    // Shutdown channel: ctrl_c sets true, workers check via watch::Receiver.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // In-flight registry for same-workspace warnings.
+    let in_flight = Arc::new(InFlightRegistry::new());
+
+    // Spawn workers (each owns its own TaskStore connection).
+    let mut worker_threads = Vec::new();
+    for i in 0..concurrency {
+        let rx = shutdown_rx.clone();
+        let inf = in_flight.clone();
+        let m = model.clone();
+        let dd = data_dir.to_path_buf();
+        let dp = db_path.to_path_buf();
+        worker_threads.push(std::thread::spawn(move || {
+            let worker_rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("worker runtime init");
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&worker_rt, worker_loop(i, dd, dp, m, rx, inf))
+        }));
+    }
+
+    // Wait for ctrl_c → broadcast shutdown → join all workers.
+    tokio::signal::ctrl_c().await.ok();
+    tracing::info!("shutdown signal received — finishing current tasks");
+    shutdown_tx.send(true).ok();
+
+    for t in worker_threads {
+        match t.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(error = %e, "worker error"),
+            Err(_) => tracing::error!("worker thread panicked"),
+        }
+    }
+
     tracing::info!("daemon stopped");
     Ok(())
 }
@@ -1795,6 +1928,262 @@ mod tests {
             log_content.contains("distilled 1 memories"),
             "log should record failure-lesson distillation: {log_content}"
         );
+
+        cleanup(&workspace);
+    }
+
+    // ── Parallel execution: concurrency=3 overlap ────────────────────
+
+    /// Model that tracks concurrent calls and sleeps briefly to force overlap.
+    struct CountingModel {
+        concurrent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl CountingModel {
+        fn new(
+            concurrent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            delay: Duration,
+        ) -> Self {
+            Self {
+                concurrent,
+                peak,
+                delay,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Model for CountingModel {
+        async fn complete(&self, _p: &Prompt) -> crate::error::Result<Completion> {
+            let c = self
+                .concurrent
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let mut p = self.peak.load(std::sync::atomic::Ordering::SeqCst);
+            while c > p {
+                match self.peak.compare_exchange(
+                    p,
+                    c,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(old) => p = old,
+                }
+            }
+            tokio::time::sleep(self.delay).await;
+            self.concurrent
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Completion::new(
+                "Task completed successfully. All verification commands passed.",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrency_3_processes_3_tasks_with_overlap() {
+        let db = TmpDb::new("parallel-3");
+        let workspace = make_temp_dir("parallel-3-ws");
+
+        save_persona(db.data_dir(), "parbot");
+        save_permissive_policy(db.data_dir());
+
+        let store = TaskStore::open(db.path()).unwrap();
+
+        let concurrent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Delay ensures overlap: 3 workers, 200ms per model call.
+        let model = std::sync::Arc::new(CountingModel::new(
+            concurrent.clone(),
+            peak.clone(),
+            Duration::from_millis(200),
+        ));
+
+        // Enqueue 3 tasks.
+        for i in 0..3 {
+            store
+                .enqueue(NewTask {
+                    agent: "parbot".to_string(),
+                    goal: format!("task {i}"),
+                    workspace: workspace.clone(),
+                    verify: vec!["exit 0".to_string()],
+                    parent_id: None,
+                })
+                .unwrap();
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let in_flight = std::sync::Arc::new(InFlightRegistry::new());
+
+        let mut worker_threads = Vec::new();
+        for i in 0..3 {
+            let rx = shutdown_rx.clone();
+            let inf = in_flight.clone();
+            let m = model.clone();
+            let dd = db.data_dir().to_path_buf();
+            let dp = db.path().to_path_buf();
+            worker_threads.push(std::thread::spawn(move || {
+                let worker_rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("worker runtime init");
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&worker_rt, worker_loop(i, dd, dp, m, rx, inf))
+            }));
+        }
+
+        // Wait for all tasks to complete (generous timeout).
+        let start = std::time::Instant::now();
+        loop {
+            let tasks = store.list(100).unwrap();
+            let all_done = tasks
+                .iter()
+                .all(|t| t.status == TaskStatus::Completed || t.status == TaskStatus::Failed);
+            if all_done {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(30) {
+                panic!("timeout waiting for tasks to complete");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // Verify all completed.
+        let tasks = store.list(100).unwrap();
+        assert_eq!(tasks.len(), 3);
+        for t in &tasks {
+            assert_eq!(
+                t.status,
+                TaskStatus::Completed,
+                "task {} should be Completed",
+                t.id
+            );
+        }
+
+        // Verify overlap: peak concurrent model calls >= 2.
+        // With 3 workers and 200ms delay, at least 2 overlap is expected.
+        let peak_val = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak_val >= 2,
+            "at least 2 tasks ran concurrently (peak={peak_val})"
+        );
+
+        // Shutdown workers.
+        shutdown_tx.send(true).unwrap();
+        for t in worker_threads {
+            t.join().unwrap().unwrap();
+        }
+
+        cleanup(&workspace);
+    }
+
+    // ── Shutdown: watch channel re-queues in-flight ──────────────────────
+
+    /// Model that blocks until a signal is sent (simulates long-running task).
+    struct BlockUntilSignalModel {
+        unblock: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for BlockUntilSignalModel {
+        async fn complete(&self, _p: &Prompt) -> crate::error::Result<Completion> {
+            while !self.unblock.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(Completion::new("done after signal"))
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_watch_requeues_inflight_and_workers_join() {
+        let db = TmpDb::new("shutdown-requeue");
+        let workspace = make_temp_dir("shutdown-requeue-ws");
+
+        save_persona(db.data_dir(), "blockbot");
+        save_permissive_policy(db.data_dir());
+
+        let store = TaskStore::open(db.path()).unwrap();
+
+        let unblock = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let model = std::sync::Arc::new(BlockUntilSignalModel {
+            unblock: unblock.clone(),
+        });
+
+        // Enqueue one task that blocks until we unblock it.
+        let task = store
+            .enqueue(NewTask {
+                agent: "blockbot".to_string(),
+                goal: "blocking task".to_string(),
+                workspace: workspace.clone(),
+                verify: vec!["exit 0".to_string()],
+                parent_id: None,
+            })
+            .unwrap();
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let in_flight = std::sync::Arc::new(InFlightRegistry::new());
+
+        let rx = shutdown_rx.clone();
+        let inf = in_flight.clone();
+        let m = model.clone();
+        let dd = db.data_dir().to_path_buf();
+        let dp = db.path().to_path_buf();
+        let worker_thread = std::thread::spawn(move || {
+            let worker_rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("worker runtime init");
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&worker_rt, worker_loop(0, dd, dp, m, rx, inf))
+        });
+
+        // Wait for the task to be claimed (task status → Running).
+        let start = std::time::Instant::now();
+        loop {
+            let loaded = store.get(&task.id).unwrap().unwrap();
+            if loaded.status == TaskStatus::Running {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("timeout waiting for task to be claimed");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Task is now in-flight and blocked. Send shutdown signal.
+        shutdown_tx.send(true).unwrap();
+
+        // Wait briefly for the worker to re-queue the task.
+        let start = std::time::Instant::now();
+        loop {
+            let loaded = store.get(&task.id).unwrap().unwrap();
+            if loaded.status == TaskStatus::Queued {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("timeout waiting for task to be re-queued");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Verify worker thread joined successfully.
+        let result = worker_thread.join().unwrap();
+        assert!(result.is_ok(), "worker should exit cleanly");
+
+        // Task is now Queued again (re-queued on shutdown).
+        let loaded = store.get(&task.id).unwrap().unwrap();
+        assert_eq!(
+            loaded.status,
+            TaskStatus::Queued,
+            "task re-queued after shutdown"
+        );
+
+        // Unblocking the model is not needed since the worker exited
+        // (the tokio::select! dropped the run_task future).
+        unblock.store(true, std::sync::atomic::Ordering::SeqCst);
 
         cleanup(&workspace);
     }
