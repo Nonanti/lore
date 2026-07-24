@@ -14,7 +14,7 @@ pub use fs_write::{FileEditTool, FileWriteTool};
 pub use shell::ShellTool;
 
 use crate::error::Result;
-use crate::model::{Model, Prompt};
+use crate::model::{Model, Prompt, ToolSpec};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -32,6 +32,44 @@ pub trait Tool: Send + Sync {
     /// comma-separated args) — see §5.1.
     fn args_hint(&self) -> &str {
         ""
+    }
+    /// JSON Schema describing native tool-call input. Default: one required
+    /// string property `args` (described by `args_hint`, falling back to
+    /// `description`) — every string-args tool is natively callable with
+    /// zero changes. Structured tools (write/edit) override with their
+    /// real schema.
+    fn input_schema(&self) -> serde_json::Value {
+        let desc = if self.args_hint().is_empty() {
+            self.description()
+        } else {
+            self.args_hint()
+        };
+        serde_json::json!({
+            "type": "object",
+            "properties": { "args": { "type": "string", "description": desc } },
+            "required": ["args"]
+        })
+    }
+    /// Converts native tool-use `input` to the args string [`Tool::run`]
+    /// expects. Default handles every shape a model emits:
+    /// - bare string input → passed through (OpenAI unparseable-arguments
+    ///   fallback arrives this way),
+    /// - `{"args": "..."}` → unwrapped (default schema),
+    /// - a sole non-string `args` value → that value serialized (models
+    ///   sometimes nest objects there — same tolerance as `parse_tool_call`),
+    /// - anything else → the whole object serialized (structured tools'
+    ///   `run` parses that JSON, the text-protocol convention).
+    fn args_from_input(&self, input: &serde_json::Value) -> String {
+        if let serde_json::Value::String(s) = input {
+            return s.clone();
+        }
+        match input.get("args") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) if input.as_object().is_some_and(|o| o.len() == 1) => {
+                serde_json::to_string(other).unwrap_or_default()
+            }
+            _ => serde_json::to_string(input).unwrap_or_default(),
+        }
     }
     /// Runs the tool with the given arguments.
     async fn run(&self, args: &str) -> Result<String>;
@@ -57,6 +95,22 @@ pub fn catalog(tools: &ToolRegistry) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Native tool specs: sorted by name (deterministic), built from the same
+/// registry as [`catalog`] — the two views cannot drift.
+pub fn tool_specs(tools: &ToolRegistry) -> Vec<ToolSpec> {
+    let mut names = tools.names();
+    names.sort();
+    names
+        .iter()
+        .filter_map(|n| tools.get(n))
+        .map(|t| ToolSpec {
+            name: t.name().to_string(),
+            description: t.description().to_string(),
+            input_schema: t.input_schema(),
+        })
+        .collect()
 }
 
 /// A tool call (which tool, which arguments).
@@ -240,6 +294,66 @@ pub struct ToolContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_input_schema_wraps_args_hint() {
+        let calc = CalcTool::new();
+        let s = calc.input_schema();
+        assert_eq!(s["type"], "object");
+        assert_eq!(s["properties"]["args"]["type"], "string");
+        assert_eq!(s["required"], serde_json::json!(["args"]));
+        // args_hint present → used as the description.
+        let desc = s["properties"]["args"]["description"].as_str().unwrap();
+        assert_eq!(desc, calc.args_hint());
+    }
+
+    #[test]
+    fn args_from_input_handles_every_model_shape() {
+        let t = CalcTool::new();
+        // Default schema: {"args": "..."} unwraps.
+        assert_eq!(
+            t.args_from_input(&serde_json::json!({"args": "2+2"})),
+            "2+2"
+        );
+        // Sole non-string args → that value serialized.
+        assert_eq!(
+            t.args_from_input(&serde_json::json!({"args": {"path": "a.py"}})),
+            r#"{"path":"a.py"}"#
+        );
+        // Structured object without "args" → whole object serialized.
+        let s = t.args_from_input(&serde_json::json!({"path": "a.py", "content": "x"}));
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["path"], "a.py");
+        assert_eq!(v["content"], "x");
+        // args alongside other keys → whole object (args is a real field).
+        let s2 = t.args_from_input(&serde_json::json!({"args": 1, "x": 2}));
+        let v2: serde_json::Value = serde_json::from_str(&s2).unwrap();
+        assert_eq!(v2["args"], 1);
+        // Bare string input (OpenAI unparseable-arguments fallback) → as-is.
+        assert_eq!(
+            t.args_from_input(&serde_json::Value::String("raw text".into())),
+            "raw text"
+        );
+    }
+
+    #[test]
+    fn tool_specs_sorted_and_share_registry_with_catalog() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(builtin::TimeTool::new()));
+        reg.register(Arc::new(CalcTool::new()));
+        let specs = tool_specs(&reg);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["calc", "time"], "sorted by name");
+        assert!(!specs[0].description.is_empty());
+        assert_eq!(specs[0].input_schema["type"], "object");
+        // Same registry view as the text catalog: identical name set/order.
+        let cat = catalog(&reg);
+        let cat_names: Vec<&str> = cat
+            .lines()
+            .map(|l| l.trim_start_matches("- ").split(':').next().unwrap())
+            .collect();
+        assert_eq!(cat_names, names);
+    }
 
     #[tokio::test]
     async fn keyword_router_matches_and_misses() {

@@ -25,6 +25,12 @@ pub enum LoreError {
     #[error("model error: {0}")]
     Model(String),
 
+    /// Provider/endpoint cannot do native tool calling (e.g. ollama's
+    /// "does not support tools" 400, or a provider without an override).
+    /// Drives the `auto` tool-mode downgrade to the text protocol.
+    #[error("native tool calling unsupported: {0}")]
+    NativeToolsUnsupported(String),
+
     /// Storage error (sqlite, etc.).
     #[error("storage error: {0}")]
     Storage(String),

@@ -79,6 +79,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_complete_thread_is_native_tools_unsupported() {
+        use crate::error::LoreError;
+        use crate::model::Thread;
+        let m = MockModel::new();
+        assert!(!m.supports_native_tools());
+        let err = m
+            .complete_thread(&Thread::new("sys"), &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, LoreError::NativeToolsUnsupported(_)),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn context_is_reflected_in_reply() {
         let m = MockModel::new();
         let p = Prompt {

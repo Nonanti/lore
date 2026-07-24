@@ -152,6 +152,17 @@ impl Tool for FileWriteTool {
         r#"JSON {"path":"relative/path","content":"file content"}"#
     }
 
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "relative file path inside the workspace" },
+                "content": { "type": "string", "description": "full file content to write" }
+            },
+            "required": ["path", "content"]
+        })
+    }
+
     async fn run(&self, args: &str) -> Result<String> {
         let wa: WriteArgs = serde_json::from_str(args).map_err(|e| {
             LoreError::InvalidInput(format!(
@@ -227,6 +238,18 @@ impl Tool for FileEditTool {
         r#"JSON {"path":"relative/path","old":"exact text","new":"replacement"}"#
     }
 
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "relative file path inside the workspace" },
+                "old": { "type": "string", "description": "exact existing text — must occur exactly once" },
+                "new": { "type": "string", "description": "replacement text" }
+            },
+            "required": ["path", "old", "new"]
+        })
+    }
+
     async fn run(&self, args: &str) -> Result<String> {
         let ea: EditArgs = serde_json::from_str(args).map_err(|e| {
             LoreError::InvalidInput(format!(
@@ -292,6 +315,23 @@ mod tests {
     use crate::policy::{DefaultExec, Policy, SandboxMode};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[test]
+    fn write_and_edit_expose_real_schemas() {
+        let dir = std::env::temp_dir();
+        let w = FileWriteTool::new(allow_gate(dir.clone()), dir.clone());
+        let ws = w.input_schema();
+        assert_eq!(ws["required"], serde_json::json!(["path", "content"]));
+        assert_eq!(ws["properties"]["path"]["type"], "string");
+
+        let e = FileEditTool::new(allow_gate(dir.clone()), dir);
+        let es = e.input_schema();
+        assert_eq!(es["required"], serde_json::json!(["path", "old", "new"]));
+        // Native input object → args string that run() parses (round-trip).
+        let args = e.args_from_input(&serde_json::json!({"path": "a.py", "old": "x", "new": "y"}));
+        let parsed: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(parsed["old"], "x");
+    }
 
     fn allow_gate(root: PathBuf) -> Arc<Gate> {
         let p = Policy {

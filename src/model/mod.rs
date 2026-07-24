@@ -9,14 +9,18 @@ mod codex;
 mod factory;
 mod mock;
 mod openai;
+mod thread;
 
 pub use anthropic::{AnthropicAuth, AnthropicModel};
 pub use codex::CodexModel;
 pub use factory::{build_model, build_model_from_env, AuthKind, ModelConfig, ProviderKind};
 pub use mock::MockModel;
 pub use openai::OpenAiModel;
+pub use thread::{
+    ChatMessage, ChatRole, ContentBlock, StopReason, Thread, ThreadReply, ToolSpec, ToolUseRef,
+};
 
-use crate::error::Result;
+use crate::error::{LoreError, Result};
 use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -152,5 +156,22 @@ pub trait Model: Send + Sync {
     async fn complete_stream(&self, prompt: &Prompt) -> Result<TokenStream> {
         let c = self.complete(prompt).await?;
         Ok(Box::pin(futures::stream::iter(vec![Ok(c.text)])))
+    }
+
+    /// Completes a structured conversation with native tool calling.
+    /// Providers with a native tool API override this. Default:
+    /// [`LoreError::NativeToolsUnsupported`] — the solve loop routes
+    /// text-only models through the flat-prompt text protocol instead.
+    async fn complete_thread(&self, _thread: &Thread, _tools: &[ToolSpec]) -> Result<ThreadReply> {
+        Err(LoreError::NativeToolsUnsupported(
+            "provider has no native tool support".into(),
+        ))
+    }
+
+    /// Whether [`Model::complete_thread`] has a native implementation.
+    /// `auto` tool mode probes this before spending a roundtrip on a
+    /// provider that can never succeed (Mock, Codex for now).
+    fn supports_native_tools(&self) -> bool {
+        false
     }
 }
