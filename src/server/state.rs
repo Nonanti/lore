@@ -528,6 +528,14 @@ impl AppState {
             ));
         }
         let persona = Persona::new(name, role).with_traits(traits);
+        // Sanitize: reject control chars / newlines in structural fields.
+        let bad = persona.validate();
+        if !bad.is_empty() {
+            return Err(LoreError::InvalidInput(format!(
+                "invalid persona fields: {}",
+                bad.join(", ")
+            )));
+        }
         let agent = Agent::new(persona, self.inner.store.clone(), self.inner.model.clone());
         // Cap check + insert under the same write lock: no race can exceed the cap.
         // Check BEFORE persist — a rejected agent must not leave a file behind.
@@ -728,6 +736,12 @@ impl AppState {
                 changed = true;
             }
             if changed {
+                // Sanitize: reject control chars / newlines in structural fields.
+                let bad = agent.persona.validate();
+                if !bad.is_empty() {
+                    let msg = format!("invalid persona fields: {}", bad.join(", "));
+                    return Err(LoreError::InvalidInput(msg));
+                }
                 agent.persona.version += 1;
             }
             (agent.clone(), changed)
