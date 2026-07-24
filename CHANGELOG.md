@@ -79,6 +79,40 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
   sandbox, parallelism) with corrected endpoint tables; DESIGN.md gains
   D11–D18 decision records and a current module map.
 
+### Added — native tool calling (spec: `2026-07-24-native-tool-calling-design.md`)
+
+- **Thread protocol as the core** — new `model/thread.rs`
+  (`Thread`/`ChatMessage`/`ContentBlock`/`ToolSpec`/`ThreadReply`): the
+  provider-neutral message/block model every provider tool API is built
+  from; `Model::complete_thread` + `supports_native_tools` probe
+  (default: text-only, typed `NativeToolsUnsupported` error).
+- **Native solve driver** — `solve` dispatches by mode into two drivers
+  sharing one epilogue: text (the pre-native loop, byte-for-byte
+  behavior) and native (assistant `tool_use` blocks answered by
+  correlated user `tool_result` blocks; parallel calls in one step;
+  `is_error` flags; last-step nudge with an unexecuted-ToolUse guard so
+  raw blocks never leak). Learned procedures keep the same `tool: args`
+  shape in both modes — procedural memories stay interchangeable.
+- **`tool_mode` config: `auto` (default) | `native` | `text`** — in
+  `ModelConfig` (old config files load unchanged), `LORE_TOOL_MODE` env,
+  `--tool-mode` on `agent create`, `with_tool_mode` builder. `auto`
+  probes the provider and downgrades per-agent on unsupported-tools
+  errors (only reachable from step 0, so a downgrade rerun can never
+  repeat tool side effects), then latches.
+- **Anthropic native**: thread blocks map 1:1 onto Messages content
+  blocks, tools carry JSON Schemas as `input_schema`, OAuth Claude-Code
+  identity prefix preserved. **OpenAI/compat native**: assistant
+  `tool_calls` (JSON-string `arguments`), `role:"tool"` result messages;
+  ollama ("does not support tools"), llama.cpp (`--jinja`), vLLM and
+  strict-proxy errors are classified into the typed downgrade error.
+  Codex and Mock stay on the text protocol (Codex native is a follow-up).
+- **Tool schemas** — `Tool::input_schema` (default wraps `args_hint` as
+  one required string arg; write/edit expose real schemas) +
+  `Tool::args_from_input` (string / sole-object / structured / bare-string
+  tolerance) keep `run(&str)` signatures untouched. 30+ new tests across
+  thread types, both providers, and all three modes; 1 new live-LLM
+  ignored smoke test.
+
 ### Changed
 
 - **axum 0.7 → 0.8** (`{id}` path syntax, Utf8Bytes WS, explicit body

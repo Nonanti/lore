@@ -187,6 +187,14 @@ to Lore — still no external service.
 - **Native tools:** `time` (UTC), `web` (http GET, capped at 64KB, **SSRF-protected** —
   private/loopback addresses blocked by default; use `LORE_WEB_ALLOW_PRIVATE=1` for your
   own services), `file` (reading within the data-directory sandbox), `calc` (calculator).
+- **Native tool calling (protocol):** `solve` speaks each provider's native tool
+  protocol — Anthropic `tool_use`/`tool_result` content blocks, OpenAI-compatible
+  `tool_calls` + `role:"tool"` messages — with structured JSON Schemas per tool, parallel
+  calls in one step, and native error flags. Select with `tool_mode` (`auto` default ⁄
+  `native` ⁄ `text`): per-agent in the model config, `--tool-mode` on `agent create`, or
+  `LORE_TOOL_MODE`. In `auto`, tool-incapable endpoints (gemma, R1 distills, vLLM without
+  a tool parser…) are detected at runtime and the agent falls back to the text-JSON
+  protocol — nothing breaks, it just downgrades once and remembers.
 - **Agent cap:** `LORE_MAX_AGENTS` (default 1024) — a fan-out DoS brake.
 
 Neural embedder (optional): `cargo build --features neural` + `LORE_EMBEDDER=neural` →

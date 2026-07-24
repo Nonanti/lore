@@ -5,7 +5,7 @@
 > not tied to any external service or API; the memory engine is written from scratch in
 > native Rust, inside Lore (“Alaz from zero”).
 
-> **Status (570 tests passing + 1 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅ + Phase E hardening ✅ + Phase E review hardening ✅. Next roadmap: `docs/superpowers/specs/2026-07-24-next-roadmap.md`.
+> **Status (602 tests passing + 2 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅ + Phase E hardening ✅ + Phase E review hardening ✅ + native tool calling ✅ (`docs/superpowers/specs/2026-07-24-native-tool-calling-design.md`).
 
 This document captures the design decisions and phased roadmap made after research
 (the 2026 “Memory in the Age of AI Agents” survey + Alaz's current architecture).
@@ -115,6 +115,7 @@ Rust ecosystem (local, lightweight stack):
 | D16 | Sandbox: `Policy.sandbox_exec` (bubblewrap: `--ro-bind / /`, workspace rw, `--die-with-parent`) — `Off`/`IfAvailable`/`Required` | `Required` without bwrap fails closed; argv-built, never string-joined. Opt-in: the default build runs plain |
 | D17 | Parallel daemon: `lore daemon --concurrency N` — atomic `claim_next_queued` (`UPDATE…RETURNING`), per-worker connections, graceful shutdown with in-flight re-queue | Two workers can never take the same task. Team finalization is compare-and-swap; reviewer child enqueue via atomic `INSERT…WHERE NOT EXISTS` |
 | D18 | Orchestrator is a lib-API for embedded/demo use, not the production routing layer. Production team flow (daemon+pm) lives in `daemon.rs` + `task/store.rs`; `pm.rs` stays in `orchestrator/` as a decomposition helper (moving it to `team/` would churn without benefit — the Orchestrator's mailbox pattern is used by demo and tests, but HTTP+TaskStore drives production). Demo/tests exercise the Orchestrator's mailbox+blackboard directly; the daemon bypasses it for stateless SQL-backed operations. | Keeps the Orchestrator lightweight and purpose-scoped; avoids conflating the in-memory mailbox model with the persistent task queue that production actually uses |
+| D19 | Native tool calling: structured `Thread`/`ContentBlock` model at the core, `Model::complete_thread` beside `complete`; `solve` dispatches text/native drivers over one shared epilogue; `tool_mode: auto\|native\|text` per `ModelConfig` with a per-agent downgrade latch on typed unsupported errors | Providers train models on the `tool_use`/`tool_result` protocol — text-parsed JSON was the source of two production bugs. Text stays as the fallback for tool-incapable endpoints (gemma, R1 distills, misconfigured vLLM); flat text becomes a rendering, not the foundation |
 
 ---
 
@@ -291,7 +292,7 @@ pub trait MemoryStore: Send + Sync {
 
 ## 10. Phased Roadmap (milestones)
 
-> **Status (570 tests passing + 1 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅ + Phase E hardening ✅ + Phase E review hardening ✅. **Next roadmap:** see [`docs/superpowers/specs/2026-07-24-next-roadmap.md`](../docs/superpowers/specs/2026-07-24-next-roadmap.md) (Phase A: correctness sweep, Phase B: doc sync, Phase C: e2e harness, Phase D: task HTTP surface, Phase E: maintenance).
+> **Status (602 tests passing + 2 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅ + Phase E hardening ✅ + Phase E review hardening ✅ + native tool calling ✅. **Roadmap docs:** [`2026-07-24-next-roadmap.md`](../docs/superpowers/specs/2026-07-24-next-roadmap.md) (phases A–E, done) · [`2026-07-24-native-tool-calling-design.md`](../docs/superpowers/specs/2026-07-24-native-tool-calling-design.md) (done; Codex native + streaming tool use are the follow-ups).
 
 - ✅ **M0 — Skeleton:** crate layout, `error.rs`, `id.rs`, empty modules, `lib.rs` compiles.
 - ✅ **M1 — Memory core:** `Memory` types + `MemoryStore` trait + `InMemoryStore`

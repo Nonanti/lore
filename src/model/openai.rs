@@ -1560,6 +1560,42 @@ mod tests {
         assert!(!full.trim().is_empty(), "stream returned empty");
     }
 
+    /// Smoke test for NATIVE tool calling against a real OpenAI-compatible
+    /// server (default: local Ollama with a tools-capable model).
+    /// Run with: `LORE_LLM_BASE=... LORE_LLM_MODEL=... cargo test -- --ignored`
+    #[tokio::test]
+    #[ignore = "requires real LLM with tool support (LORE_LLM_BASE, default http://localhost:11434/v1)"]
+    async fn live_llm_complete_thread_native_tools() {
+        use super::super::ChatMessage as ThreadMsg;
+        let base =
+            std::env::var("LORE_LLM_BASE").unwrap_or_else(|_| "http://localhost:11434/v1".into());
+        let model = std::env::var("LORE_LLM_MODEL").unwrap_or_else(|_| "llama3.2".into());
+        let mut m = OpenAiModel::new(base, model);
+        if let Ok(k) = std::env::var("LORE_LLM_KEY") {
+            m = m.with_api_key(k);
+        }
+        let mut t = Thread::new("You are a precise assistant. Use the calc tool for arithmetic.");
+        t.push(ThreadMsg::user_text("What is 137 * 41? Use the calc tool."));
+        let specs = vec![ToolSpec {
+            name: "calc".into(),
+            description: "evaluates an arithmetic expression".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "args": {"type": "string", "description": "expression, e.g. 2 + 2"}
+                },
+                "required": ["args"]
+            }),
+        }];
+        let r = m.complete_thread(&t, &specs).await.unwrap();
+        assert!(!r.blocks.is_empty(), "empty native reply");
+        // Tools-capable models are expected to emit a native call here; log
+        // rather than assert — small models occasionally answer directly.
+        if r.tool_uses().is_empty() {
+            eprintln!("note: model answered directly instead of calling the tool");
+        }
+    }
+
     mod props {
         use super::*;
         use proptest::prelude::*;
