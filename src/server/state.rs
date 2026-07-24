@@ -4,7 +4,7 @@
 //! Collective deliberation (deliberate/federation) is in `deliberate.rs`,
 //! the HTTP layer is in `api.rs`.
 
-use super::types::{AgentView, MemoryView, PersonaPatch};
+use super::types::{AgentView, MemoryView, PersonaPatch, TaskFullView};
 use crate::agent::{Agent, Conversation, Persona};
 use crate::error::{LoreError, Result};
 use crate::id::AgentId;
@@ -217,6 +217,13 @@ pub struct AppState {
     pub(super) peer_key: Option<String>,
     /// Rate-limit counter (key → window).
     pub(super) hits: Arc<Mutex<HashMap<String, Window>>>,
+    /// Data directory root (LORE_DATA). Used for task log paths.
+    /// None when the server runs without persistent task support.
+    pub(super) data_dir: Option<PathBuf>,
+    /// Task database path (<data>/tasks.db). None when task support is off.
+    /// Opening per-request is acceptable: `TaskStore` owns a non-Sync
+    /// `rusqlite::Connection`; same pattern as `QueueApprover` and CLI.
+    pub(super) task_db_path: Option<PathBuf>,
     /// Shared HTTP client for peer node calls (connection pool).
     pub(super) http: reqwest::Client,
     /// Chat sessions: (agent, session name) → working memory.
@@ -339,6 +346,8 @@ impl AppState {
             http: make_peer_client(),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             latency: Arc::new(Mutex::new(HashMap::new())),
+            data_dir: None,
+            task_db_path: None,
         }
     }
 
@@ -409,6 +418,15 @@ impl AppState {
     /// Connects the shared tool set (builder). `act` uses these.
     pub fn with_tools(mut self, tools: ToolContext) -> Self {
         self.tools = Some(Arc::new(tools));
+        self
+    }
+
+    /// Connects task database path (builder). Required for task/approval endpoints.
+    /// Data dir is also set (used for log file reading).
+    /// When not set, task/approval endpoints return 503.
+    pub fn with_task_store(mut self, data_dir: PathBuf, db_path: PathBuf) -> Self {
+        self.data_dir = Some(data_dir);
+        self.task_db_path = Some(db_path);
         self
     }
 
@@ -1010,5 +1028,128 @@ impl AppState {
                 summary: s.item.summary(),
             })
             .collect())
+    }
+
+    // ── Task queue HTTP surface ────────────────────────────────────────────
+
+    /// Opens a per-request TaskStore connection.
+    /// Design choice: `rusqlite::Connection` is not `Sync`; the CLI and
+    /// `QueueApprover` each open per-call connections too. WAL mode permits
+    /// concurrent reads/writes. No new dependency needed.
+    fn open_task_store(&self) -> Result<crate::task::TaskStore> {
+        let path = self
+            .task_db_path
+            .as_ref()
+            .ok_or_else(|| LoreError::Server("task store not configured".to_string()))?
+            .as_path();
+        crate::task::TaskStore::open(path)
+    }
+
+    /// Enqueues a new task (HTTP: POST /tasks).
+    /// Workspace defaults to `<data_dir>/workspaces/<agent>` when not provided.
+    pub fn enqueue_task(
+        &self,
+        agent: &str,
+        goal: &str,
+        workspace: Option<PathBuf>,
+        verify: Vec<String>,
+    ) -> Result<crate::task::Task> {
+        let store = self.open_task_store()?;
+        let agent = agent.trim();
+        let goal = goal.trim();
+        if agent.is_empty() {
+            return Err(LoreError::InvalidInput("agent cannot be empty".into()));
+        }
+        if goal.is_empty() {
+            return Err(LoreError::InvalidInput("goal cannot be empty".into()));
+        }
+        // Path traversal validation: agent name is used in persona file lookup.
+        if agent.contains('/') || agent.contains('\\') || agent.contains("..") {
+            return Err(LoreError::InvalidInput(
+                "agent name must not contain path separators".into(),
+            ));
+        }
+        let workspace = workspace.unwrap_or_else(|| {
+            self.data_dir
+                .as_ref()
+                .map(|d| d.join("workspaces").join(agent))
+                .unwrap_or_else(|| PathBuf::from(format!("/tmp/lore-{agent}")))
+        });
+        let new_task = crate::task::NewTask {
+            agent: agent.to_string(),
+            goal: goal.to_string(),
+            workspace,
+            verify,
+            parent_id: None,
+        };
+        store.enqueue(new_task)
+    }
+
+    /// Lists tasks (compact, newest-first).
+    pub fn list_tasks(&self, limit: usize) -> Result<Vec<crate::task::Task>> {
+        let store = self.open_task_store()?;
+        let limit = limit.clamp(1, 1000); // MAX_QUERY_LIMIT same as api.rs
+        store.list(limit)
+    }
+
+    /// Gets a full task record (HTTP: GET /tasks/:id).
+    /// Includes report + children when present.
+    pub fn get_task_full(&self, id: &str) -> Result<TaskFullView> {
+        let store = self.open_task_store()?;
+        let task = store
+            .get(id)?
+            .ok_or_else(|| LoreError::NotFound(format!("task {id}")))?;
+        let children = store.children_of(id)?;
+        Ok(TaskFullView { task, children })
+    }
+
+    /// Reads a task log file (HTTP: GET /tasks/:id/log?tail=N).
+    /// Uses the same path traversal validation as the CLI.
+    pub fn read_task_log(&self, id: &str, tail: Option<usize>) -> Result<String> {
+        // Path traversal validation (same as CLI: reject / \ ..).
+        if id.contains('/') || id.contains('\\') || id.contains("..") {
+            return Err(LoreError::InvalidInput("invalid task id".into()));
+        }
+        let data_dir = self
+            .data_dir
+            .as_ref()
+            .ok_or_else(|| LoreError::Server("data directory not configured".to_string()))?
+            .clone();
+        let log_path = data_dir.join("logs").join(format!("{id}.log"));
+        if !log_path.exists() {
+            return Err(LoreError::NotFound(format!(
+                "log file not found for task {id}"
+            )));
+        }
+        let content =
+            std::fs::read_to_string(&log_path).map_err(|e| LoreError::Storage(e.to_string()))?;
+        match tail {
+            Some(n) => {
+                let lines: Vec<&str> = content.lines().collect();
+                let start = lines.len().saturating_sub(n);
+                Ok(lines[start..].join("\n"))
+            }
+            None => Ok(content),
+        }
+    }
+
+    /// Lists pending approvals (HTTP: GET /inbox).
+    pub fn pending_approvals(&self) -> Result<Vec<crate::task::ApprovalEntry>> {
+        let store = self.open_task_store()?;
+        store.pending_approvals()
+    }
+
+    /// Decides an approval: approve or deny (HTTP: POST /approvals/:id/approve|deny).
+    /// Idempotent: deciding a non-Pending approval -> Conflict (409) with clear message;
+    /// unknown id -> NotFound (404).
+    pub fn decide_approval(&self, id: &str, approve: bool) -> Result<()> {
+        let store = self.open_task_store()?;
+        // TaskStore::decide_approval returns NotFound for unknown id and
+        // InvalidInput for already-decided. We map InvalidInput -> Conflict
+        // (409 in the handler layer).
+        store.decide_approval(id, approve).map_err(|e| match e {
+            LoreError::InvalidInput(msg) => LoreError::Conflict(msg),
+            other => other,
+        })
     }
 }

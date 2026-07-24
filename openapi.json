@@ -169,6 +169,166 @@
             "type": "string"
           }
         }
+      },
+      "Task": {
+        "type": "object",
+        "required": [
+          "id",
+          "agent",
+          "goal",
+          "workspace",
+          "verify",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "ULID identifier"
+          },
+          "agent": {
+            "type": "string",
+            "description": "Agent name (persona file stem)"
+          },
+          "goal": {
+            "type": "string",
+            "description": "What the agent should achieve"
+          },
+          "workspace": {
+            "type": "string",
+            "description": "Sandbox root for this task"
+          },
+          "verify": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Verification commands"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "Queued",
+              "Running",
+              "WaitingApproval",
+              "WaitingSubtasks",
+              "Completed",
+              "Failed"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "report": {
+            "type": "string",
+            "description": "WorkReport JSON (present when Completed or Failed)",
+            "nullable": true
+          },
+          "parent_id": {
+            "type": "string",
+            "description": "Parent task id (for team hierarchy)",
+            "nullable": true
+          }
+        }
+      },
+      "TaskFullView": {
+        "type": "object",
+        "required": [
+          "task"
+        ],
+        "properties": {
+          "task": {
+            "$ref": "#/components/schemas/Task"
+          },
+          "children": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Task"
+            },
+            "description": "Child tasks (subtasks), empty for standalone"
+          }
+        }
+      },
+      "ApprovalEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "task_id",
+          "action",
+          "reason",
+          "status",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "ULID identifier"
+          },
+          "task_id": {
+            "type": "string",
+            "description": "Which task this approval belongs to"
+          },
+          "action": {
+            "type": "string",
+            "description": "JSON-serialized action being considered"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why the action requires approval"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "Pending",
+              "Approved",
+              "Denied"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "decided_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "EnqueueTaskReq": {
+        "type": "object",
+        "required": [
+          "agent",
+          "goal"
+        ],
+        "properties": {
+          "agent": {
+            "type": "string",
+            "description": "Agent name (must not contain '/', '\\', or '..')"
+          },
+          "goal": {
+            "type": "string",
+            "description": "Goal description (non-empty)"
+          },
+          "workspace": {
+            "type": "string",
+            "description": "Workspace root (defaults to <data>/workspaces/<agent>)"
+          },
+          "verify": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Verification commands (optional)",
+            "default": []
+          }
+        }
       }
     }
   },
@@ -841,6 +1001,280 @@
           },
           "404": {
             "description": "agent not found"
+          }
+        }
+      }
+    },
+    "/tasks": {
+      "post": {
+        "summary": "Enqueue a new task",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnqueueTaskReq"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "task enqueued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "empty agent/goal or path traversal in agent name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "task store not configured"
+          }
+        }
+      },
+      "get": {
+        "summary": "List tasks (compact, newest-first)",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 20,
+              "maximum": 1000
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "task list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Task"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "task store not configured"
+          }
+        }
+      }
+    },
+    "/tasks/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "Get a full task record (incl. report + children)",
+        "responses": {
+          "200": {
+            "description": "full task view",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskFullView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "task not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "task store not configured"
+          }
+        }
+      }
+    },
+    "/tasks/{id}/log": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "summary": "Read task log file (path traversal validated)",
+        "parameters": [
+          {
+            "name": "tail",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Number of lines from the end"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "log content (text/plain)"
+          },
+          "404": {
+            "description": "log file not found or invalid task id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "path traversal rejected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "data directory not configured"
+          }
+        }
+      }
+    },
+    "/inbox": {
+      "get": {
+        "summary": "List pending approvals",
+        "responses": {
+          "200": {
+            "description": "pending approvals",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ApprovalEntry"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "task store not configured"
+          }
+        }
+      }
+    },
+    "/approvals/{id}/approve": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Approve a pending approval (idempotent: non-Pending -> 409)",
+        "responses": {
+          "204": {
+            "description": "approved"
+          },
+          "404": {
+            "description": "approval not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "already decided (Approved or Denied)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "task store not configured"
+          }
+        }
+      }
+    },
+    "/approvals/{id}/deny": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "summary": "Deny a pending approval (idempotent: non-Pending -> 409)",
+        "responses": {
+          "204": {
+            "description": "denied"
+          },
+          "404": {
+            "description": "approval not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "already decided (Approved or Denied)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "task store not configured"
           }
         }
       }

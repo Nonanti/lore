@@ -140,6 +140,17 @@ pub(super) struct ReflectResp {
     pub(super) distilled: usize,
 }
 
+/// Full task view: the task itself + child tasks (when present).
+/// Used for GET /tasks/:id — includes report + children.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskFullView {
+    /// The task record.
+    pub task: crate::task::Task,
+    /// Children (subtasks) of this task, empty for standalone tasks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<crate::task::Task>,
+}
+
 /// Outcome field for `reinforce` request (lowercase JSON: "accessed" etc.).
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -189,4 +200,30 @@ pub(super) struct RecallParams {
     pub(super) limit: Option<usize>,
     /// Semantic (morphology/synonym) recall — retrieves even without keyword match.
     pub(super) semantic: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct EnqueueTaskReq {
+    /// Agent name (persona file stem).
+    pub(super) agent: String,
+    /// Goal description (required, non-empty).
+    pub(super) goal: String,
+    /// Workspace root (optional; defaults to <data>/workspaces/<agent>).
+    #[serde(default)]
+    pub(super) workspace: Option<String>,
+    /// Verification commands (optional).
+    #[serde(default)]
+    pub(super) verify: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TaskListParams {
+    /// Maximum number of tasks to return (default 20, max 1000).
+    pub(super) limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TaskLogParams {
+    /// Number of lines from the end of the log ("tail" mode).
+    pub(super) tail: Option<usize>,
 }

@@ -25,6 +25,13 @@
 //! - `POST /deliberate`                  → collective deliberation (+synthesizer, +local)
 //! - `GET  /deliberate/live`             → WebSocket live deliberate
 //! - `GET  /board?limit=`                → read shared board
+//! - `POST /tasks`                         → enqueue task (agent, goal, workspace?, verify[])
+//! - `GET  /tasks?limit=N`                 → list tasks (compact)
+//! - `GET  /tasks/:id`                      → full task record (report + children)
+//! - `GET  /tasks/:id/log?tail=N`          → read task log (traversal validated)
+//! - `GET  /inbox`                          → pending approvals
+//! - `POST /approvals/:id/approve`          → approve (non-Pending → 409)
+//! - `POST /approvals/:id/deny`             → deny (non-Pending → 409)
 //!
 //! All endpoints except `/health` go through auth + rate-limit middleware.
 
@@ -48,4 +55,5 @@ pub use api::{router, serve};
 pub use state::AppState;
 pub use types::{
     ActResp, AgentView, AskResp, DeliberateReply, DeliberateResp, MemoryView, PersonaPatch,
+    TaskFullView,
 };

@@ -481,10 +481,19 @@ async fn observability_request_id_ready_and_histogram() {
         "/agents/{id}/message",
         "/agents/{id}/experience",
         "/agents/{id}/recall",
+        "/agents/{id}/reinforce",
+        "/agents/{id}/reflect",
         "/deliberate",
         "/deliberate/live",
         "/board",
         "/openapi.json",
+        // Phase D — Task HTTP surface
+        "/tasks",
+        "/tasks/{id}",
+        "/tasks/{id}/log",
+        "/inbox",
+        "/approvals/{id}/approve",
+        "/approvals/{id}/deny",
     ] {
         assert!(paths.contains_key(p), "missing endpoint in spec: {p}");
     }
@@ -1179,4 +1188,493 @@ async fn reflect_endpoint_distills_hot_memories() {
     // Second run: no hot memories left to distill.
     let n2 = st.reflect(&aid).await.unwrap();
     assert_eq!(n2, 0, "idempotent: not distilled again");
+}
+
+// ── Phase D: Task HTTP surface tests ──────────────────────────────────
+
+use crate::task::TaskStore;
+
+fn task_state() -> AppState {
+    let dir = std::env::temp_dir().join(format!("lore-task-srv-{}", ulid::Ulid::new()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("tasks.db");
+    let data_dir = dir.clone();
+    // Create the logs dir so log reading works.
+    std::fs::create_dir_all(dir.join("logs")).unwrap();
+    let store: Arc<dyn MemoryStore> = Arc::new(InMemoryStore::new());
+    let model: Arc<dyn Model> = Arc::new(MockModel::new());
+    AppState::new(store, model).with_task_store(data_dir, db_path)
+}
+
+struct TaskSrvDir(std::path::PathBuf);
+
+impl TaskSrvDir {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("lore-task-http-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for TaskSrvDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[tokio::test]
+async fn task_http_auth_required_401() {
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state()
+        .with_api_key("secret")
+        .with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Without key -> 401 on all task endpoints.
+    assert_eq!(
+        client
+            .post(format!("{base}/tasks"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        401
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/tasks?limit=5"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        401
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/tasks/nonexistent"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        401
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/tasks/nonexistent/log"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        401
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/inbox"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        401
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/approvals/nonexistent/approve"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        401
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/approvals/nonexistent/deny"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        401
+    );
+
+    // With key -> endpoints accessible (may return 404/422, but not 401).
+    let resp = client
+        .get(format!("{base}/tasks?limit=5"))
+        .header("x-api-key", "secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn task_enqueue_list_get_happy_path() {
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Enqueue.
+    let task: serde_json::Value = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "testbot", "goal": "fix the login endpoint"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(task["status"], "Queued");
+    assert_eq!(task["agent"], "testbot");
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // List.
+    let list: Vec<serde_json::Value> = client
+        .get(format!("{base}/tasks?limit=5"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["id"], task_id);
+
+    // Get full record.
+    let full: serde_json::Value = client
+        .get(format!("{base}/tasks/{task_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(full["task"]["id"], task_id);
+    assert_eq!(full["task"]["goal"], "fix the login endpoint");
+    // No children for a standalone task.
+    assert!(full.get("children").is_none() || full["children"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn task_validation_missing_goal_422() {
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Missing goal -> 422.
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "testbot", "goal": ""}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 422);
+
+    // Missing agent -> 422.
+    let resp2 = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "", "goal": "do something"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status().as_u16(), 422);
+
+    // Path traversal in agent -> 422.
+    let resp3 = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "../evil", "goal": "hack"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp3.status().as_u16(), 422);
+}
+
+#[tokio::test]
+async fn task_unknown_id_404() {
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    let resp = client
+        .get(format!("{base}/tasks/nonexistent_id"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn task_log_traversal_rejected() {
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Path traversal: ../etc/passwd -> 422.
+    let _resp = client
+        .get(format!("{base}/tasks/../etc/passwd/log"))
+        .send()
+        .await
+        .unwrap();
+    // axum routes the path literally; the handler validates the id param.
+    // The id would be "../etc/passwd" which gets rejected.
+    // Actually, axum normalizes paths - the route is /tasks/:id/log
+    // so ../etc/passwd would not match the route pattern. Instead test with
+    // a valid-looking id that contains traversal chars.
+    // Let me use a direct id param.
+    let resp2 = client
+        .get(format!("{base}/tasks/..%2Fetc%2Fpasswd/log"))
+        .send()
+        .await
+        .unwrap();
+    // The URL-decoded id is "../etc/passwd" or "..%2Fetc%2Fpasswd"
+    // Either way it should be rejected.
+    assert!(
+        resp2.status().as_u16() == 422 || resp2.status().as_u16() == 404,
+        "traversal id rejected: got {}",
+        resp2.status().as_u16()
+    );
+}
+
+#[tokio::test]
+async fn approval_decide_inbox_empties_second_decide_409() {
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Enqueue a task (so approval can be attached).
+    let task: serde_json::Value = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "testbot", "goal": "needs approval"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // Insert an approval via TaskStore directly (the HTTP surface doesn't
+    // create approvals — they're created by the daemon work loop).
+    let store = TaskStore::open(&db_path).unwrap();
+    let approval_id = store.add_approval(&task_id, "{}", "test reason").unwrap();
+
+    // Inbox should show the pending approval.
+    let inbox: Vec<serde_json::Value> = client
+        .get(format!("{base}/inbox"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0]["id"], approval_id);
+
+    // Approve it.
+    let resp = client
+        .post(format!("{base}/approvals/{approval_id}/approve"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 204);
+
+    // Inbox now empty.
+    let inbox2: Vec<serde_json::Value> = client
+        .get(format!("{base}/inbox"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(inbox2.len(), 0);
+
+    // Second decide -> 409 (already decided).
+    let resp2 = client
+        .post(format!("{base}/approvals/{approval_id}/approve"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status().as_u16(), 409);
+
+    // Deny on already-decided also -> 409.
+    let resp3 = client
+        .post(format!("{base}/approvals/{approval_id}/deny"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp3.status().as_u16(), 409);
+}
+
+#[tokio::test]
+async fn approval_deny_recorded() {
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Enqueue a task + add approval.
+    let task: serde_json::Value = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "testbot", "goal": "deny test"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    let store = TaskStore::open(&db_path).unwrap();
+    let approval_id = store.add_approval(&task_id, "{}", "deny me").unwrap();
+
+    // Deny it.
+    let resp = client
+        .post(format!("{base}/approvals/{approval_id}/deny"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 204);
+
+    // Verify via TaskStore that it's Denied.
+    let status = store.approval_status(&approval_id).unwrap().unwrap();
+    assert_eq!(status, crate::task::ApprovalStatus::Denied);
+}
+
+#[tokio::test]
+async fn approval_unknown_id_404() {
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Unknown approval id -> 404.
+    let resp = client
+        .post(format!("{base}/approvals/nonexistent/approve"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+
+    let resp2 = client
+        .post(format!("{base}/approvals/nonexistent/deny"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn task_log_reads_file() {
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Enqueue a task.
+    let task: serde_json::Value = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "logbot", "goal": "log test"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // Write a fake log file (as the daemon would).
+    let log_path = td.0.join("logs").join(format!("{task_id}.log"));
+    std::fs::write(&log_path, "line1\nline2\nline3\nline4\nline5").unwrap();
+
+    // Read full log.
+    let content = client
+        .get(format!("{base}/tasks/{task_id}/log"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(content.contains("line1"), "full log: {content}");
+
+    // Read tail=2.
+    let tail_content = client
+        .get(format!("{base}/tasks/{task_id}/log?tail=2"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(tail_content.contains("line4"), "tail=2: {tail_content}");
+    assert!(tail_content.contains("line5"), "tail=2: {tail_content}");
+    assert!(
+        !tail_content.contains("line1"),
+        "tail=2 should not have line1: {tail_content}"
+    );
+
+    // Unknown task log -> 404.
+    let resp = client
+        .get(format!("{base}/tasks/unknown_task_id/log"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
 }

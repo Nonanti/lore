@@ -7,8 +7,8 @@ use super::security::security_mw;
 use super::state::AppState;
 use super::types::{
     ActReq, ActResp, AgentView, AskReq, AskResp, BoardParams, CreateReq, DeliberateReply,
-    DeliberateReq, DeliberateResp, ExperienceReq, MemoryView, MessageReq, MsgKind, PersonaPatch,
-    RecallParams, ReflectResp, ReinforceReq, SolveReq,
+    DeliberateReq, DeliberateResp, EnqueueTaskReq, ExperienceReq, MemoryView, MessageReq, MsgKind,
+    PersonaPatch, RecallParams, ReflectResp, ReinforceReq, SolveReq, TaskListParams, TaskLogParams,
 };
 use crate::agent::DEFAULT_SOLVE_STEPS;
 use crate::error::{LoreError, Result};
@@ -42,7 +42,7 @@ const REFLECT_PERIOD_SECS: u64 = 3600;
 const WS_QUESTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Upper bound for query `limit` (client-controlled field — excessive values are clamped).
-const MAX_QUERY_LIMIT: usize = 1000;
+pub(super) const MAX_QUERY_LIMIT: usize = 1000;
 
 /// WS message/frame size limit — HTTP bodies are capped at 2MB, but WS's
 /// default ~64MB acceptance was an inconsistent DoS surface; 64KB is ample for a question.
@@ -67,6 +67,13 @@ pub fn router(state: AppState) -> Router {
         .route("/board", get(board_h))
         // Metrics are observability data — protected when API key is configured.
         .route("/metrics", get(metrics_h))
+        // Task queue HTTP surface (Phase D).
+        .route("/tasks", post(enqueue_task_h).get(list_tasks_h))
+        .route("/tasks/:id", get(get_task_h))
+        .route("/tasks/:id/log", get(task_log_h))
+        .route("/inbox", get(inbox_h))
+        .route("/approvals/:id/approve", post(approve_h))
+        .route("/approvals/:id/deny", post(deny_h))
         .route_layer(middleware::from_fn_with_state(state.clone(), security_mw))
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024)); // 2 MiB
 
@@ -501,6 +508,62 @@ async fn board_h(
     ))
 }
 
+// ── Task queue handlers ──────────────────────────────────────────────
+
+async fn enqueue_task_h(
+    State(st): State<AppState>,
+    Json(req): Json<EnqueueTaskReq>,
+) -> std::result::Result<(StatusCode, Json<crate::task::Task>), ApiError> {
+    let workspace = req.workspace.map(std::path::PathBuf::from);
+    let task = st.enqueue_task(&req.agent, &req.goal, workspace, req.verify)?;
+    Ok((StatusCode::CREATED, Json(task)))
+}
+
+async fn list_tasks_h(
+    State(st): State<AppState>,
+    AxQuery(p): AxQuery<TaskListParams>,
+) -> std::result::Result<Json<Vec<crate::task::Task>>, ApiError> {
+    let limit = p.limit.unwrap_or(20);
+    Ok(Json(st.list_tasks(limit)?))
+}
+
+async fn get_task_h(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<super::types::TaskFullView>, ApiError> {
+    Ok(Json(st.get_task_full(&id)?))
+}
+
+async fn task_log_h(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    AxQuery(p): AxQuery<TaskLogParams>,
+) -> std::result::Result<String, ApiError> {
+    Ok(st.read_task_log(&id, p.tail)?)
+}
+
+async fn inbox_h(
+    State(st): State<AppState>,
+) -> std::result::Result<Json<Vec<crate::task::ApprovalEntry>>, ApiError> {
+    Ok(Json(st.pending_approvals()?))
+}
+
+async fn approve_h(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> std::result::Result<StatusCode, ApiError> {
+    st.decide_approval(&id, true)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn deny_h(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> std::result::Result<StatusCode, ApiError> {
+    st.decide_approval(&id, false)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// HTTP error wrapper: `LoreError` → appropriate status code.
 struct ApiError(LoreError);
 
@@ -515,6 +578,7 @@ impl IntoResponse for ApiError {
         let (code, msg) = match &self.0 {
             LoreError::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
             LoreError::InvalidInput(m) => (StatusCode::UNPROCESSABLE_ENTITY, m.clone()),
+            LoreError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             other => {
                 // Internal details are not leaked to the client; logged server-side.
                 tracing::error!(error = %other, "internal error (500)");

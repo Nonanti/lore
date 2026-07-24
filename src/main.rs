@@ -331,7 +331,11 @@ fn build_state(data: &str) -> anyhow::Result<AppState> {
         store,
         build_model_from_env_cli(data)?,
     )?
-    .with_tools(tools);
+    .with_tools(tools)
+    .with_task_store(
+        std::path::PathBuf::from(data),
+        std::path::PathBuf::from(format!("{data}/tasks.db")),
+    );
     // Security: if LORE_API_KEY is set, auth is mandatory; LORE_RATE_LIMIT caps requests per minute.
     if let Some(key) = parse_api_key(std::env::var("LORE_API_KEY").ok()) {
         app = app.with_api_key(key);

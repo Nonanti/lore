@@ -291,6 +291,13 @@ lore task log <task-id> --tail 20
 | `POST /deliberate` | collective reasoning (`{question, synthesizer?, local?}`) — team + peer nodes |
 | `GET  /deliberate/live` | WebSocket: responses stream live as they become ready |
 | `GET  /board?limit=` | read the shared board |
+| `POST /tasks` | enqueue a task (`{agent, goal, workspace?, verify[]?}` → 201 `{id}`) |
+| `GET  /tasks?limit=N` | list tasks (compact, newest-first) |
+| `GET  /tasks/:id` | full task record (incl. report + children) |
+| `GET  /tasks/:id/log?tail=N` | read task log (path traversal validated) |
+| `GET  /inbox` | pending approvals |
+| `POST /approvals/:id/approve` | approve a pending approval (idempotent — non-Pending → 409) |
+| `POST /approvals/:id/deny` | deny a pending approval (idempotent — non-Pending → 409) |
 
 ## CLI
 
@@ -342,7 +349,7 @@ Docker: `docker build -t lore . && docker run -p 3777:3777 -v lore-data:/data lo
 
 ```bash
 cargo run      # demo (when no subcommand)
-cargo test     # 514 tests passing (1 ignored: live-LLM smoke test)
+cargo test     # 533 tests passing (1 ignored: live-LLM smoke test)
 cargo clippy --all-targets
 ```
 
@@ -363,7 +370,7 @@ native provider auth (subscription + metered API key), reasoning-model support.
 Maturation: structured logging + request-id + latency histograms + `/ready` · FTS5 + emb BLOB +
 separate-connection consolidation · property tests + real-binary e2e · `/openapi.json` + threat model ·
 soak/chaos harness. Full code review + 4-way review hardening done.
-514 tests passing, clippy clean, with CI. Roadmap: `docs/superpowers/specs/2026-07-24-next-roadmap.md`.
+533 tests passing, clippy clean, with CI. Roadmap: `docs/superpowers/specs/2026-07-24-next-roadmap.md`.
 
 ## Design philosophy
 

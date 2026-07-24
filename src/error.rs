@@ -33,6 +33,11 @@ pub enum LoreError {
     #[error("server error: {0}")]
     Server(String),
 
+    /// Conflict: the action cannot be applied to the current state
+    /// (e.g. deciding an already-decided approval). Maps to HTTP 409.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// Action denied by policy gate.
     #[error("policy denied: {0}")]
     PolicyDenied(String),

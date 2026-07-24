@@ -56,7 +56,7 @@ pub use policy::approval::{AllowAll, Approver, CliApprover, DenyAll, Gate};
 pub use policy::{Action, DefaultExec, Policy, SandboxMode, Verdict};
 pub use server::{
     ActResp, AgentView, AppState, AskResp, DeliberateReply, DeliberateResp, MemoryView,
-    PersonaPatch,
+    PersonaPatch, TaskFullView,
 };
 pub use task::approver::QueueApprover;
 pub use task::{ApprovalEntry, ApprovalStatus, NewTask, Task, TaskStatus, TaskStore};
