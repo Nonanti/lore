@@ -301,7 +301,7 @@ impl Tool for ShellTool {
 mod tests {
     use super::*;
     use crate::policy::approval::{AllowAll, DenyAll};
-    use crate::policy::{DefaultExec, Policy, SandboxMode};
+    use crate::policy::{Action, DefaultExec, Policy, SandboxMode, Verdict};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -654,6 +654,169 @@ mod tests {
         let json = serde_json::to_string_pretty(&p).unwrap();
         let loaded: Policy = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.sandbox_exec, SandboxMode::Required);
+    }
+
+    // ── Sandbox edge tests ────────────────────────────────────────────
+
+    /// Workspace path with spaces must remain a single argv element in
+    /// --bind and --chdir — never split into multiple args.
+    #[test]
+    fn bwrap_argv_workspace_path_with_spaces() {
+        let ws = Path::new("/home/user/my project with spaces");
+        let args = bwrap_argv("echo hello", ws);
+        let bind_idx = args.iter().position(|a| a == "--bind").unwrap();
+        assert_eq!(
+            args[bind_idx + 1],
+            "/home/user/my project with spaces",
+            "--bind source preserves spaces"
+        );
+        assert_eq!(
+            args[bind_idx + 2],
+            "/home/user/my project with spaces",
+            "--bind dest preserves spaces"
+        );
+        let chdir_idx = args.iter().position(|a| a == "--chdir").unwrap();
+        assert_eq!(
+            args[chdir_idx + 1],
+            "/home/user/my project with spaces",
+            "--chdir preserves spaces"
+        );
+    }
+
+    /// Workspace path with Unicode characters stays intact as a single
+    /// argv element (no encoding corruption).
+    #[test]
+    fn bwrap_argv_workspace_path_with_unicode() {
+        let ws = Path::new("/home/user/日本語プロジェクト");
+        let args = bwrap_argv("echo hello", ws);
+        let bind_idx = args.iter().position(|a| a == "--bind").unwrap();
+        assert_eq!(
+            args[bind_idx + 1],
+            "/home/user/日本語プロジェクト",
+            "--bind source preserves unicode"
+        );
+        assert_eq!(
+            args[bind_idx + 2],
+            "/home/user/日本語プロジェクト",
+            "--bind dest preserves unicode"
+        );
+    }
+
+    /// bwrap_argv always produces exactly 19 args for the fixed spec
+    /// pattern (9 bwrap flags × 2-3 args each + sh -c <cmd>).
+    #[test]
+    fn bwrap_argv_produces_consistent_arg_count() {
+        // Short command.
+        let args1 = bwrap_argv("ls", Path::new("/ws"));
+        assert_eq!(args1.len(), 19, "short command → 19 args");
+        // Long command.
+        let args2 = bwrap_argv("cargo test -- --test-threads=1", Path::new("/ws"));
+        assert_eq!(args2.len(), 19, "long command → 19 args");
+        // The command is always the last arg (args[18]).
+        assert_eq!(args1[18], "ls");
+        assert_eq!(args2[18], "cargo test -- --test-threads=1");
+    }
+
+    /// SandboxMode::default() is Off — additive default for old policies.
+    #[test]
+    fn sandbox_mode_default_is_off() {
+        assert_eq!(SandboxMode::default(), SandboxMode::Off);
+    }
+
+    /// SandboxMode serde roundtrip for all three variants.
+    #[test]
+    fn sandbox_mode_serde_roundtrip_all_variants() {
+        for mode in [
+            SandboxMode::Off,
+            SandboxMode::IfAvailable,
+            SandboxMode::Required,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let loaded: SandboxMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(loaded, mode, "roundtrip for {mode:?}");
+        }
+    }
+
+    /// SandboxMode Copy semantics: assigning a value copies it, no clone needed.
+    #[test]
+    fn sandbox_mode_is_copy() {
+        let a = SandboxMode::Required;
+        let b = a; // Copy, not move — a still usable.
+        assert_eq!(a, SandboxMode::Required);
+        assert_eq!(b, SandboxMode::Required);
+    }
+
+    /// spawn_argv Required + no bwrap: exact error message matches spec.
+    #[test]
+    fn spawn_argv_required_error_message_exact() {
+        let result = spawn_argv("ls", Path::new("/ws"), SandboxMode::Required);
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("sandbox required but bwrap not found"),
+            "error text contains spec phrase: {err}"
+        );
+    }
+
+    /// Policy evaluate still denies metacharacters when sandbox is Required.
+    /// Sandbox mode doesn't bypass the policy gate — chaining is still blocked.
+    #[test]
+    fn policy_sandbox_required_does_not_bypass_metacharacter_check() {
+        let root = PathBuf::from("/tmp");
+        let p = Policy {
+            roots: vec![root.clone()],
+            auto_allow: vec![],
+            deny: vec![],
+            default_exec: DefaultExec::Ask,
+            ask_on_write: false,
+            sandbox_exec: SandboxMode::Required,
+        };
+        let v = p.evaluate(&Action::Exec {
+            command: "ls; rm -rf /".into(),
+            cwd: root,
+        });
+        assert!(
+            matches!(v, Verdict::Deny { .. }),
+            "Required sandbox does not bypass metachar check: {v:?}"
+        );
+    }
+
+    /// Policy evaluate still denies deny-list entries when sandbox is Required.
+    #[test]
+    fn policy_sandbox_required_does_not_bypass_deny_list() {
+        let root = PathBuf::from("/tmp");
+        let p = Policy {
+            roots: vec![root.clone()],
+            auto_allow: vec![],
+            deny: vec!["sudo".into()],
+            default_exec: DefaultExec::Allow,
+            ask_on_write: false,
+            sandbox_exec: SandboxMode::Required,
+        };
+        let v = p.evaluate(&Action::Exec {
+            command: "sudo ls".into(),
+            cwd: root,
+        });
+        assert!(
+            matches!(v, Verdict::Deny { .. }),
+            "Required sandbox does not bypass deny-list: {v:?}"
+        );
+    }
+
+    /// Policy JSON deserialization: sandbox_exec = "IfAvailable" loads
+    /// correctly (not just Off/Required).
+    #[test]
+    fn policy_deserialize_sandbox_if_available() {
+        let json = r#"{
+            "roots": ["/tmp"],
+            "auto_allow": [],
+            "deny": [],
+            "default_exec": "Allow",
+            "ask_on_write": false,
+            "sandbox_exec": "IfAvailable"
+        }"#;
+        let p: Policy = serde_json::from_str(json).unwrap();
+        assert_eq!(p.sandbox_exec, SandboxMode::IfAvailable);
     }
 
     // ── Real-bwrap integration test (skipped when absent) ───────────────
