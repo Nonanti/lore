@@ -264,6 +264,12 @@ fn next_line(buf: &mut Vec<u8>) -> Option<String> {
 /// done; other lines (comment, blank, role/finish chunk) → `None` (skipped).
 /// Falls back to `reasoning_content` when `content` is absent/empty (parity
 /// with `complete()` — reasoning models may stream only reasoning deltas).
+/// Parse a single SSE line from the OpenAI-compatible streaming format.
+///
+/// Returns `None` for:
+/// - keepalive lines (`: ping`, empty lines)
+/// - `role` deltas (start-of-message metadata)
+/// - `reasoning_content` with empty content (filtered by ThinkFilter)
 fn parse_sse_line(line: &str) -> Option<SseEvent> {
     let payload = line.strip_prefix("data:")?.trim();
     if payload == "[DONE]" {
@@ -512,6 +518,9 @@ impl Model for OpenAiModel {
                             ))
                         }
                         // Premature close: body ended without [DONE].
+                        // Intentionally discards any buffered ThinkFilter content —
+                        // partial output from a broken stream should not be treated
+                        // as valid. Only the error is emitted; no `finish()` flush.
                         Ok(None) => {
                             return Some((
                                 Err(LoreError::Model(

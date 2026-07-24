@@ -439,7 +439,7 @@ impl SqliteStore {
 
     fn load_one(conn: &Connection, id: &MemoryId) -> Result<Option<Memory>> {
         let mut stmt = conn
-            .prepare("SELECT data, emb FROM memories WHERE id = ?1")
+            .prepare_cached("SELECT data, emb FROM memories WHERE id = ?1")
             .map_err(sqlite_err)?;
         let mut rows = stmt.query(params![id.to_string()]).map_err(sqlite_err)?;
         match rows.next().map_err(sqlite_err)? {
@@ -454,11 +454,17 @@ impl SqliteStore {
 
     /// Loads the given set of ids with a parameterized `IN (...)` batch
     /// (chunked at 500 ids). Result ordering matches the input `ids` order.
+    /// Duplicate ids are silently deduplicated — only the first occurrence
+    /// is preserved in the output.
     fn load_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<Memory>> {
+        debug_assert!(
+            ids.len() == ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            "load_by_ids called with duplicate ids — they will be silently deduplicated"
+        );
         const CHUNK: usize = 500;
         let mut by_id: std::collections::HashMap<String, Memory> =
             std::collections::HashMap::with_capacity(ids.len());
-        for chunk in ids.chunks(CHUNK.max(1)) {
+        for chunk in ids.chunks(CHUNK) {
             let placeholders: String = (0..chunk.len())
                 .map(|i| format!("?{}", i + 1))
                 .collect::<Vec<_>>()
@@ -755,11 +761,12 @@ impl MemoryStore for SqliteStore {
         let ids = ids.to_vec();
         self.blocking(move |conn| {
             let tx = conn.transaction().map_err(sqlite_err)?;
+            let now = Utc::now();
             for id in &ids {
                 let Some(mut mem) = Self::load_one(&tx, id)? else {
                     continue; // skip — batch processes the rest
                 };
-                mem.last_access = Utc::now();
+                mem.last_access = now;
                 mem.access_count = mem.access_count.saturating_add(1);
                 match outcome {
                     Outcome::Accessed => {}
@@ -1338,13 +1345,10 @@ mod tests {
         let mb = store.get(&b).await.unwrap().unwrap();
         assert_eq!(ma.access_count, 1, "a reinforced");
         assert_eq!(mb.access_count, 1, "b reinforced");
-        // Both timestamps should be very close (same transaction).
-        let diff = (ma.last_access - mb.last_access)
-            .num_milliseconds()
-            .unsigned_abs();
-        assert!(
-            diff < 1000,
-            "both updated in same transaction, timestamps close: {diff}ms"
+        // Both timestamps should be identical (captured before loop).
+        assert_eq!(
+            ma.last_access, mb.last_access,
+            "both updated with the same `now` timestamp in one transaction"
         );
     }
 

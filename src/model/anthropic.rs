@@ -251,6 +251,17 @@ fn next_line(buf: &mut Vec<u8>) -> Option<String> {
 
 /// Parses one Anthropic SSE `data:` line. Emits text deltas; signals done on
 /// `message_stop`; surfaces an error event as a done (the body carries it).
+/// Parse a single SSE line from the Anthropic streaming format.
+///
+/// Returns `None` for:
+/// - keepalive lines (`: ping`, `event:` with no `data:` prefix)
+/// - `content_block_delta` deltas that are not `text_delta` (e.g.
+///   `input_json_delta` for tool-use streaming — not yet supported)
+/// - empty text deltas
+///
+/// Only `text_delta` content and `message_stop` terminal events are
+/// currently extracted; tool-call streaming will require extending this
+/// function.
 fn parse_sse_line(line: &str) -> Option<SseEvent> {
     let payload = line.strip_prefix("data:")?.trim();
     let v: serde_json::Value = serde_json::from_str(payload).ok()?;
@@ -342,6 +353,8 @@ impl Model for AnthropicModel {
                             return Some((Err(LoreError::Http(e)), (body, buf, true)))
                         }
                         // Premature close: body ended without message_stop.
+                        // Partial output from a broken stream is discarded —
+                        // only the terminal-event error is emitted.
                         Ok(None) => {
                             return Some((
                                 Err(LoreError::Model(
