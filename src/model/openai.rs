@@ -5,7 +5,10 @@
 //! (`parse_response`) are pure/testable; the actual HTTP call is inside
 //! `complete`.
 
-use super::{Completion, Model, Prompt, Role, TokenStream};
+use super::{
+    ChatRole, Completion, ContentBlock, Model, Prompt, Role, StopReason, Thread, ThreadReply,
+    TokenStream, ToolSpec,
+};
 use crate::error::{LoreError, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -54,6 +57,31 @@ struct ChatMessage {
     /// empty in the response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+    /// Native tool calls in an assistant response message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<WireToolCall>>,
+}
+
+/// One `tool_calls[]` entry on the wire (request and response shape).
+#[derive(Serialize, Deserialize)]
+struct WireToolCall {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "type", default = "wire_fn_type")]
+    kind: String,
+    function: WireFunction,
+}
+
+fn wire_fn_type() -> String {
+    "function".into()
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireFunction {
+    name: String,
+    /// JSON **string** on the wire (the OpenAI convention).
+    #[serde(default)]
+    arguments: String,
 }
 
 impl ChatMessage {
@@ -62,6 +90,7 @@ impl ChatMessage {
             role: role.into(),
             content,
             reasoning_content: None,
+            tool_calls: None,
         }
     }
 }
@@ -75,6 +104,8 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct Choice {
     message: ChatMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Strips `<think>...</think>` blocks that reasoning models (qwen3,
@@ -198,6 +229,214 @@ impl OpenAiModel {
             v["max_tokens"] = mt.into();
         }
         v
+    }
+
+    /// Thread → OpenAI wire messages. Text user blocks become `user`
+    /// messages; ToolResult blocks become one `role:"tool"` message each
+    /// (correlated by `tool_call_id`); assistant messages carry text as
+    /// `content` and ToolUse blocks as `tool_calls` (arguments re-serialized
+    /// to the wire's JSON-string convention). Block order is preserved.
+    fn build_thread_messages(thread: &Thread) -> Vec<serde_json::Value> {
+        let mut msgs: Vec<serde_json::Value> = Vec::new();
+        if !thread.system.trim().is_empty() {
+            msgs.push(serde_json::json!({
+                "role": "system", "content": thread.system.trim()
+            }));
+        }
+        for m in &thread.messages {
+            match m.role {
+                ChatRole::User => {
+                    let mut pending_text = String::new();
+                    for b in &m.blocks {
+                        match b {
+                            ContentBlock::Text { text } => {
+                                pending_text.push_str(text);
+                            }
+                            ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                is_error: _,
+                            } => {
+                                // No native error flag on this wire — the
+                                // "ERROR: .." content text carries it.
+                                if !pending_text.is_empty() {
+                                    msgs.push(serde_json::json!({
+                                        "role": "user", "content": pending_text
+                                    }));
+                                    pending_text = String::new();
+                                }
+                                msgs.push(serde_json::json!({
+                                    "role": "tool",
+                                    "tool_call_id": tool_use_id,
+                                    "content": content,
+                                }));
+                            }
+                            ContentBlock::ToolUse { .. } => {
+                                tracing::warn!("ToolUse block in a user message; skipped");
+                            }
+                        }
+                    }
+                    if !pending_text.is_empty() {
+                        msgs.push(serde_json::json!({ "role": "user", "content": pending_text }));
+                    }
+                }
+                ChatRole::Assistant => {
+                    let text: String = m
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    let calls: Vec<serde_json::Value> = m
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolUse { id, name, input } => Some(serde_json::json!({
+                                "id": id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments":
+                                        serde_json::to_string(input).unwrap_or_default(),
+                                }
+                            })),
+                            _ => None,
+                        })
+                        .collect();
+                    let mut msg = serde_json::json!({ "role": "assistant" });
+                    msg["content"] = if text.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(text)
+                    };
+                    if !calls.is_empty() {
+                        msg["tool_calls"] = serde_json::Value::Array(calls);
+                    }
+                    msgs.push(msg);
+                }
+            }
+        }
+        msgs
+    }
+
+    /// Builds the request body for a native tool-calling thread.
+    fn build_thread_payload(&self, thread: &Thread, tools: &[ToolSpec]) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "model": self.model,
+            "messages": Self::build_thread_messages(thread),
+            "temperature": self.temperature,
+            "stream": false,
+        });
+        if let Some(mt) = self.max_tokens {
+            v["max_tokens"] = mt.into();
+        }
+        if !tools.is_empty() {
+            let tools_json: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.input_schema,
+                        }
+                    })
+                })
+                .collect();
+            v["tools"] = serde_json::Value::Array(tools_json);
+        }
+        v
+    }
+
+    /// Parses a response into thread blocks + stop reason. `content` text is
+    /// think-stripped like `parse_response`; `tool_calls` become ToolUse
+    /// blocks (`arguments` JSON string parsed to a Value; unparseable → the
+    /// raw string, so the tool still sees something). The
+    /// `reasoning_content` fallback only applies when there are no tool
+    /// calls — with calls, empty content is the normal shape.
+    fn parse_thread_response(body: &str) -> Result<ThreadReply> {
+        let resp: ChatResponse = serde_json::from_str(body)?;
+        let choice = resp
+            .choices
+            .into_iter()
+            .next()
+            .ok_or_else(|| LoreError::Model("empty 'choices' in response".into()))?;
+        let finish = choice.finish_reason;
+        let msg = choice.message;
+
+        let mut blocks: Vec<ContentBlock> = Vec::new();
+        let mut reasoning_fallback = false;
+        let content = strip_think(&msg.content);
+        let calls = msg.tool_calls.unwrap_or_default();
+        if content.trim().is_empty() && calls.is_empty() {
+            if let Some(r) = msg.reasoning_content {
+                let r = strip_think(&r);
+                if !r.trim().is_empty() {
+                    blocks.push(ContentBlock::Text { text: r });
+                    reasoning_fallback = true;
+                }
+            }
+        } else if !content.trim().is_empty() {
+            blocks.push(ContentBlock::Text { text: content });
+        }
+        for (i, c) in calls.into_iter().enumerate() {
+            let input = match serde_json::from_str(&c.function.arguments) {
+                Ok(v) => v,
+                Err(_) => serde_json::Value::String(c.function.arguments),
+            };
+            blocks.push(ContentBlock::ToolUse {
+                // Some compat servers omit ids — synthesize a stable one so
+                // tool_result correlation still works.
+                id: c.id.unwrap_or_else(|| format!("call_{i}")),
+                name: c.function.name,
+                input,
+            });
+        }
+
+        let has_calls = blocks
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        let stop = if has_calls {
+            StopReason::ToolUse
+        } else {
+            match finish.as_deref() {
+                Some("stop") => StopReason::EndTurn,
+                Some("tool_calls") => StopReason::ToolUse,
+                _ => StopReason::Other,
+            }
+        };
+        Ok(ThreadReply {
+            blocks,
+            stop,
+            reasoning_fallback,
+        })
+    }
+
+    /// Whether an error response means "this endpoint/model cannot do native
+    /// tool calling" (drives the `auto` downgrade). Substring-based by
+    /// necessity — the compat ecosystem has no structured error for this:
+    /// - ollama: HTTP 400 `"<model> does not support tools"`
+    /// - llama.cpp server: `"tools param requires --jinja flag"`
+    /// - vLLM without `--enable-auto-tool-choice`: 400 mentioning
+    ///   `tool_choice`/tools being unsupported
+    /// - strict compat proxies: `"unknown field"` for `tools`
+    fn tools_unsupported(body: &str) -> bool {
+        let b = body.to_lowercase();
+        if b.contains("does not support tools") {
+            return true;
+        }
+        if b.contains("--jinja") {
+            return true;
+        }
+        (b.contains("tools") || b.contains("tool_choice"))
+            && (b.contains("unsupported")
+                || b.contains("not supported")
+                || b.contains("unknown field")
+                || b.contains("unrecognized"))
     }
 
     /// Builds an authorized POST request.
@@ -417,6 +656,39 @@ fn partial_suffix_len(s: &str, needle: &str) -> usize {
 
 #[async_trait]
 impl Model for OpenAiModel {
+    async fn complete_thread(&self, thread: &Thread, tools: &[ToolSpec]) -> Result<ThreadReply> {
+        let work = async {
+            let resp = self
+                .request(&self.build_thread_payload(thread, tools))
+                .send()
+                .await?;
+            let status = resp.status();
+            let body = resp.text().await?;
+            if !status.is_success() {
+                // Tool-incapable endpoint → typed error so `auto` mode can
+                // downgrade to the text protocol instead of failing the task.
+                if Self::tools_unsupported(&body) {
+                    return Err(LoreError::NativeToolsUnsupported(format!(
+                        "{status}: {body}"
+                    )));
+                }
+                return Err(LoreError::Model(format!("{status}: {body}")));
+            }
+            Self::parse_thread_response(&body)
+        };
+        match tokio::time::timeout(self.timeout, work).await {
+            Ok(r) => r,
+            Err(_) => Err(LoreError::Model(format!(
+                "request timeout ({}s)",
+                self.timeout.as_secs()
+            ))),
+        }
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
     async fn complete(&self, prompt: &Prompt) -> Result<Completion> {
         // One-shot: timeout is the total duration (no progress signal).
         let work = async {
@@ -540,6 +812,232 @@ impl Model for OpenAiModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_thread() -> (Thread, Vec<ToolSpec>) {
+        use super::super::ChatMessage as ThreadMsg;
+        let mut t = Thread::new("You are Aria.");
+        t.push(ThreadMsg::user_text("what is 3+4?"));
+        t.push(ThreadMsg::assistant_blocks(vec![
+            ContentBlock::Text {
+                text: "Computing.".into(),
+            },
+            ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "calc".into(),
+                input: serde_json::json!({"args": "3 + 4"}),
+            },
+        ]));
+        t.push(ThreadMsg::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "call_1".into(),
+            content: "7".into(),
+            is_error: false,
+        }]));
+        let specs = vec![ToolSpec {
+            name: "calc".into(),
+            description: "evaluates arithmetic".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"args": {"type": "string"}},
+                "required": ["args"]
+            }),
+        }];
+        (t, specs)
+    }
+
+    #[test]
+    fn thread_payload_maps_messages_and_tools() {
+        let m = OpenAiModel::ollama("llama3.2");
+        let (t, specs) = tool_thread();
+        let v = m.build_thread_payload(&t, &specs);
+
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "calc");
+        assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+
+        let msgs = v["messages"].as_array().unwrap();
+        // system + user + assistant(text+tool_calls) + tool result
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "what is 3+4?");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "Computing.");
+        let tc = &msgs[2]["tool_calls"][0];
+        assert_eq!(tc["id"], "call_1");
+        assert_eq!(tc["function"]["name"], "calc");
+        // arguments is a JSON *string* on this wire.
+        let args: serde_json::Value =
+            serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["args"], "3 + 4");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_call_id"], "call_1");
+        assert_eq!(msgs[3]["content"], "7");
+    }
+
+    #[test]
+    fn thread_payload_assistant_without_text_has_null_content() {
+        use super::super::ChatMessage as ThreadMsg;
+        let m = OpenAiModel::ollama("llama3.2");
+        let mut t = Thread::new("");
+        t.push(ThreadMsg::assistant_blocks(vec![ContentBlock::ToolUse {
+            id: "c1".into(),
+            name: "calc".into(),
+            input: serde_json::json!({"args": "1"}),
+        }]));
+        let v = m.build_thread_payload(&t, &[]);
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "empty system omitted");
+        assert!(msgs[0]["content"].is_null());
+        assert!(v.get("tools").is_none());
+    }
+
+    #[test]
+    fn parse_thread_extracts_tool_calls_and_stop() {
+        let body = r#"{"choices":[{"finish_reason":"tool_calls","message":{
+            "role":"assistant","content":"",
+            "tool_calls":[{"id":"c9","type":"function",
+                "function":{"name":"calc","arguments":"{\"args\":\"2+2\"}"}}]}}]}"#;
+        let r = OpenAiModel::parse_thread_response(body).unwrap();
+        assert_eq!(r.stop, StopReason::ToolUse);
+        assert!(!r.reasoning_fallback);
+        let uses = r.tool_uses();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].id, "c9");
+        assert_eq!(uses[0].input["args"], "2+2");
+    }
+
+    #[test]
+    fn parse_thread_unparseable_arguments_fall_back_to_raw_string() {
+        let body = r#"{"choices":[{"finish_reason":"tool_calls","message":{
+            "role":"assistant","content":"",
+            "tool_calls":[{"type":"function",
+                "function":{"name":"shell","arguments":"ls -la"}}]}}]}"#;
+        let r = OpenAiModel::parse_thread_response(body).unwrap();
+        let uses = r.tool_uses();
+        // Missing id → synthesized; raw string preserved as input.
+        assert_eq!(uses[0].id, "call_0");
+        assert_eq!(uses[0].input, &serde_json::Value::String("ls -la".into()));
+    }
+
+    #[test]
+    fn parse_thread_plain_text_is_end_turn() {
+        let body = r#"{"choices":[{"finish_reason":"stop","message":{
+            "role":"assistant","content":"<think>hm</think>The answer is 4."}}]}"#;
+        let r = OpenAiModel::parse_thread_response(body).unwrap();
+        assert_eq!(r.stop, StopReason::EndTurn);
+        assert_eq!(r.text(), "The answer is 4.", "think-stripped");
+        assert!(r.tool_uses().is_empty());
+    }
+
+    #[test]
+    fn parse_thread_reasoning_fallback_only_without_tool_calls() {
+        // No calls + empty content → reasoning fallback applies.
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"",
+            "reasoning_content":"Step: 2+2=4"}}]}"#;
+        let r = OpenAiModel::parse_thread_response(body).unwrap();
+        assert!(r.reasoning_fallback);
+        assert_eq!(r.text(), "Step: 2+2=4");
+
+        // With calls, empty content is the NORMAL shape — no fallback.
+        let body2 = r#"{"choices":[{"message":{"role":"assistant","content":"",
+            "reasoning_content":"thinking...",
+            "tool_calls":[{"id":"c1","type":"function",
+                "function":{"name":"calc","arguments":"{}"}}]}}]}"#;
+        let r2 = OpenAiModel::parse_thread_response(body2).unwrap();
+        assert!(!r2.reasoning_fallback);
+        assert_eq!(r2.text(), "");
+        assert_eq!(r2.tool_uses().len(), 1);
+    }
+
+    #[test]
+    fn tools_unsupported_detection_matrix() {
+        // ollama
+        assert!(OpenAiModel::tools_unsupported(
+            r#"{"error":{"message":"registry.ollama.ai/library/gemma3:4b does not support tools"}}"#
+        ));
+        // llama.cpp server
+        assert!(OpenAiModel::tools_unsupported(
+            r#"{"error":"tools param requires --jinja flag"}"#
+        ));
+        // vLLM-style
+        assert!(OpenAiModel::tools_unsupported(
+            r#"{"error":"tool_choice option is unsupported on this server"}"#
+        ));
+        // strict proxy
+        assert!(OpenAiModel::tools_unsupported(
+            r#"{"error":"unknown field 'tools'"}"#
+        ));
+        // Unrelated 400s must NOT downgrade.
+        assert!(!OpenAiModel::tools_unsupported(
+            r#"{"error":"context length exceeded"}"#
+        ));
+        assert!(!OpenAiModel::tools_unsupported(
+            r#"{"error":"invalid model name"}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_thread_maps_unsupported_error() {
+        use axum::{http::StatusCode, routing::post, Router};
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":{"message":"llama3.2 does not support tools"}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let m = OpenAiModel::new(format!("http://{addr}"), "llama3.2");
+        assert!(m.supports_native_tools());
+        let (t, specs) = tool_thread();
+        let err = m.complete_thread(&t, &specs).await.unwrap_err();
+        assert!(
+            matches!(err, LoreError::NativeToolsUnsupported(_)),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_thread_round_trips_over_http() {
+        use axum::{routing::post, Router};
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|body: axum::Json<serde_json::Value>| async move {
+                assert!(body.0["tools"].is_array());
+                axum::Json(serde_json::json!({
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant", "content": "",
+                            "tool_calls": [{"id": "c1", "type": "function",
+                                "function": {"name": "calc",
+                                             "arguments": "{\"args\":\"3 + 4\"}"}}]
+                        }
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let m = OpenAiModel::new(format!("http://{addr}"), "gpt-test");
+        let (t, specs) = tool_thread();
+        let r = m.complete_thread(&t, &specs).await.unwrap();
+        assert_eq!(r.stop, StopReason::ToolUse);
+        assert_eq!(r.tool_uses()[0].name, "calc");
+        assert_eq!(r.tool_uses()[0].input["args"], "3 + 4");
+    }
 
     #[test]
     fn payload_has_model_temperature_and_two_messages() {
