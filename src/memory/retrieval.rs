@@ -140,11 +140,15 @@ pub const CONFLICT_BAND: (f32, f32) = (0.6, 0.9);
 // --- Graph expansion leg (Query.graph) ---
 
 /// How many top first-pass candidates seed the entity-neighbor expansion.
+/// `doc(hidden)`: store-internal plumbing, not a semver surface (review #13).
+#[doc(hidden)]
 pub const GRAPH_SEED_K: usize = 3;
 /// Max neighbors pulled per expansion (before filtering).
+#[doc(hidden)]
 pub const GRAPH_NEIGHBOR_CAP: usize = 16;
 /// Damping applied to the best seed score when scoring a pulled neighbor —
 /// a hop is supporting evidence, never stronger than its source.
+#[doc(hidden)]
 pub const GRAPH_DAMP: f32 = 0.5;
 
 /// Appends graph-pulled neighbors to a first-pass candidate list with the
@@ -152,6 +156,7 @@ pub const GRAPH_DAMP: f32 = 0.5;
 /// the caller runs [`finalize`] afterwards (which sorts). Neighbors are
 /// assumed pre-filtered (visibility/tier/importance) and deduplicated
 /// against `hits` by the caller.
+#[doc(hidden)]
 pub fn append_graph_neighbors(
     hits: &mut Vec<Scored<Memory>>,
     neighbors: Vec<Memory>,

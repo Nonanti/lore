@@ -9,7 +9,7 @@
 //!
 //! Design: `docs/superpowers/specs/2026-07-24-team-memory-design.md`.
 
-use super::types::{ConsolidationReport, Memory, Outcome, Query, Scope, Scored};
+use super::types::{ConsolidationReport, Memory, Outcome, Query, Scope, Scored, Tier};
 use super::MemoryStore;
 use crate::error::{LoreError, Result};
 use crate::id::MemoryId;
@@ -57,6 +57,19 @@ impl MemoryStore for CompositeStore {
     }
 
     async fn recall(&self, scope: &Scope, query: &Query) -> Result<Vec<Scored<Memory>>> {
+        // Contract (review #5): the shared side carries distilled TEAM
+        // knowledge — semantic-tier records (spec T3). A recall whose tier
+        // filter excludes Semantic (e.g. solve's procedural-prior query)
+        // would scan the shared store for a guaranteed-empty answer every
+        // time; skip it. Lib users composing non-semantic World records
+        // are off-label for this type — documented here deliberately.
+        if query
+            .tiers
+            .as_ref()
+            .is_some_and(|t| !t.contains(&Tier::Semantic))
+        {
+            return self.personal.recall(scope, query).await;
+        }
         // Both sides run the full query (each store enforces `Scope::sees`
         // itself: the shared store answers with World records, the personal
         // store with Agent records — plus any legacy World records written
@@ -119,6 +132,8 @@ impl MemoryStore for CompositeStore {
         }
     }
 
+    /// Count = records VISIBLE in the scope (personal + shared World), not
+    /// records OWNED by the agent — team growth shows up here by design.
     async fn count(&self, scope: &Scope) -> Result<usize> {
         Ok(self.personal.count(scope).await? + self.shared.count(scope).await?)
     }
@@ -157,6 +172,42 @@ mod tests {
             personal,
             shared,
         )
+    }
+
+    #[tokio::test]
+    async fn non_semantic_tier_recall_skips_shared_side() {
+        let (c, _p, shared) = composite();
+        let scope = Scope::Agent(AgentId::new());
+        // A (off-label) procedural record in the shared store…
+        shared
+            .remember(Memory::procedural(
+                Scope::World,
+                "shared proc",
+                vec!["step".into()],
+            ))
+            .await
+            .unwrap();
+        // …is invisible to a procedural-tier recall through the composite
+        // (documented contract: shared side = semantic team knowledge).
+        let res = c
+            .recall(
+                &scope,
+                &Query::new("proc")
+                    .tier(crate::memory::Tier::Procedural)
+                    .limit(5),
+            )
+            .await
+            .unwrap();
+        assert!(
+            res.is_empty(),
+            "shared side must be skipped for non-semantic tiers"
+        );
+        // Semantic-including queries still see the shared side.
+        let res2 = c
+            .recall(&scope, &Query::new("proc").limit(5))
+            .await
+            .unwrap();
+        assert!(!res2.is_empty(), "untiered queries hit both sides");
     }
 
     #[tokio::test]

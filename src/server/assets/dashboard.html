@@ -148,6 +148,10 @@
 
 <script>
 "use strict";
+// Tunables (review #12).
+const POLL_MS = 4000;
+const RECALL_LIMIT = 8;
+const ID_SHORT = 10;
 const $ = (s, el) => (el || document).querySelector(s);
 const $$ = (s, el) => Array.from((el || document).querySelectorAll(s));
 const keyEl = $("#key");
@@ -199,7 +203,7 @@ const openDetails = new Set();
 // previous polling cycle — stale promises must not overwrite fresh DOM.
 let taskGen = 0;
 function fmtTime(t) { return new Date(t).toLocaleString(); }
-function shortId(id) { return id.length > 10 ? id.slice(0, 10) + "…" : id; }
+function shortId(id) { return id.length > ID_SHORT ? id.slice(0, ID_SHORT) + "…" : id; }
 
 async function loadTasks() {
   const gen = ++taskGen;
@@ -334,7 +338,7 @@ async function recall(id) {
   out.innerHTML = '<div class="empty">searching…</div>';
   try {
     const mems = await api("/agents/" + encodeURIComponent(id) +
-      "/recall?semantic=true&limit=8&q=" + encodeURIComponent(q));
+      "/recall?semantic=true&limit=" + RECALL_LIMIT + "&q=" + encodeURIComponent(q));
     out.innerHTML = mems.length
       ? mems.map(m => `<div class="mem"><span class="score">${esc(Number(m.score).toFixed(2))}</span>${esc(m.summary)}</div>`).join("")
       : '<div class="empty">no matches</div>';
@@ -351,7 +355,7 @@ function refresh() {
 }
 setInterval(() => {
   if ($("#autorefresh").checked && document.visibilityState !== "hidden") refresh();
-}, 4000);
+}, POLL_MS);
 refresh();
 </script>
 </body>

@@ -117,6 +117,31 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
   thread types, both providers, and all three modes; 1 new live-LLM
   ignored smoke test.
 
+### Fixed — full-session review sweep (13 findings, 2 live-verified)
+
+- **Consecutive-user nudge live-verified** — the native driver's last-step
+  shape (`…tool_result, user nudge`) was suspected to break Anthropic's
+  role rules; verified accepted against the live API (both shapes) and
+  pinned with a code comment so nobody "fixes" it blindly.
+- **`agent/mod.rs` split at the project's own M25 threshold** (2678 →
+  1198 + `solve.rs` 435 + `tests.rs` 1065); public paths unchanged; an
+  orphaned doc comment from the SolvePriors insertion restored to `Agent`.
+- **Composite recall skips the shared side for non-semantic tier filters**
+  — solve's procedural-prior query no longer scans the team store for a
+  guaranteed-empty answer (documented contract + test).
+- **InMemory `remember` overwrite drops the old text's entity mappings**
+  (import/restore flows could reach records via content they no longer
+  have; SQLite side already did DELETE+INSERT).
+- **v2→v3 migration no longer rewrites every row**: v1-only work (column
+  adds, re-encode backfill, FTS build) gated on the recorded version.
+- **Entity index hygiene**: consolidation sweeps entity rows of
+  soft-deleted records.
+- `NativeToolsUnsupported` → HTTP 422 (operator misconfig, not a 500);
+  `NeuralReranker` warns once then logs at debug (no hot-path log storms);
+  `LORE_TOOL_MODE` read once per process (`OnceLock`); graph plumbing
+  marked `#[doc(hidden)]`; dashboard magic numbers named; composite
+  `count` semantics and CSP same-origin side effect documented.
+
 ### Added — web dashboard (spec: `2026-07-24-dashboard-design.md`)
 
 - **`GET /ui`** — a single self-contained embedded HTML dashboard (inline

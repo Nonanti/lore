@@ -63,6 +63,11 @@ Independent review (2 major, 4 minor, 4 nits):
 - N4 (space injection via status CSS class) acknowledged, not changed:
   `TaskStatus` is a server-side enum; `esc()` already covers the
   injection-relevant characters.
+- CSP side effect (follow-up review #4): `connect-src 'self'` also means
+  the shell can only talk to the Lore instance that SERVED it — pointing
+  one dashboard at a remote/other instance is deliberately impossible.
+  Cross-instance administration is a non-goal; run each instance's own
+  `/ui`.
 
 ## 5. Out of scope
 

@@ -607,6 +607,9 @@ impl IntoResponse for ApiError {
             LoreError::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
             LoreError::InvalidInput(m) => (StatusCode::UNPROCESSABLE_ENTITY, m.clone()),
             LoreError::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
+            // Operator misconfiguration (agent forced to tool_mode=native on
+            // a tool-incapable endpoint) is not a server fault — tell them.
+            LoreError::NativeToolsUnsupported(m) => (StatusCode::UNPROCESSABLE_ENTITY, m.clone()),
             other => {
                 // Internal details are not leaked to the client; logged server-side.
                 tracing::error!(error = %other, "internal error (500)");

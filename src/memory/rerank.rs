@@ -34,6 +34,9 @@ impl Reranker for NativeReranker {
 #[cfg(feature = "neural")]
 pub struct NeuralReranker {
     model: std::sync::Mutex<fastembed::TextRerank>,
+    /// Warn-once latch: a permanently broken model must not spam a warn
+    /// per recall on the hot path (review #10).
+    warned: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "neural")]
@@ -51,6 +54,7 @@ impl NeuralReranker {
                 .map_err(|e| crate::error::LoreError::Model(e.to_string()))?;
         Ok(Self {
             model: std::sync::Mutex::new(m),
+            warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -70,8 +74,13 @@ impl Reranker for NeuralReranker {
             Ok(r) => r,
             Err(e) => {
                 // Fail open: first-pass order is a valid answer; losing the
-                // whole recall to a rerank hiccup is not.
-                tracing::warn!(error = %e, "neural rerank error (keeping first-pass order)");
+                // whole recall to a rerank hiccup is not. Warn once, then
+                // drop to debug — no log storms on the recall hot path.
+                if !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(error = %e, "neural rerank error (keeping first-pass order; further errors logged at debug)");
+                } else {
+                    tracing::debug!(error = %e, "neural rerank error (keeping first-pass order)");
+                }
                 return items;
             }
         };

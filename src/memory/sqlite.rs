@@ -116,54 +116,60 @@ impl SqliteStore {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(sqlite_err)?;
-        if !has_col(&tx, "search_text")? {
-            tx.execute_batch(
-                "ALTER TABLE memories ADD COLUMN search_text TEXT NOT NULL DEFAULT ''",
-            )
-            .map_err(sqlite_err)?;
-        }
-        if !has_col(&tx, "emb")? {
-            tx.execute_batch("ALTER TABLE memories ADD COLUMN emb BLOB")
-                .map_err(sqlite_err)?;
-        }
-
-        // Backfill: v1 rows have the embedding inside JSON — extract it into
-        // BLOB, generate search_text. (decode_row also reads v1 JSON: if the
-        // emb column is empty, the JSON embedding is used.) Rows are consumed
-        // LAZILY — the entire table is not loaded into RAM (no single-pass
-        // memory spike on large installations).
-        {
-            let mut stmt = tx
-                .prepare("SELECT id, data FROM memories")
-                .map_err(sqlite_err)?;
-            let mut rows = stmt.query([]).map_err(sqlite_err)?;
-            while let Some(row) = rows.next().map_err(sqlite_err)? {
-                let id: String = row.get(0).map_err(sqlite_err)?;
-                let data: String = row.get(1).map_err(sqlite_err)?;
-                // A single corrupt JSON row should not kill the entire
-                // migration — skip and warn, consistent with the persona
-                // policy where one bad record does not stop the service.
-                let mem: Memory = match serde_json::from_str(&data) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::warn!(id = %id, error = %e, "skipping corrupt row during v1→v2 migration");
-                        continue;
-                    }
-                };
-                let (slim, emb, stext) = Self::encode_row(&mem)?;
-                tx.execute(
-                    "UPDATE memories SET data = ?1, search_text = ?2, emb = ?3 WHERE id = ?4",
-                    params![slim, stext, emb, id],
+        // v1-only work (column adds, row re-encode backfill, FTS build) is
+        // gated on the RECORDED version: a v2→v3 upgrade must not rewrite
+        // every row + rebuild FTS for nothing (review #6). Fresh DBs report
+        // "1" (empty meta) and take this path over empty tables — cheap.
+        let from_v1 = ver == "1";
+        if from_v1 {
+            if !has_col(&tx, "search_text")? {
+                tx.execute_batch(
+                    "ALTER TABLE memories ADD COLUMN search_text TEXT NOT NULL DEFAULT ''",
                 )
                 .map_err(sqlite_err)?;
             }
-        }
+            if !has_col(&tx, "emb")? {
+                tx.execute_batch("ALTER TABLE memories ADD COLUMN emb BLOB")
+                    .map_err(sqlite_err)?;
+            }
 
-        // FTS5 (external content) + sync triggers. Note: upsert uses
-        // `ON CONFLICT DO UPDATE` — `INSERT OR REPLACE` would skip the delete
-        // trigger and leave the index stale.
-        tx.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+            // Backfill: v1 rows have the embedding inside JSON — extract it into
+            // BLOB, generate search_text. (decode_row also reads v1 JSON: if the
+            // emb column is empty, the JSON embedding is used.) Rows are consumed
+            // LAZILY — the entire table is not loaded into RAM (no single-pass
+            // memory spike on large installations).
+            {
+                let mut stmt = tx
+                    .prepare("SELECT id, data FROM memories")
+                    .map_err(sqlite_err)?;
+                let mut rows = stmt.query([]).map_err(sqlite_err)?;
+                while let Some(row) = rows.next().map_err(sqlite_err)? {
+                    let id: String = row.get(0).map_err(sqlite_err)?;
+                    let data: String = row.get(1).map_err(sqlite_err)?;
+                    // A single corrupt JSON row should not kill the entire
+                    // migration — skip and warn, consistent with the persona
+                    // policy where one bad record does not stop the service.
+                    let mem: Memory = match serde_json::from_str(&data) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!(id = %id, error = %e, "skipping corrupt row during v1→v2 migration");
+                            continue;
+                        }
+                    };
+                    let (slim, emb, stext) = Self::encode_row(&mem)?;
+                    tx.execute(
+                        "UPDATE memories SET data = ?1, search_text = ?2, emb = ?3 WHERE id = ?4",
+                        params![slim, stext, emb, id],
+                    )
+                    .map_err(sqlite_err)?;
+                }
+            }
+
+            // FTS5 (external content) + sync triggers. Note: upsert uses
+            // `ON CONFLICT DO UPDATE` — `INSERT OR REPLACE` would skip the delete
+            // trigger and leave the index stale.
+            tx.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
                 search_text, content='memories', content_rowid='rowid', tokenize='unicode61');
              CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
                 INSERT INTO memories_fts(rowid, search_text) VALUES (new.rowid, new.search_text);
@@ -178,8 +184,9 @@ impl SqliteStore {
                 INSERT INTO memories_fts(rowid, search_text) VALUES (new.rowid, new.search_text);
              END;
              INSERT INTO memories_fts(memories_fts) VALUES('rebuild');",
-        )
-        .map_err(sqlite_err)?;
+            )
+            .map_err(sqlite_err)?;
+        } // from_v1
 
         // v3: entity inverted index feeding the recall graph leg. Backfilled
         // here (lazy row consumption, corrupt rows skipped — same policy as
@@ -1027,6 +1034,14 @@ impl SqliteStore {
                 Self::upsert(&tx, &m)?;
             }
         }
+        // Index hygiene (review #7): soft-deleted records are filtered at
+        // read, but their entity rows would otherwise accumulate forever.
+        tx.execute(
+            "DELETE FROM entities WHERE memory_id IN
+                (SELECT id FROM memories WHERE deleted = 1)",
+            [],
+        )
+        .map_err(sqlite_err)?;
         tx.commit().map_err(sqlite_err)?;
         Ok(ConsolidationReport {
             scanned,

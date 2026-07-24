@@ -153,14 +153,34 @@ impl MemoryStore for InMemoryStore {
         let id = mem.id.clone();
         // Lock discipline: recall nests inner.read → entity.read, so remember
         // must NEVER hold both locks at once (inverse nesting would deadlock).
-        // Entities are extracted first; the two writes are sequential.
-        // Accepted window: a recall between the two writes finds the record
-        // by first-pass scan but cannot yet use it as a graph seed source —
+        // Entities are extracted first; all lock acquisitions are sequential.
+        // Accepted window: a recall between the writes finds the record by
+        // first-pass scan but cannot yet use it as a graph seed source —
         // resolved by the very next entity_idx write.
         let ents = super::graph::extract_entities(&mem);
+        // Overwrite of an existing id (import/restore flows): the OLD text's
+        // entity mappings must not linger, or the record stays reachable
+        // through content it no longer has (review #2; SQLite side does the
+        // equivalent DELETE+INSERT).
+        let old_ents = {
+            let guard = self.inner.read().await;
+            guard
+                .get(&id.to_string())
+                .map(super::graph::extract_entities)
+        };
         self.inner.write().await.insert(id.to_string(), mem);
         {
             let mut idx = self.entity_idx.write().await;
+            if let Some(old) = old_ents {
+                for ent in old.difference(&ents) {
+                    if let Some(set) = idx.get_mut(ent) {
+                        set.remove(&id.to_string());
+                        if set.is_empty() {
+                            idx.remove(ent);
+                        }
+                    }
+                }
+            }
             for ent in ents {
                 idx.entry(ent).or_default().insert(id.to_string());
             }
@@ -512,6 +532,43 @@ mod tests {
             !res.iter()
                 .any(|s| s.item.searchable_text().contains("vaccinated")),
             "another agent's record must never arrive through the graph leg"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_overwrite_drops_old_entity_mappings() {
+        let store = InMemoryStore::new();
+        let (_a, scope) = agent_scope();
+        let mut first = Memory::semantic(
+            scope.clone(),
+            "Paspas visited the veterinary clinic",
+            SemanticCat::Fact,
+        );
+        let anchor_id = store
+            .remember(Memory::semantic(
+                scope.clone(),
+                "Aylin adopted a tabby cat and named it Paspas",
+                SemanticCat::Fact,
+            ))
+            .await
+            .unwrap();
+        let _ = anchor_id;
+        let rid = first.id.clone();
+        store.remember(first.clone()).await.unwrap();
+
+        // Overwrite the SAME id with unrelated text — the old "paspas"
+        // entity must no longer pull this record through the graph leg.
+        first.kind =
+            Memory::semantic(scope.clone(), "weather is sunny today", SemanticCat::Fact).kind;
+        store.remember(first).await.unwrap();
+
+        let res = store
+            .recall(&scope, &Query::new("aylin cat").graph().limit(5))
+            .await
+            .unwrap();
+        assert!(
+            !res.iter().any(|s| s.item.id == rid),
+            "overwritten record must not be reachable via its OLD entities"
         );
     }
 
