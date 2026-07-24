@@ -76,7 +76,17 @@ fn warn_bwrap_missing_once() {
 ///
 /// Built as separate `String` args — never string-interpolated into a
 /// single shell string (no quoting bugs).
-pub fn bwrap_argv(command: &str, cwd: &Path) -> Vec<String> {
+///
+/// Note on mount ordering: bwrap applies mounts left-to-right; a later
+/// `--bind` on the same path overrides the earlier `--ro-bind`. This means:
+///
+/// - `/etc` is covered by `--ro-bind / /` with no writable override → RO ✓
+/// - `--tmpfs /tmp` overlays the RO `/tmp` slice → host `/tmp` is hidden ✓
+/// - `--bind <ws> <ws>` after `--ro-bind / /` → workspace is RW ✓
+///
+/// Edge case: if the workspace is under `/tmp`, the `--bind <ws> <ws>`
+/// correctly overlays the empty tmpfs with the host workspace dir.
+fn bwrap_argv(command: &str, cwd: &Path) -> Vec<String> {
     let ws = cwd.to_string_lossy().to_string();
     vec![
         "--ro-bind".into(),
@@ -107,15 +117,28 @@ pub fn bwrap_argv(command: &str, cwd: &Path) -> Vec<String> {
 /// - `IfAvailable/Required` + bwrap present → exact bwrap argv per spec
 /// - `IfAvailable` + bwrap missing → warn once + fall back to plain `sh -c`
 /// - `Required` + bwrap missing → `Err(PolicyDenied)` (fail closed)
-fn spawn_argv(command: &str, cwd: &Path, sandbox: SandboxMode) -> Result<(String, Vec<String>)> {
+///
+/// Returns `(program, argv, set_current_dir)` — `set_current_dir` is true
+/// when the caller must set `current_dir` on the spawned process
+/// (plain `sh` mode). When bwrap is used, `--chdir` handles the working
+/// directory inside the sandbox, so `current_dir` must NOT be set (it
+/// would conflict with the sandbox's `/` view).
+fn spawn_argv(
+    command: &str,
+    cwd: &Path,
+    sandbox: SandboxMode,
+) -> Result<(String, Vec<String>, bool)> {
     match sandbox {
-        SandboxMode::Off => Ok(("sh".into(), vec!["-c".into(), command.into()])),
+        SandboxMode::Off => Ok(("sh".into(), vec!["-c".into(), command.into()], true)),
         SandboxMode::IfAvailable | SandboxMode::Required => {
             if bwrap_available() {
-                Ok(("bwrap".into(), bwrap_argv(command, cwd)))
+                // bwrap --chdir handles cwd; don't set current_dir on the
+                // Command — it would resolve against the host filesystem,
+                // not the sandbox mount layout.
+                Ok(("bwrap".into(), bwrap_argv(command, cwd), false))
             } else if sandbox == SandboxMode::IfAvailable {
                 warn_bwrap_missing_once();
-                Ok(("sh".into(), vec!["-c".into(), command.into()]))
+                Ok(("sh".into(), vec!["-c".into(), command.into()], true))
             } else {
                 Err(LoreError::PolicyDenied(
                     "sandbox required but bwrap not found".into(),
@@ -206,14 +229,16 @@ impl Tool for ShellTool {
 
         // Determine sandbox mode and build the spawn argv.
         let sandbox = self.gate.policy.sandbox_exec;
-        let (program, argv) = spawn_argv(command, &self.cwd, sandbox)?;
+        let (program, argv, set_current_dir) = spawn_argv(command, &self.cwd, sandbox)?;
 
         // Spawn the child with piped stdout/stderr.
         // When using bwrap, --chdir handles the working directory inside
-        // the sandbox; for plain sh, we set current_dir explicitly.
+        // the sandbox; for plain sh, we set current_dir via the bool flag
+        // returned by spawn_argv — avoids fragile string comparison on
+        // the program name.
         let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&argv);
-        if program == "sh" {
+        if set_current_dir {
             cmd.current_dir(&self.cwd);
         }
         cmd.stdout(std::process::Stdio::piped())
@@ -526,10 +551,11 @@ mod tests {
 
     #[test]
     fn spawn_argv_off_returns_plain_sh() {
-        let (program, args) =
+        let (program, args, set_current_dir) =
             spawn_argv("ls -la", Path::new("/workspace"), SandboxMode::Off).unwrap();
         assert_eq!(program, "sh");
         assert_eq!(args, vec!["-c", "ls -la"]);
+        assert!(set_current_dir, "Off mode must set current_dir");
     }
 
     #[test]
@@ -606,7 +632,11 @@ mod tests {
 
     #[test]
     fn spawn_argv_required_no_bwrap_fails_closed() {
-        // On this machine bwrap is absent — Required must return PolicyDenied.
+        if bwrap_available() {
+            // bwrap present on this host — Required succeeds; test the
+            // absent-bwrap branch on a host where bwrap is missing.
+            return;
+        }
         let result = spawn_argv("echo hi", Path::new("/ws"), SandboxMode::Required);
         assert!(result.is_err(), "Required + no bwrap → PolicyDenied");
         let err = result.unwrap_err();
@@ -616,13 +646,54 @@ mod tests {
 
     #[test]
     fn spawn_argv_if_available_no_bwrap_falls_back() {
-        // On this machine bwrap is absent — IfAvailable must fall back to
-        // plain sh (with a one-time warning already logged).
+        if bwrap_available() {
+            // bwrap present on this host — IfAvailable uses bwrap; test the
+            // fallback branch on a host where bwrap is missing.
+            return;
+        }
         let result = spawn_argv("echo hi", Path::new("/ws"), SandboxMode::IfAvailable);
         assert!(result.is_ok(), "IfAvailable + no bwrap → fallback");
-        let (program, args) = result.unwrap();
+        let (program, args, set_current_dir) = result.unwrap();
         assert_eq!(program, "sh");
         assert_eq!(args, vec!["-c", "echo hi"]);
+        assert!(set_current_dir, "fallback sh must set current_dir");
+    }
+
+    /// Required + bwrap present → Ok with bwrap argv and set_current_dir=false.
+    #[test]
+    fn spawn_argv_required_with_bwrap_returns_bwrap_argv() {
+        if !bwrap_available() {
+            return; // can only test the "bwrap present" branch when bwrap exists.
+        }
+        let result = spawn_argv("echo hi", Path::new("/ws"), SandboxMode::Required);
+        assert!(result.is_ok(), "Required + bwrap present → Ok");
+        let (program, args, set_current_dir) = result.unwrap();
+        assert_eq!(program, "bwrap");
+        assert!(!set_current_dir, "bwrap mode must NOT set current_dir");
+        // Verify the argv starts with the expected bwrap flags.
+        let first_flag = &args[0];
+        assert_eq!(
+            first_flag, "--ro-bind",
+            "first bwrap flag must be --ro-bind"
+        );
+    }
+
+    /// IfAvailable + bwrap present → Ok with bwrap argv (same as Required).
+    #[test]
+    fn spawn_argv_if_available_with_bwrap_returns_bwrap_argv() {
+        if !bwrap_available() {
+            return;
+        }
+        let result = spawn_argv("echo hi", Path::new("/ws"), SandboxMode::IfAvailable);
+        assert!(result.is_ok(), "IfAvailable + bwrap present → Ok");
+        let (program, args, set_current_dir) = result.unwrap();
+        assert_eq!(program, "bwrap");
+        assert!(!set_current_dir, "bwrap mode must NOT set current_dir");
+        let first_flag = &args[0];
+        assert_eq!(
+            first_flag, "--ro-bind",
+            "first bwrap flag must be --ro-bind"
+        );
     }
 
     // ── Policy serde: old JSON without sandbox_exec ─────────────────────
@@ -749,6 +820,9 @@ mod tests {
     /// spawn_argv Required + no bwrap: exact error message matches spec.
     #[test]
     fn spawn_argv_required_error_message_exact() {
+        if bwrap_available() {
+            return; // only meaningful when bwrap is absent.
+        }
         let result = spawn_argv("ls", Path::new("/ws"), SandboxMode::Required);
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
@@ -847,10 +921,10 @@ mod tests {
         let out = tool.run("touch inside_ws.txt").await.unwrap();
         assert!(out.contains("[exit code: 0]"), "write in ws ok: {out}");
 
-        // Write to /tmp → fails (tmpfs, but unprivileged bwrap may allow it;
-        // the key property is isolation from host /tmp).
-        // We just verify the sandbox runs; precise /tmp isolation depends on
-        // bwrap version and user namespaces.
+        // Write inside workspace succeeded — sandbox is functional.
+        // /tmp isolation is not asserted here because bwrap creates a fresh
+        // tmpfs that may or may not allow writes depending on userns
+        // privileges; the important property is that host /tmp is hidden.
 
         std::fs::remove_dir_all(&ws).ok();
     }
