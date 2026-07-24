@@ -215,11 +215,15 @@ pub fn parse_tool_call(text: &str) -> Option<ToolCall> {
         if tool.is_empty() || tool == "null" {
             return None;
         }
-        let args = v
-            .get("args")
-            .and_then(|a| a.as_str())
-            .unwrap_or("")
-            .to_string();
+        // args may be a JSON string OR a nested object — Anthropic-style
+        // tool calls use `{"args": {"path":.., ..}}` whose object form
+        // used to collapse to "" (every structured-args tool then failed
+        // with "EOF while parsing"). Objects are re-serialized to text.
+        let args = match v.get("args") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => serde_json::to_string(other).unwrap_or_default(),
+            None => String::new(),
+        };
         return Some(ToolCall { tool, args });
     }
     None
@@ -311,6 +315,26 @@ mod tests {
         assert!(parse_tool_call(r#"{"tool":null}"#).is_none());
         assert!(parse_tool_call(r#"{"tool":""}"#).is_none());
         assert!(parse_tool_call("no json here").is_none());
+    }
+
+    #[test]
+    fn parse_tool_call_args_as_object_is_reserialized() {
+        // Anthropic-style: args arrives as a nested JSON object, not a
+        // string — it must be re-serialized, not collapsed to "".
+        let c = parse_tool_call(r#"{"tool":"edit","args":{"path":"a.py","old":"x","new":"y"}}"#)
+            .unwrap();
+        assert_eq!(c.tool, "edit");
+        let v: serde_json::Value = serde_json::from_str(&c.args).unwrap();
+        assert_eq!(v["path"], "a.py");
+        assert_eq!(v["new"], "y");
+
+        // String form still passes through unchanged.
+        let c2 = parse_tool_call(r#"{"tool":"calc","args":"2+2"}"#).unwrap();
+        assert_eq!(c2.args, "2+2");
+
+        // Missing args → empty string.
+        let c3 = parse_tool_call(r#"{"tool":"time"}"#).unwrap();
+        assert_eq!(c3.args, "");
     }
 
     #[test]

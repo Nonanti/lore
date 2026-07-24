@@ -45,8 +45,12 @@ pub async fn decompose(
 
     let prompt = Prompt {
         system: "You are a project manager. Decompose the given goal into concrete subtasks assigned to named agents.\n\
-                  Return ONLY a JSON array: [{\"agent\": \"<name from roster>\", \"goal\": \"<description>\", \"verify\": [\"<criteria>\"]}]\n\
-                  Each agent field must exactly match a name from the roster below. Do not invent agent names.".to_string(),
+                  Return ONLY a JSON array: [{\"agent\": \"<name from roster>\", \"goal\": \"<description>\", \"verify\": [\"<one shell command>\"]}]\n\n\
+                  Rules:\n\
+                  - Each agent field must exactly match a name from the roster below. Do not invent agent names.\n\
+                  - verify must be a SINGLE runnable shell command that exits 0 on success, e.g. \"cargo test\", \"python3 app.py\", \"npm test\".\n\
+                  - verify is executed non-interactively by `sh -c` — it is NOT a checklist. NEVER put prose, requirement sentences, or markdown there.\n\
+                  - If no shell command can verify the subtask, use an empty array: \"verify\": [].".to_string(),
         context: vec![format!("Available agents (roster):\n{roster_text}")],
         user: goal.to_string(),
         ..Default::default()
@@ -93,8 +97,9 @@ pub async fn decompose_with_retry(
                 .collect::<Vec<_>>()
                 .join("\n");
             let retry_prompt = Prompt {
-                system: "Your previous response was not valid JSON. Return ONLY a valid JSON array: [{\"agent\": \"<name>\", \"goal\": \"<description>\", \"verify\": [\"<criteria>\"]}]\n\
+                system: "Your previous response was not valid JSON. Return ONLY a valid JSON array: [{\"agent\": \"<name>\", \"goal\": \"<description>\", \"verify\": [\"<one shell command>\"]}]\n\
                           Each agent field must exactly match a name from the roster below. Do not invent agent names.\n\
+                          verify must be a single runnable shell command (e.g. \"cargo test\") or an empty array — never prose.\n\
                           No prose, no code fences, no extra text. Just the JSON array.".to_string(),
                 context: vec![format!("Available agents (roster):\n{roster_text}")],
                 user: format!("Original goal: {goal}\n\nReturn the subtask decomposition as pure JSON now."),
