@@ -1,5 +1,11 @@
 # Lore — Comprehensive Test Report
 
+> ⚠️ **Historical snapshot (2026-07-17)** — this report was written when the project had 108 tests
+> (M0–M31 complete, before the AI-coworkers roadmap). The current test count is 514 (1 ignored).
+> New modules (policy, work, daemon, task, team/pm, distill, auth, model factory, shell/fs-write tools)
+> were added after this snapshot. The findings below still reflect the codebase quality at that time;
+> see CHANGELOG.md and DESIGN.md for the current state.
+
 | | |
 |---|---|
 | **Project** | `lore` — an identity + orchestration + memory core for AI agents (Rust) |

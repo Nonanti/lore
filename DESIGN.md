@@ -3,10 +3,12 @@
 > **Lore**: an identity + orchestration + memory core for AI agents. It gives each agent
 > a persistent identity (persona) and a personal memory. **Fully self-contained** —
 > not tied to any external service or API; the memory engine is written from scratch in
-> native Rust, inside Lore ("Alaz from zero").
+> native Rust, inside Lore (“Alaz from zero”).
+
+> **Status (514 tests passing + 1 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅. Next roadmap: `docs/superpowers/specs/2026-07-24-next-roadmap.md`.
 
 This document captures the design decisions and phased roadmap made after research
-(the 2026 "Memory in the Age of AI Agents" survey + Alaz's current architecture).
+(the 2026 “Memory in the Age of AI Agents” survey + Alaz's current architecture).
 
 ---
 
@@ -105,6 +107,13 @@ Rust ecosystem (local, lightweight stack):
 | D8 | Evolution: soft-delete+timestamp, time/frequency/importance decay, write-time conflict | Survey best practice; "forgetting matters as much as remembering" |
 | D9 | Scoping: memory isolated by `AgentId` (+ optional shared `world`); retrieval-level enforcement | Multi-tenant security from the start |
 | D10 | Language: Rust 2021, `async` core (tokio), errors via `thiserror`+`anyhow` | Compatible with the current Cargo.toml |
+| D11 | Hands: write/exec tools (`ShellTool`, `FileWriteTool`, `FileEditTool`) gated by a `Policy` engine (allow/deny/approve) | Personal-use-first pragmatic security; policy-based autonomy — agents run freely inside the policy, anything outside falls to an approval gate. Shell metacharacter chaining denied by default |
+| D12 | Work loop: `Agent::work(WorkSpec)` — plan → apply → verify → iterate until verification passes | Victory is declared by the verify command's exit code, never by the model. Failed verification feeds back as data for the next iteration |
+| D13 | Daemon + task queue: SQLite-backed `TaskStore` + `lore daemon` foreground worker + CLI (`task add/list/status/log`, `inbox`, `approve|deny`) | Single operator, single machine; everything coordinates through SQLite (WAL). Crash recovery: orphaned Running/WaitingApproval tasks are re-queued on restart. `--concurrency N` enables atomic-claim parallel workers (1–8) |
+| D14 | Team + PM: role presets (`backend/frontend/reviewer/pm`) with per-agent `ModelConfig` + factory; `task add --team` decomposes via PM → child tasks → reviewer → synthesis | Each role gets tailored tools (reviewer is read-only). The PM flow is crash-safe: no duplicate children, no wedged parents, compare-and-swap finalization |
+| D15 | Distillation: `Agent::distill_work` extracts conventions/constraints/facts from successful tasks into semantic memory; failed tasks produce constraint-only lessons | Procedural memory (Wilson-reinforced) is recorded after every run. Recalled conventions seed the next task's goal. `--no-distill` opts out per agent |
+| D16 | Sandbox: `Policy.sandbox_exec` (bubblewrap: `--ro-bind / /`, workspace rw, `--die-with-parent`) — `Off`/`IfAvailable`/`Required` | `Required` without bwrap fails closed; argv-built, never string-joined. Opt-in: the default build runs plain |
+| D17 | Parallel daemon: `lore daemon --concurrency N` — atomic `claim_next_queued` (`UPDATE…RETURNING`), per-worker connections, graceful shutdown with in-flight re-queue | Two workers can never take the same task. Team finalization is compare-and-swap; reviewer child enqueue via atomic `INSERT…WHERE NOT EXISTS` |
 
 ---
 
@@ -115,12 +124,17 @@ src/
   lib.rs            # public API surface, re-exports
   main.rs           # demo / CLI entry point
   error.rs          # LoreError (thiserror)
+  daemon.rs         # task queue daemon (foreground worker, crash recovery, parallel)
 
   id.rs             # AgentId, MemoryId (ULID-based)
 
   agent/
     mod.rs          # Agent struct: identity + handles
     persona.rs      # Persona: name, role, description, traits, system_prompt
+    conversation.rs # Conversation: bounded verbatim window + Prompt.history
+    work.rs         # WorkSpec / WorkReport / Agent::work — plan→apply→verify→iterate
+    distill.rs      # Agent::distill_work — extract conventions/facts into semantic memory
+    roles.rs        # Role presets (backend, frontend, reviewer, pm) + identity extras
 
   memory/
     mod.rs          # MemoryStore trait + shared types
@@ -128,20 +142,50 @@ src/
     in_memory.rs    # InMemoryStore (+ JSON snapshot) — Phase 1
     sqlite.rs       # SqliteStore (native persistent engine) — Phase 2
     embed.rs        # local embeddings (fastembed) — Phase 2
-    index.rs        # BM25 (tantivy) + vector index fusion — Phase 2/3
-    graph.rs        # entity/relationship graph (native) — Phase 4
     retrieval.rs    # scoring: keyword+recency → hybrid → HyDE/rerank
+    rerank.rs       # native reranker (coverage + phrase + bigram)
     evolution.rs    # consolidation, decay, conflict detection (background task)
+    graph.rs        # entity/relationship graph (native)
 
   model/
-    mod.rs          # Model trait (complete/chat/embed)
+    mod.rs          # Model trait (complete/chat/embed/stream)
     mock.rs         # MockModel (deterministic, for tests)
-    openai.rs       # OpenAI-compatible client (including Ollama) — Phase 3
+    openai.rs       # OpenAI-compatible client (including Ollama)
+    anthropic.rs    # Anthropic Messages API (key + subscription auth)
+    codex.rs        # CodexModel — OpenAI Responses API (ChatGPT subscription)
+    factory.rs      # ModelConfig + build_model — per-agent model construction
+
+  auth/
+    mod.rs          # PKCE helpers, TokenStore (0600 atomic), AccessTokenProvider
+    oauth.rs        # Provider-specific OAuth (Anthropic, OpenAI loopback/device)
 
   orchestrator/
-    mod.rs          # Orchestrator: registry + mailbox + routing
+    mod.rs          # Orchestrator: registry + mailbox + routing + blackboard
     message.rs      # Message, Envelope (from AgentId → to AgentId)
     registry.rs     # AgentId -> Agent registration table
+    pm.rs           # PM decomposition: team task → child tasks → reviewer → synthesis
+
+  policy/
+    mod.rs          # Policy engine: allowed roots, auto-allow, deny, default_exec, sandbox
+    approval.rs     # Gate + Approver (CliApprover, AllowAll, DenyAll, QueueApprover)
+
+  task/
+    mod.rs          # TaskStore (SQLite): task + approval CRUD, atomic claim, idempotent decisions
+    approver.rs     # QueueApprover: approval requests stored in DB until answered
+
+  tool/
+    mod.rs          # Tool trait + ToolRegistry + ToolRouter (KeywordRouter + LlmRouter)
+    builtin.rs      # CalcTool, TimeTool, WebFetchTool, FileReadTool
+    shell.rs        # ShellTool (timeout, output truncation, policy-gated)
+    fs_write.rs     # FileWriteTool (atomic tmp+rename), FileEditTool (exact replace)
+
+  server/
+    mod.rs          # Module entry
+    api.rs          # Router + thin handler wrappers + serve()
+    state.rs        # AppState core (shared store+model, agent map, team)
+    security.rs     # API key validation + rate-limit middleware
+    deliberate.rs   # Collective reasoning + federation + WebSocket
+    types.rs        # DTOs (CreateReq, AskReq, etc.)
 ```
 
 ---
@@ -243,7 +287,7 @@ pub trait MemoryStore: Send + Sync {
 
 ## 10. Phased Roadmap (milestones)
 
-> **Status (108 tests passing + 2 ignored [neural, real-LLM], clippy clean, with CI):** M0–M31 ✅ done + code review fixes ✅.
+> **Status (514 tests passing + 1 ignored [live-LLM], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅. **Next roadmap:** see [`docs/superpowers/specs/2026-07-24-next-roadmap.md`](../docs/superpowers/specs/2026-07-24-next-roadmap.md) (Phase A: correctness sweep, Phase B: doc sync, Phase C: e2e harness, Phase D: task HTTP surface, Phase E: maintenance).
 
 - ✅ **M0 — Skeleton:** crate layout, `error.rs`, `id.rs`, empty modules, `lib.rs` compiles.
 - ✅ **M1 — Memory core:** `Memory` types + `MemoryStore` trait + `InMemoryStore`

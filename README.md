@@ -216,9 +216,68 @@ internet = the trio of reverse proxy + `LORE_API_KEY` + rate limit.
 - **Supply chain** — `cargo audit` on every CI run; 16 runtime dependencies
   (`sha2` added for the PKCE challenge in native OAuth login).
 
+### AI coworkers
+
+Lore agents can now **work autonomously as coworkers** — not just chat, but plan, execute,
+verify, and learn from their experience.
+
+**Hands + policy:** agents get write/exec tools (`ShellTool`, `FileWriteTool`, `FileEditTool`)
+gated by a policy engine. The policy decides: allow (auto), deny, or escalate to human
+approval. Shell metacharacter chaining is blocked by default; bare-word deny entries match
+whole tokens. Customizable via allow roots, auto-allow list, and deny list.
+
+**Work loop:** `Agent::work()` — plan → apply → verify → iterate. Victory is declared by
+the verify command's exit code, never by the model. Failed verification feeds back into the
+next iteration; `WorkSpec::for_workspace` auto-detects `cargo test` / `npm test` / `pytest`.
+
+**Daemon + task queue:** `lore daemon` runs a foreground worker that picks tasks from a
+SQLite-backed queue, executes the work loop, and handles crash recovery (orphaned tasks
+re-queued on restart). `lore task add/list/status/log` manages tasks;
+`lore inbox` shows pending approvals; `lore approve|deny` decides them.
+`--concurrency N` (1–8) enables parallel workers with atomic task claiming.
+
+**Team + PM:** `lore agent create --role backend|frontend|reviewer|pm` creates role-preset
+agents with their own model/provider config. `lore task add --team` routes the task through
+the PM agent: decompose → child tasks → reviewer pass → synthesis. Each role gets
+tailored tools (reviewer is read-only).
+
+**Distillation:** after every work run, the agent records a procedural memory (Wilson-reinforced);
+`Agent::distill_work` extracts durable conventions/constraints/facts from successful tasks
+into semantic memory. Failed tasks produce constraint-only lessons. Recalled conventions
+seed the next task's goal automatically. `--no-distill` opts out per agent.
+
+**Sandbox:** `Policy.sandbox_exec` (`Off`/`IfAvailable`/`Required`) runs shell commands under
+bubblewrap (`--ro-bind / /`, workspace the only rw mount, `--die-with-parent`). `Required`
+without bwrap fails closed; `IfAvailable` warns and runs plain.
+
+**Quick-start flow:**
+
+```bash
+# 1. Create agents
+lore agent create --name backend --role backend --provider openai-compat --model qwen3:8b
+lore agent create --name reviewer --role reviewer --provider anthropic --model claude-sonnet-4-5
+lore agent create --name pm --role pm --provider openai --model gpt-5 --auth subs
+
+# 2. Start the daemon (2 parallel workers)
+lore daemon --concurrency 2
+
+# 3. Enqueue a team task
+lore task add backend "fix the login endpoint" --team --verify "cargo test"
+
+# 4. Check progress / approvals
+lore task list
+lore inbox
+lore approve <approval-id>   # or: lore deny <approval-id>
+lore task status <task-id>
+lore task log <task-id> --tail 20
+```
+
 | Endpoint | Description |
 |----------|----------|
-| `GET  /health` | health |
+| `GET  /health` | liveness (open) |
+| `GET  /ready` | readiness — verifies store is reachable (open) |
+| `GET  /openapi.json` | OpenAPI 3.1 spec (open) |
+| `GET  /metrics` | Prometheus-style metrics (**behind auth when `LORE_API_KEY` is set**) |
 | `POST /agents` | create an agent (`{name, role, traits}`) |
 | `GET  /agents` | list agents |
 | `PATCH  /agents/:id` | update persona (`{name?, role?, traits?, ...}`) — `version` increments |
@@ -227,7 +286,6 @@ internet = the trio of reverse proxy + `LORE_API_KEY` + rate limit.
 | `POST /agents/:id/act` | make it do something (`{input}`) — runs if a tool matches |
 | `POST /agents/:id/ask/stream` | stream the response in REAL time via SSE (token by token; `session` supported) |
 | `POST /agents/:id/message` | inter-agent message (`{from?, kind, content}`) |
-| `GET  /metrics` | Prometheus-style metrics (open) |
 | `POST /agents/:id/experience` | add a memory (`{title, body}`) |
 | `GET  /agents/:id/recall?q=&limit=&semantic=` | recall |
 | `POST /deliberate` | collective reasoning (`{question, synthesizer?, local?}`) — team + peer nodes |
@@ -263,6 +321,18 @@ cargo run -- export --out backup.json           # export memory
 cargo run -- import backup.json                 # restore (ids preserved)
 cargo run -- consolidate                        # trigger memory maintenance manually
 cargo run -- reembed                            # after an embedder migration
+cargo run -- reflect <id>                       # distill episodic → semantic
+cargo run -- reinforce <id> <memory> accessed   # decay/Wilson feedback
+
+# AI coworkers
+cargo run -- daemon --concurrency 2              # task queue daemon (parallel workers)
+cargo run -- task add <agent> "goal"             # enqueue a task
+cargo run -- task add <agent> "goal" --team      # PM-decomposed team task
+cargo run -- task list / status / log            # task management
+cargo run -- inbox                               # pending approvals
+cargo run -- approve <id> / deny <id>            # decide approvals
+cargo run -- agent create --name pm --role pm   # role-preset agent
+cargo run -- agent list                          # list agents with model info
 cargo run -- demo
 ```
 
@@ -272,31 +342,28 @@ Docker: `docker build -t lore . && docker run -p 3777:3777 -v lore-data:/data lo
 
 ```bash
 cargo run      # demo (when no subcommand)
-cargo test     # 193 tests passing (1 ignored: live-LLM smoke test)
+cargo test     # 514 tests passing (1 ignored: live-LLM smoke test)
 cargo clippy --all-targets
 ```
 
 ## Status
 
-M0–M31 complete (identity, memory, orchestration, real model, persistence, evolution, graph+HyDE+rerank,
-blackboard/collective reasoning, identity persistence, tool use, persistent HTTP service + CLI, collective-reasoning API, agent lifecycle + persona versioning, tool-use API, auth + rate limit,
+Identity, memory, orchestration, real model, persistence, evolution, graph+HyDE+rerank,
+blackboard/collective reasoning, identity persistence, tool use, persistent HTTP service + CLI,
+collective-reasoning API, agent lifecycle + persona versioning, tool-use API, auth + rate limit,
 observability /metrics, LLM tool-calling, SSE streaming, inter-agent messaging, live WebSocket deliberate,
-multi-node federation, supervisor synthesis, optional neural embedder,
-conversation history — `lore chat` interactive chat + HTTP `session` support,
-real token streaming — OpenAI `stream:true` flows end-to-end into SSE,
-ReAct multi-step tool chain — `lore solve`, CI, embedder migration — `lore reembed`,
-backup — `lore export/import`, Dockerfile).
-A full code review was done after M25: fixes landed for security (rate-limit key, constant-time comparison,
-500 detail leak), resilience (WAL, timeouts, fault-tolerant deliberate) and async
-hygiene (spawn_blocking, parallel fanout); the `server` module was split into focused
-files (state / deliberate / security / api / types).
+multi-node federation, supervisor synthesis, optional neural embedder, conversation history + chat,
+real token streaming, ReAct multi-step tool chain, CI, embedder migration, backup + Dockerfile.
 
-Maturation phases (see [`CHANGELOG.md`](CHANGELOG.md)): structured logging + request-id +
-latency histograms + `/ready` · FTS5 + emb BLOB + separate-connection consolidation
-(keyword recall @10k: ~4ms) · property tests + real-binary e2e (SIGKILL/restart
-persistence) · `/openapi.json` + threat model · soak/chaos harness (`scripts/soak.sh`:
-continuous load + periodic SIGKILL; sample run: 2948 requests, 2 restarts, 0 errors,
-ask p95=9ms, full data integrity). Details: [`DESIGN.md`](DESIGN.md).
+AI coworkers: policy-gated hands (shell/write/edit tools), work loop (plan→apply→verify→iterate),
+daemon + task queue + CLI, team/roles/PM, memory distillation, OS sandbox (opt-in),
+parallel daemon (`--concurrency`). Per-agent models (Anthropic/OpenAI/OpenAiCompat/Mock),
+native provider auth (subscription + metered API key), reasoning-model support.
+
+Maturation: structured logging + request-id + latency histograms + `/ready` · FTS5 + emb BLOB +
+separate-connection consolidation · property tests + real-binary e2e · `/openapi.json` + threat model ·
+soak/chaos harness. Full code review + 4-way review hardening done.
+514 tests passing, clippy clean, with CI. Roadmap: `docs/superpowers/specs/2026-07-24-next-roadmap.md`.
 
 ## Design philosophy
 
