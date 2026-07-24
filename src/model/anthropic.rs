@@ -9,7 +9,10 @@
 //! Request building (`build_payload`) and response parsing (`parse_response`)
 //! are pure/testable; the HTTP call lives in `complete`/`complete_stream`.
 
-use super::{Completion, Model, Prompt, Role, TokenStream};
+use super::{
+    ChatRole, Completion, ContentBlock, Model, Prompt, Role, StopReason, Thread, ThreadReply,
+    TokenStream, ToolSpec,
+};
 use crate::auth::AccessTokenProvider;
 use crate::error::{LoreError, Result};
 use async_trait::async_trait;
@@ -149,7 +152,11 @@ impl AnthropicModel {
     /// first block, so it is emitted as a two-block array; API-key mode uses a
     /// plain string (or omits it when empty).
     fn build_system(&self, prompt: &Prompt) -> Option<serde_json::Value> {
-        let text = Self::system_text(prompt);
+        self.build_system_from_text(Self::system_text(prompt))
+    }
+
+    /// `system` field from raw text (shared by prompt and thread paths).
+    fn build_system_from_text(&self, text: String) -> Option<serde_json::Value> {
         if self.auth.is_oauth() {
             let mut blocks = vec![serde_json::json!({
                 "type": "text", "text": CLAUDE_CODE_IDENTITY
@@ -175,6 +182,69 @@ impl AnthropicModel {
             "messages": Self::build_messages(prompt),
         });
         if let Some(system) = self.build_system(prompt) {
+            v["system"] = system;
+        }
+        v
+    }
+
+    /// One thread content block → Anthropic wire block.
+    fn wire_block(b: &ContentBlock) -> serde_json::Value {
+        match b {
+            ContentBlock::Text { text } => {
+                serde_json::json!({ "type": "text", "text": text })
+            }
+            ContentBlock::ToolUse { id, name, input } => serde_json::json!({
+                "type": "tool_use", "id": id, "name": name, "input": input
+            }),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => serde_json::json!({
+                "type": "tool_result", "tool_use_id": tool_use_id,
+                "content": content, "is_error": is_error
+            }),
+        }
+    }
+
+    /// Builds the JSON request body for a native tool-calling thread.
+    /// Blocks map 1:1 onto Anthropic content blocks; tools carry their
+    /// JSON Schemas in `input_schema` (the API's own field name).
+    fn build_thread_payload(&self, thread: &Thread, tools: &[ToolSpec]) -> serde_json::Value {
+        let messages: Vec<serde_json::Value> = thread
+            .messages
+            .iter()
+            .map(|m| {
+                let role = match m.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                };
+                let blocks: Vec<serde_json::Value> =
+                    m.blocks.iter().map(Self::wire_block).collect();
+                serde_json::json!({ "role": role, "content": blocks })
+            })
+            .collect();
+        let mut v = serde_json::json!({
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream": false,
+            "messages": messages,
+        });
+        if !tools.is_empty() {
+            let tools_json: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema,
+                    })
+                })
+                .collect();
+            v["tools"] = serde_json::Value::Array(tools_json);
+        }
+        if let Some(system) = self.build_system_from_text(thread.system.trim().to_string()) {
             v["system"] = system;
         }
         v
@@ -220,20 +290,66 @@ impl AnthropicModel {
         }
         Ok(Completion::new(text))
     }
+
+    /// Parses a Messages response into thread blocks + stop reason.
+    /// `text` and `tool_use` blocks are kept (thinking ignored, as in
+    /// `parse_response`); a malformed `tool_use` (missing id/name) is
+    /// skipped with a warning rather than failing the whole reply.
+    fn parse_thread_response(body: &str) -> Result<ThreadReply> {
+        let resp: MessagesResponse = serde_json::from_str(body)?;
+        let mut blocks = Vec::new();
+        for b in resp.content {
+            match b.kind.as_str() {
+                "text" => {
+                    if let Some(text) = b.text {
+                        blocks.push(ContentBlock::Text { text });
+                    }
+                }
+                "tool_use" => match (b.id, b.name) {
+                    (Some(id), Some(name)) => blocks.push(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input: b.input.unwrap_or(serde_json::Value::Null),
+                    }),
+                    _ => tracing::warn!("anthropic tool_use block missing id/name; skipped"),
+                },
+                _ => {}
+            }
+        }
+        let stop = match resp.stop_reason.as_deref() {
+            Some("tool_use") => StopReason::ToolUse,
+            Some("end_turn") => StopReason::EndTurn,
+            _ => StopReason::Other,
+        };
+        Ok(ThreadReply {
+            blocks,
+            stop,
+            reasoning_fallback: false,
+        })
+    }
 }
 
 #[derive(Deserialize)]
 struct MessagesResponse {
     #[serde(default)]
-    content: Vec<ContentBlock>,
+    content: Vec<RespBlock>,
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
+/// One deserialized response content block (text / tool_use / thinking).
 #[derive(Deserialize)]
-struct ContentBlock {
+struct RespBlock {
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
 }
 
 /// An SSE event of interest from the Messages stream.
@@ -284,6 +400,33 @@ fn parse_sse_line(line: &str) -> Option<SseEvent> {
 
 #[async_trait]
 impl Model for AnthropicModel {
+    async fn complete_thread(&self, thread: &Thread, tools: &[ToolSpec]) -> Result<ThreadReply> {
+        let auth = self.auth.resolve().await?;
+        let work = async {
+            let resp = self
+                .request(&self.build_thread_payload(thread, tools), &auth)
+                .send()
+                .await?;
+            let status = resp.status();
+            let body = resp.text().await?;
+            if !status.is_success() {
+                return Err(LoreError::Model(format!("{status}: {body}")));
+            }
+            Self::parse_thread_response(&body)
+        };
+        match tokio::time::timeout(self.timeout, work).await {
+            Ok(r) => r,
+            Err(_) => Err(LoreError::Model(format!(
+                "request timeout ({}s)",
+                self.timeout.as_secs()
+            ))),
+        }
+    }
+
+    fn supports_native_tools(&self) -> bool {
+        true
+    }
+
     async fn complete(&self, prompt: &Prompt) -> Result<Completion> {
         let auth = self.auth.resolve().await?;
         let work = async {
@@ -434,6 +577,141 @@ mod tests {
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[0]["content"], "hi");
         assert_eq!(msgs[1]["content"], "hello");
+    }
+
+    fn tool_thread() -> (Thread, Vec<ToolSpec>) {
+        use super::super::ChatMessage;
+        let mut t = Thread::new("You are Aria.");
+        t.push(ChatMessage::user_text("what is 3+4?"));
+        t.push(ChatMessage::assistant_blocks(vec![ContentBlock::ToolUse {
+            id: "tu_1".into(),
+            name: "calc".into(),
+            input: serde_json::json!({"args": "3 + 4"}),
+        }]));
+        t.push(ChatMessage::tool_results(vec![ContentBlock::ToolResult {
+            tool_use_id: "tu_1".into(),
+            content: "7".into(),
+            is_error: false,
+        }]));
+        let specs = vec![ToolSpec {
+            name: "calc".into(),
+            description: "evaluates arithmetic".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"args": {"type": "string"}},
+                "required": ["args"]
+            }),
+        }];
+        (t, specs)
+    }
+
+    #[test]
+    fn thread_payload_maps_blocks_and_tools() {
+        let m = AnthropicModel::new("claude-x", AnthropicAuth::ApiKey("k".into()));
+        let (t, specs) = tool_thread();
+        let v = m.build_thread_payload(&t, &specs);
+
+        assert_eq!(v["system"], "You are Aria.");
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["name"], "calc");
+        assert_eq!(tools[0]["input_schema"]["type"], "object");
+
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"][0]["type"], "text");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"][0]["type"], "tool_use");
+        assert_eq!(msgs[1]["content"][0]["id"], "tu_1");
+        assert_eq!(msgs[1]["content"][0]["input"]["args"], "3 + 4");
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"][0]["type"], "tool_result");
+        assert_eq!(msgs[2]["content"][0]["tool_use_id"], "tu_1");
+        assert_eq!(msgs[2]["content"][0]["is_error"], false);
+    }
+
+    #[test]
+    fn thread_payload_oauth_keeps_identity_prefix() {
+        let m = AnthropicModel::new("claude-x", oauth("tok"));
+        let (t, specs) = tool_thread();
+        let v = m.build_thread_payload(&t, &specs);
+        let system = v["system"].as_array().expect("oauth system is an array");
+        assert_eq!(system[0]["text"], CLAUDE_CODE_IDENTITY);
+        assert_eq!(system[1]["text"], "You are Aria.");
+    }
+
+    #[test]
+    fn thread_payload_without_tools_omits_field() {
+        let m = AnthropicModel::new("claude-x", AnthropicAuth::ApiKey("k".into()));
+        let v = m.build_thread_payload(&Thread::new(""), &[]);
+        assert!(v.get("tools").is_none());
+        assert!(v.get("system").is_none(), "empty system omitted");
+    }
+
+    #[test]
+    fn parse_thread_extracts_tool_use_and_stop_reason() {
+        let body = r#"{"stop_reason":"tool_use","content":[
+            {"type":"thinking","thinking":"..."},
+            {"type":"text","text":"Let me compute."},
+            {"type":"tool_use","id":"tu_9","name":"calc","input":{"args":"2+2"}}]}"#;
+        let r = AnthropicModel::parse_thread_response(body).unwrap();
+        assert_eq!(r.stop, StopReason::ToolUse);
+        assert_eq!(r.blocks.len(), 2, "thinking skipped");
+        assert_eq!(r.text(), "Let me compute.");
+        let uses = r.tool_uses();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].id, "tu_9");
+        assert_eq!(uses[0].name, "calc");
+        assert_eq!(uses[0].input["args"], "2+2");
+    }
+
+    #[test]
+    fn parse_thread_end_turn_and_malformed_tool_use() {
+        let body = r#"{"stop_reason":"end_turn","content":[
+            {"type":"text","text":"Done."},
+            {"type":"tool_use","name":"calc"}]}"#;
+        let r = AnthropicModel::parse_thread_response(body).unwrap();
+        assert_eq!(r.stop, StopReason::EndTurn);
+        assert_eq!(r.blocks.len(), 1, "malformed tool_use (no id) skipped");
+        assert_eq!(r.text(), "Done.");
+
+        // Unknown stop reason → Other.
+        let r2 =
+            AnthropicModel::parse_thread_response(r#"{"stop_reason":"max_tokens","content":[]}"#)
+                .unwrap();
+        assert_eq!(r2.stop, StopReason::Other);
+    }
+
+    #[tokio::test]
+    async fn complete_thread_round_trips_over_http() {
+        use axum::{routing::post, Router};
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|body: axum::Json<serde_json::Value>| async move {
+                // Echo-check: tools arrived; reply with a tool_use.
+                assert!(body.0["tools"].is_array());
+                axum::Json(serde_json::json!({
+                    "stop_reason": "tool_use",
+                    "content": [
+                        {"type": "tool_use", "id": "t1", "name": "calc",
+                         "input": {"args": "3 + 4"}}
+                    ]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let m = AnthropicModel::new("test", AnthropicAuth::ApiKey("k".into()))
+            .with_base_url(format!("http://{addr}"));
+        assert!(m.supports_native_tools());
+        let (t, specs) = tool_thread();
+        let r = m.complete_thread(&t, &specs).await.unwrap();
+        assert_eq!(r.stop, StopReason::ToolUse);
+        assert_eq!(r.tool_uses()[0].name, "calc");
     }
 
     #[test]
