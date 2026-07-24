@@ -86,6 +86,61 @@ mod peer_tests {
     }
 }
 
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use crate::memory::InMemoryStore;
+    use crate::model::MockModel;
+
+    fn test_state() -> AppState {
+        AppState::new(Arc::new(InMemoryStore::new()), Arc::new(MockModel::new()))
+    }
+
+    #[test]
+    fn cross_eviction_does_not_kill_live_fail_window() {
+        // Fix 3: fail_rate.per > rate.per — eviction must not drop a live
+        // fail-rate window just because rate.per is shorter.
+        let st = test_state()
+            .with_rate_limit(100, 10) // 100/10s
+            .with_fail_rate_limit(5, 60); // 5/60s
+
+        // Fill the hits map above HITS_EVICT_THRESHOLD with expired main-rate
+        // entries so eviction triggers.
+        {
+            let mut hits = st.hits.lock().unwrap();
+            for i in 0..HITS_EVICT_THRESHOLD + 1 {
+                hits.insert(
+                    format!("filler-{i}"),
+                    Window {
+                        start: Instant::now() - Duration::from_secs(120),
+                        count: 1,
+                    },
+                );
+            }
+            // A live fail-rate window (created 30s ago — within fail_rate.per=60s
+            // but outside rate.per=10s).
+            hits.insert(
+                "fail:attacker".into(),
+                Window {
+                    start: Instant::now() - Duration::from_secs(30),
+                    count: 4,
+                },
+            );
+        }
+
+        // Trigger eviction via allow_with (main rate).
+        let rl = st.rate.unwrap();
+        st.allow_with("new-client", &rl);
+
+        // The fail-rate window must survive (not evicted by rate.per=10s).
+        let hits = st.hits.lock().unwrap();
+        assert!(
+            hits.contains_key("fail:attacker"),
+            "fail-rate window must survive cross-eviction"
+        );
+    }
+}
+
 /// Latency histogram buckets (ms) — Prometheus `le` boundaries.
 const LATENCY_BUCKETS_MS: [u64; 10] = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000];
 
@@ -373,8 +428,16 @@ impl AppState {
         // Poison recovery: a panicked thread must not kill the entire service.
         let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         // If the table has grown, evict expired windows (memory DoS mitigation).
+        // Use max(rate.per, fail_rate.per) so we never evict a live window
+        // belonging to the other limiter (both share the same map).
         if hits.len() > HITS_EVICT_THRESHOLD {
-            hits.retain(|_, w| now.duration_since(w.start) <= rl.per);
+            let evict_per = match (self.rate, self.fail_rate) {
+                (Some(r), Some(f)) => r.per.max(f.per),
+                (Some(r), None) => r.per,
+                (None, Some(f)) => f.per,
+                (None, None) => rl.per,
+            };
+            hits.retain(|_, w| now.duration_since(w.start) <= evict_per);
         }
         let w = hits.entry(key.to_string()).or_insert(Window {
             start: now,

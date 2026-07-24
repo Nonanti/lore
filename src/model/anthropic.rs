@@ -341,7 +341,15 @@ impl Model for AnthropicModel {
                         Ok(Some(Err(e))) => {
                             return Some((Err(LoreError::Http(e)), (body, buf, true)))
                         }
-                        Ok(None) => return None,
+                        // Premature close: body ended without message_stop.
+                        Ok(None) => {
+                            return Some((
+                                Err(LoreError::Model(
+                                    "stream ended without terminal event".into(),
+                                )),
+                                (body, buf, true),
+                            ))
+                        }
                         Err(_) => {
                             return Some((
                                 Err(LoreError::Model(format!(
@@ -440,5 +448,46 @@ mod tests {
         assert!(parse_sse_line(think).is_none());
         assert!(parse_sse_line("event: message_stop").is_none());
         assert!(parse_sse_line(": ping").is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_premature_close_errors() {
+        // Fix 4: body ends without message_stop → error, not silent partial.
+        use axum::{routing::post, Router};
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let m = AnthropicModel::new("test", AnthropicAuth::ApiKey("k".into()))
+            .with_base_url(format!("http://{addr}"));
+        let p = prompt();
+        let mut s = m.complete_stream(&p).await.unwrap();
+        let mut toks = Vec::new();
+        let mut errs = Vec::new();
+        while let Some(r) = s.next().await {
+            match r {
+                Ok(t) => toks.push(t),
+                Err(e) => errs.push(e.to_string()),
+            }
+        }
+        assert_eq!(toks, vec!["Hel".to_string()], "partial token streamed");
+        assert_eq!(errs.len(), 1, "premature close produces an error");
+        assert!(
+            errs[0].contains("terminal event"),
+            "error message: {}",
+            errs[0]
+        );
     }
 }

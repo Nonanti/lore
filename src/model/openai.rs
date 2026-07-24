@@ -262,16 +262,24 @@ fn next_line(buf: &mut Vec<u8>) -> Option<String> {
 
 /// Parses an SSE line: `data: {json}` → delta content; `data: [DONE]` →
 /// done; other lines (comment, blank, role/finish chunk) → `None` (skipped).
+/// Falls back to `reasoning_content` when `content` is absent/empty (parity
+/// with `complete()` — reasoning models may stream only reasoning deltas).
 fn parse_sse_line(line: &str) -> Option<SseEvent> {
     let payload = line.strip_prefix("data:")?.trim();
     if payload == "[DONE]" {
         return Some(SseEvent::Done);
     }
     let v: serde_json::Value = serde_json::from_str(payload).ok()?;
-    let tok = v["choices"][0]["delta"]["content"].as_str()?;
-    if tok.is_empty() {
-        return None;
-    }
+    let delta = &v["choices"][0]["delta"];
+    // Prefer content; fall back to reasoning_content (reasoning model parity).
+    let tok = delta["content"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            delta["reasoning_content"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+        })?;
     Some(SseEvent::Token(tok.to_string()))
 }
 
@@ -503,10 +511,14 @@ impl Model for OpenAiModel {
                                 (body, buf, filter, true),
                             ))
                         }
+                        // Premature close: body ended without [DONE].
                         Ok(None) => {
-                            return filter
-                                .finish()
-                                .map(|out| (Ok(out), (body, buf, filter, true)));
+                            return Some((
+                                Err(LoreError::Model(
+                                    "stream ended without terminal event".into(),
+                                )),
+                                (body, buf, filter, true),
+                            ));
                         }
                     }
                 }
@@ -629,6 +641,21 @@ mod tests {
         // Comment / blank line → skip.
         assert!(parse_sse_line(": ping").is_none());
         assert!(parse_sse_line("").is_none());
+    }
+
+    #[test]
+    fn reasoning_content_stream_parity() {
+        // Fix 5: reasoning_content delta is used when content is empty/absent
+        // (parity with complete() reasoning_content fallback).
+        let rc = r#"data: {"choices":[{"delta":{"reasoning_content":"step1"}}]}"#;
+        assert!(matches!(parse_sse_line(rc), Some(SseEvent::Token(s)) if s == "step1"));
+        // Content takes priority over reasoning_content.
+        let both =
+            r#"data: {"choices":[{"delta":{"content":"answer","reasoning_content":"thought"}}]}"#;
+        assert!(matches!(parse_sse_line(both), Some(SseEvent::Token(s)) if s == "answer"));
+        // Empty content falls back to reasoning_content.
+        let empty = r#"data: {"choices":[{"delta":{"content":"","reasoning_content":"reason"}}]}"#;
+        assert!(matches!(parse_sse_line(empty), Some(SseEvent::Token(s)) if s == "reason"));
     }
 
     #[test]
@@ -790,6 +817,49 @@ mod tests {
             t0.elapsed() < std::time::Duration::from_secs(5),
             "idle-timeout fast termination: {:?}",
             t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_premature_close_errors() {
+        // Fix 4: body ends without [DONE] → error, not silent partial.
+        use axum::{routing::post, Router};
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let m = OpenAiModel::new(format!("http://{addr}/v1"), "test-model");
+        let prompt = Prompt {
+            user: "hello".into(),
+            ..Default::default()
+        };
+        let mut s = m.complete_stream(&prompt).await.unwrap();
+        let mut toks = Vec::new();
+        let mut errs = Vec::new();
+        while let Some(r) = s.next().await {
+            match r {
+                Ok(t) => toks.push(t),
+                Err(e) => errs.push(e.to_string()),
+            }
+        }
+        assert_eq!(toks, vec!["Hel".to_string()], "partial token streamed");
+        assert_eq!(errs.len(), 1, "premature close produces an error");
+        assert!(
+            errs[0].contains("terminal event"),
+            "error message: {}",
+            errs[0]
         );
     }
 

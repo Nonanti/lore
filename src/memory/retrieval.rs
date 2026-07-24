@@ -323,7 +323,9 @@ fn score_impl(
 ) -> (f32, Vec<Signal>) {
     let mut signals = Vec::new();
 
-    let age = (now - mem.created_at).num_seconds().max(0) as f64;
+    // Use last_access (not created_at) — aligns with should_forget: a
+    // recently-accessed old memory is "fresh" for retrieval purposes.
+    let age = (now - mem.last_access).num_seconds().max(0) as f64;
     let recency = recency_score(age);
     let importance = mem.importance.clamp(0.0, 1.0);
     let wilson = match &mem.kind {
@@ -519,6 +521,30 @@ mod score_tests {
     use super::*;
     use crate::memory::embed::{Embedder, HashingEmbedder};
     use crate::memory::types::{Scope, SemanticCat};
+
+    #[test]
+    fn recency_ranks_by_last_access_not_created_at() {
+        // Fix 1: old-created/recently-accessed must outrank
+        // fresh-created/never-accessed.
+        let now = Utc::now();
+        let mut old_but_accessed =
+            Memory::semantic(Scope::World, "old accessed", SemanticCat::Fact);
+        old_but_accessed.created_at = now - chrono::Duration::days(60);
+        old_but_accessed.last_access = now - chrono::Duration::hours(1);
+
+        let mut fresh_never = Memory::semantic(Scope::World, "fresh never", SemanticCat::Fact);
+        fresh_never.created_at = now - chrono::Duration::hours(2);
+        fresh_never.last_access = now - chrono::Duration::hours(2);
+
+        let q = Query::new("").limit(10); // browse mode (recency-dominant)
+        let (s_old, _) = score(&old_but_accessed, &q, None, now);
+        let (s_fresh, _) = score(&fresh_never, &q, None, now);
+        assert!(
+            s_old > s_fresh,
+            "recently-accessed old record ({s_old}) should outrank \
+             stale fresh record ({s_fresh})"
+        );
+    }
 
     #[test]
     fn short_query_token_fallback_recalls_morphology() {

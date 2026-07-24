@@ -175,7 +175,9 @@ impl Embedder for NeuralEmbedder {
     }
 
     fn embed(&self, text: &str) -> Vec<f32> {
-        let m = self.model.lock().unwrap();
+        // Poison recovery: a panic in a previous embed must not make the
+        // embedder permanently unusable.
+        let m = self.model.lock().unwrap_or_else(|e| e.into_inner());
         let out = match m.embed(vec![text.to_string()], None) {
             Ok(o) => o,
             Err(e) => {

@@ -184,6 +184,12 @@ impl SqliteStore {
 
     /// BLOB → f32 vector.
     fn blob_to_emb(b: &[u8]) -> Vec<f32> {
+        if !b.len().is_multiple_of(4) {
+            tracing::warn!(
+                blob_len = b.len(),
+                "embedding BLOB length is not a multiple of 4 — trailing bytes discarded"
+            );
+        }
         b.chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
@@ -446,24 +452,39 @@ impl SqliteStore {
         }
     }
 
-    /// Loads the given set of ids (id PK — prepared statement, one lookup per candidate).
+    /// Loads the given set of ids with a parameterized `IN (...)` batch
+    /// (chunked at 500 ids). Result ordering matches the input `ids` order.
     fn load_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<Memory>> {
-        let mut stmt = conn
-            .prepare("SELECT data, emb FROM memories WHERE id = ?1")
-            .map_err(sqlite_err)?;
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            use rusqlite::OptionalExtension;
-            let row = stmt
-                .query_row(params![id], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
+        const CHUNK: usize = 500;
+        let mut by_id: std::collections::HashMap<String, Memory> =
+            std::collections::HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK.max(1)) {
+            let placeholders: String = (0..chunk.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT id, data, emb FROM memories WHERE id IN ({placeholders})");
+            let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                .iter()
+                .map(|s| s as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows = stmt
+                .query_map(params.as_slice(), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
                 })
-                .optional()
                 .map_err(sqlite_err)?;
-            if let Some((s, e)) = row {
-                out.push(Self::decode_row(&s, e)?);
+            for row in rows {
+                let (id, data, emb) = row.map_err(sqlite_err)?;
+                by_id.insert(id, Self::decode_row(&data, emb)?);
             }
         }
+        // Preserve input ordering.
+        let out: Vec<Memory> = ids.iter().filter_map(|id| by_id.remove(id)).collect();
         Ok(out)
     }
 
@@ -733,8 +754,9 @@ impl MemoryStore for SqliteStore {
     async fn reinforce_many(&self, ids: &[MemoryId], outcome: Outcome) -> Result<()> {
         let ids = ids.to_vec();
         self.blocking(move |conn| {
+            let tx = conn.transaction().map_err(sqlite_err)?;
             for id in &ids {
-                let Some(mut mem) = Self::load_one(conn, id)? else {
+                let Some(mut mem) = Self::load_one(&tx, id)? else {
                     continue; // skip — batch processes the rest
                 };
                 mem.last_access = Utc::now();
@@ -752,8 +774,9 @@ impl MemoryStore for SqliteStore {
                         }
                     }
                 }
-                Self::upsert(conn, &mem)?;
+                Self::upsert(&tx, &mem)?;
             }
+            tx.commit().map_err(sqlite_err)?;
             Ok(())
         })
         .await
@@ -1219,6 +1242,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_by_ids_batch_correctness_and_ordering() {
+        // Fix 2: batch IN (...) returns results in input order and handles
+        // missing ids gracefully.
+        let store = SqliteStore::in_memory().unwrap();
+        let s = scope();
+        let a = store
+            .remember(Memory::semantic(s.clone(), "alpha", SemanticCat::Fact))
+            .await
+            .unwrap();
+        let b = store
+            .remember(Memory::semantic(s.clone(), "beta", SemanticCat::Fact))
+            .await
+            .unwrap();
+        let c = store
+            .remember(Memory::semantic(s.clone(), "gamma", SemanticCat::Fact))
+            .await
+            .unwrap();
+        // Request in reverse order + a missing id.
+        let ids: Vec<String> = vec![
+            c.to_string(),
+            MemoryId::new().to_string(), // missing
+            a.to_string(),
+            b.to_string(),
+        ];
+        let conn = store.conn.lock().unwrap();
+        let loaded = SqliteStore::load_by_ids(&conn, &ids).unwrap();
+        assert_eq!(loaded.len(), 3, "missing id is skipped");
+        assert_eq!(loaded[0].id, c, "order: c first");
+        assert_eq!(loaded[1].id, a, "order: a second");
+        assert_eq!(loaded[2].id, b, "order: b third");
+    }
+
+    #[tokio::test]
     async fn get_fetches_by_id_and_reinforce_many_batches() {
         // get: single record by id (None if absent).
         let store = SqliteStore::in_memory().unwrap();
@@ -1258,6 +1314,38 @@ mod tests {
             .unwrap();
         let pm = store.get(&p).await.unwrap().unwrap();
         assert!(pm.summary().contains("1\u{2713}/0\u{2717}"));
+    }
+
+    #[tokio::test]
+    async fn reinforce_many_atomicity() {
+        // Fix 7: reinforce_many runs inside a single transaction.
+        // If it completes, all records are updated atomically.
+        let store = SqliteStore::in_memory().unwrap();
+        let s = scope();
+        let a = store
+            .remember(Memory::semantic(s.clone(), "alpha", SemanticCat::Fact))
+            .await
+            .unwrap();
+        let b = store
+            .remember(Memory::semantic(s.clone(), "beta", SemanticCat::Fact))
+            .await
+            .unwrap();
+        store
+            .reinforce_many(&[a.clone(), b.clone()], Outcome::Accessed)
+            .await
+            .unwrap();
+        let ma = store.get(&a).await.unwrap().unwrap();
+        let mb = store.get(&b).await.unwrap().unwrap();
+        assert_eq!(ma.access_count, 1, "a reinforced");
+        assert_eq!(mb.access_count, 1, "b reinforced");
+        // Both timestamps should be very close (same transaction).
+        let diff = (ma.last_access - mb.last_access)
+            .num_milliseconds()
+            .unsigned_abs();
+        assert!(
+            diff < 1000,
+            "both updated in same transaction, timestamps close: {diff}ms"
+        );
     }
 
     #[tokio::test]

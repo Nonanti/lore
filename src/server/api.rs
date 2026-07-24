@@ -16,7 +16,7 @@ use crate::id::AgentId;
 
 use axum::{
     extract::ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
-    extract::{MatchedPath, Path, Query as AxQuery, Request, State},
+    extract::{DefaultBodyLimit, MatchedPath, Path, Query as AxQuery, Request, State},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::sse::{Event, Sse},
@@ -67,7 +67,8 @@ pub fn router(state: AppState) -> Router {
         .route("/board", get(board_h))
         // Metrics are observability data — protected when API key is configured.
         .route("/metrics", get(metrics_h))
-        .route_layer(middleware::from_fn_with_state(state.clone(), security_mw));
+        .route_layer(middleware::from_fn_with_state(state.clone(), security_mw))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024)); // 2 MiB
 
     Router::new()
         .route("/health", get(health))
