@@ -286,7 +286,7 @@ impl Tool for FileEditTool {
 mod tests {
     use super::*;
     use crate::policy::approval::{AllowAll, DenyAll};
-    use crate::policy::{DefaultExec, Policy};
+    use crate::policy::{DefaultExec, Policy, SandboxMode};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -297,6 +297,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Allow,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         Arc::new(Gate::new(p, Arc::new(AllowAll)))
     }
@@ -308,6 +309,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Ask,
             ask_on_write: true,
+            sandbox_exec: SandboxMode::Off,
         };
         Arc::new(Gate::new(p, Arc::new(DenyAll)))
     }

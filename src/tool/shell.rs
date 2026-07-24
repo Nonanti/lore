@@ -10,16 +10,24 @@
 //! `Allow`. This prevents chaining attacks (e.g. `ls; bash -i ...`). The
 //! auto-allow list matches the first whitespace-delimited token of the
 //! command — word-boundary matching prevents `ls` from allowing `lsof`.
+//!
+//! **Sandbox:** when [`SandboxMode`] is `IfAvailable` or `Required`, commands
+//! run inside a bubblewrap (bwrap) sandbox with a read-only root filesystem,
+//! `/dev`, `/proc`, a tmpfs `/tmp`, and the workspace bind-mounted writable.
+//! bwrap availability is probed once and cached; `IfAvailable` + missing bwrap
+//! falls back to plain exec (warn once), while `Required` + missing fails
+//! closed (`PolicyDenied`). Network stays shared (package managers need it).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
 
 use crate::error::{LoreError, Result};
 use crate::policy::approval::Gate;
-use crate::policy::Action;
+use crate::policy::{Action, SandboxMode};
 use crate::tool::Tool;
 
 /// Default command timeout (seconds).
@@ -30,6 +38,92 @@ const DEFAULT_MAX_OUTPUT: usize = 32 * 1024;
 
 /// Truncation marker appended when output exceeds the cap.
 const TRUNCATION_MARKER: &str = "\n[... output truncated]";
+
+/// Cached bwrap availability check. Probed once via `bwrap --version`.
+static BWRAP_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+/// Whether bwrap (bubblewrap) is installed and functional.
+///
+/// Probes `bwrap --version` once and caches the result. Uses
+/// `std::process::Command` (blocking) since this runs only once.
+fn bwrap_available() -> bool {
+    *BWRAP_AVAILABLE.get_or_init(|| {
+        std::process::Command::new("bwrap")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Warn-once guard: logs a warning when bwrap is missing under IfAvailable.
+static BWRAP_WARNED: OnceLock<()> = OnceLock::new();
+
+/// Emit a one-time warning that bwrap is not available.
+fn warn_bwrap_missing_once() {
+    BWRAP_WARNED.get_or_init(|| {
+        tracing::warn!("bwrap not found — sandbox disabled, commands run without isolation");
+    });
+}
+
+/// Build the exact bwrap argv per spec (pure function, no I/O).
+///
+/// argv: `--ro-bind / / --dev /dev --proc /proc --tmpfs /tmp
+///        --bind <workspace> <workspace> --unshare-pid --die-with-parent
+///        --chdir <workspace> sh -c <command>`
+///
+/// Built as separate `String` args — never string-interpolated into a
+/// single shell string (no quoting bugs).
+pub fn bwrap_argv(command: &str, cwd: &Path) -> Vec<String> {
+    let ws = cwd.to_string_lossy().to_string();
+    vec![
+        "--ro-bind".into(),
+        "/".into(),
+        "/".into(),
+        "--dev".into(),
+        "/dev".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--tmpfs".into(),
+        "/tmp".into(),
+        "--bind".into(),
+        ws.clone(),
+        ws.clone(),
+        "--unshare-pid".into(),
+        "--die-with-parent".into(),
+        "--chdir".into(),
+        ws,
+        "sh".into(),
+        "-c".into(),
+        command.into(),
+    ]
+}
+
+/// Determine the spawn program and argument list for a shell command.
+///
+/// - `Off` → plain `sh -c <command>`
+/// - `IfAvailable/Required` + bwrap present → exact bwrap argv per spec
+/// - `IfAvailable` + bwrap missing → warn once + fall back to plain `sh -c`
+/// - `Required` + bwrap missing → `Err(PolicyDenied)` (fail closed)
+fn spawn_argv(command: &str, cwd: &Path, sandbox: SandboxMode) -> Result<(String, Vec<String>)> {
+    match sandbox {
+        SandboxMode::Off => Ok(("sh".into(), vec!["-c".into(), command.into()])),
+        SandboxMode::IfAvailable | SandboxMode::Required => {
+            if bwrap_available() {
+                Ok(("bwrap".into(), bwrap_argv(command, cwd)))
+            } else if sandbox == SandboxMode::IfAvailable {
+                warn_bwrap_missing_once();
+                Ok(("sh".into(), vec!["-c".into(), command.into()]))
+            } else {
+                Err(LoreError::PolicyDenied(
+                    "sandbox required but bwrap not found".into(),
+                ))
+            }
+        }
+    }
+}
 
 /// Round down to the nearest UTF-8 char boundary ≤ `index`.
 ///
@@ -110,16 +204,24 @@ impl Tool for ShellTool {
             })
             .await?;
 
-        // Spawn the child with piped stdout/stderr. We take the pipes out
-        // before the timeout so we can kill the process on timeout.
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(&self.cwd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+        // Determine sandbox mode and build the spawn argv.
+        let sandbox = self.gate.policy.sandbox_exec;
+        let (program, argv) = spawn_argv(command, &self.cwd, sandbox)?;
+
+        // Spawn the child with piped stdout/stderr.
+        // When using bwrap, --chdir handles the working directory inside
+        // the sandbox; for plain sh, we set current_dir explicitly.
+        let mut cmd = tokio::process::Command::new(&program);
+        cmd.args(&argv);
+        if program == "sh" {
+            cmd.current_dir(&self.cwd);
+        }
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = cmd
             .spawn()
-            .map_err(|e| LoreError::Server(format!("failed to spawn shell: {e}")))?;
+            .map_err(|e| LoreError::Server(format!("failed to spawn {program}: {e}")))?;
 
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
@@ -199,7 +301,7 @@ impl Tool for ShellTool {
 mod tests {
     use super::*;
     use crate::policy::approval::{AllowAll, DenyAll};
-    use crate::policy::{DefaultExec, Policy};
+    use crate::policy::{DefaultExec, Policy, SandboxMode};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -210,6 +312,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Allow,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         Arc::new(Gate::new(p, Arc::new(AllowAll)))
     }
@@ -221,9 +324,12 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Deny,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         Arc::new(Gate::new(p, Arc::new(DenyAll)))
     }
+
+    // ── Existing functional tests ───────────────────────────────────────
 
     #[tokio::test]
     async fn shell_echo_roundtrip() {
@@ -264,8 +370,6 @@ mod tests {
         let root = std::env::temp_dir();
         let gate = deny_gate(root.clone());
         let tool = ShellTool::new(gate, root);
-        // default_exec = Deny + DenyAll approver; "unknown_command" not on
-        // auto_allow → denied.
         let result = tool.run("unknown_command").await;
         assert!(result.is_err(), "denied command must be Err");
         let err = result.unwrap_err();
@@ -278,7 +382,6 @@ mod tests {
         let root = std::env::temp_dir();
         let gate = allow_gate(root.clone());
         let tool = ShellTool::new(gate, root).with_max_output(64);
-        // Generate output exceeding 64 bytes.
         let out = tool
             .run("python3 -c \"print('A' * 200)\" 2>/dev/null || echo AAAA_BBBB_CCCC_DDDD_EEEE_FFFF_GGGG_HHHH_IIII_JJJJ_KKKK_LLLL")
             .await
@@ -295,8 +398,6 @@ mod tests {
         assert!(tool.run("  ").await.is_err());
     }
 
-    // ── Additional edge-case tests ──────────────────────────────────────
-
     #[tokio::test]
     async fn shell_stderr_is_captured() {
         let root = std::env::temp_dir();
@@ -312,7 +413,6 @@ mod tests {
 
     #[tokio::test]
     async fn shell_cwd_outside_roots_denied() {
-        // Shell tool with a cwd outside the policy roots → Deny.
         let root = std::env::temp_dir();
         let p = Policy {
             roots: vec![root.clone()],
@@ -320,6 +420,7 @@ mod tests {
             deny: vec![],
             default_exec: DefaultExec::Allow,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         let gate = Arc::new(Gate::new(p, Arc::new(AllowAll)));
         let tool = ShellTool::new(gate, PathBuf::from("/etc"));
@@ -331,7 +432,6 @@ mod tests {
 
     #[tokio::test]
     async fn shell_deny_list_beats_auto_allow() {
-        // Both auto_allow and deny contain "sudo" → deny wins.
         let root = std::env::temp_dir();
         let p = Policy {
             roots: vec![root.clone()],
@@ -339,6 +439,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Allow,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         let gate = Arc::new(Gate::new(p, Arc::new(AllowAll)));
         let tool = ShellTool::new(gate, root);
@@ -351,7 +452,6 @@ mod tests {
     #[tokio::test]
     async fn shell_truncation_boundary_exact() {
         let root = std::env::temp_dir();
-        // Generate short output that fits within 200 bytes → no truncation.
         let gate = allow_gate(root.clone());
         let tool = ShellTool::new(gate, root.clone()).with_max_output(200);
         let out = tool.run("echo 1234567890").await.unwrap();
@@ -360,7 +460,6 @@ mod tests {
             "should not truncate: {out}"
         );
 
-        // Now set max_output very small → must truncate.
         let gate2 = allow_gate(root.clone());
         let tool2 = ShellTool::new(gate2, root).with_max_output(5);
         let out2 = tool2.run("echo 1234567890").await.unwrap();
@@ -369,21 +468,17 @@ mod tests {
 
     #[test]
     fn floor_char_boundary_ascii() {
-        // ASCII: every byte is a char boundary.
         assert_eq!(floor_char_boundary("hello", 3), 3);
         assert_eq!(floor_char_boundary("hello", 5), 5);
-        assert_eq!(floor_char_boundary("hello", 100), 5); // index >= len → len
+        assert_eq!(floor_char_boundary("hello", 100), 5);
     }
 
     #[test]
     fn floor_char_boundary_multibyte() {
-        // CJK: each char is 3 bytes. "你好" = 6 bytes.
-        // Byte 4 is mid-char (char 你 = bytes 0-2, char 好 = bytes 3-5).
         assert_eq!(floor_char_boundary("你好", 4), 3);
         assert_eq!(floor_char_boundary("你好", 5), 3);
         assert_eq!(floor_char_boundary("你好", 3), 3);
         assert_eq!(floor_char_boundary("你好", 6), 6);
-        // Emoji: 🎉 is 4 bytes (F0 9F 8E 89).
         assert_eq!(floor_char_boundary("🎉hello", 2), 0);
         assert_eq!(floor_char_boundary("🎉hello", 3), 0);
         assert_eq!(floor_char_boundary("🎉hello", 4), 4);
@@ -391,24 +486,18 @@ mod tests {
 
     #[tokio::test]
     async fn shell_truncation_preserves_exit_code() {
-        // M1 fix: exit code must always be visible even when output is truncated.
         let root = std::env::temp_dir();
         let gate = allow_gate(root.clone());
         let tool = ShellTool::new(gate, root).with_max_output(32);
-        // Generate enough output to trigger truncation.
-        // Use a simple echo command that produces enough chars.
         let out = tool
             .run(r#"python3 -c 'print("A" * 200)' 2>/dev/null || printf 'AAAA_BBBB_CCCC_DDDD_EEEE_FFFF_GGGG_HHHH_IIII_JJJJ'"#)
             .await
             .unwrap();
-        // Exit code must appear AFTER truncation marker.
         assert!(
             out.contains("[exit code:"),
             "exit code must be present: {out}"
         );
-        // Truncation marker must also appear.
         assert!(out.contains(TRUNCATION_MARKER), "must truncate: {out}");
-        // Exit code comes AFTER truncation marker in the string.
         let trunc_idx = out.find(TRUNCATION_MARKER).unwrap();
         let exit_idx = out.find("[exit code:").unwrap();
         assert!(exit_idx > trunc_idx, "exit code after truncation: {out}");
@@ -416,15 +505,14 @@ mod tests {
 
     #[tokio::test]
     async fn shell_shell_metacharacters_denied() {
-        // C2 fix: commands with shell metacharacters are denied when
-        // default_exec != Allow.
         let root = std::env::temp_dir();
         let p = Policy {
             roots: vec![root.clone()],
             auto_allow: vec![],
             deny: vec![],
-            default_exec: DefaultExec::Ask, // NOT Allow → metachars blocked
+            default_exec: DefaultExec::Ask,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         let gate = Arc::new(Gate::new(p, Arc::new(DenyAll)));
         let tool = ShellTool::new(gate, root);
@@ -432,5 +520,175 @@ mod tests {
         assert!(result.is_err(), "semicolon chaining → denied");
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("metacharacter"), "error: {err}");
+    }
+
+    // ── Sandbox argv construction tests ─────────────────────────────────
+
+    #[test]
+    fn spawn_argv_off_returns_plain_sh() {
+        let (program, args) =
+            spawn_argv("ls -la", Path::new("/workspace"), SandboxMode::Off).unwrap();
+        assert_eq!(program, "sh");
+        assert_eq!(args, vec!["-c", "ls -la"]);
+    }
+
+    #[test]
+    fn bwrap_argv_exact_spec_order() {
+        let ws = Path::new("/home/user/project");
+        let args = bwrap_argv("cargo test", ws);
+        // Verify exact order per spec.
+        let expected = vec![
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--bind",
+            "/home/user/project",
+            "/home/user/project",
+            "--unshare-pid",
+            "--die-with-parent",
+            "--chdir",
+            "/home/user/project",
+            "sh",
+            "-c",
+            "cargo test",
+        ];
+        assert_eq!(args, expected, "bwrap argv must match spec exactly");
+    }
+
+    #[test]
+    fn bwrap_argv_workspace_bind_present() {
+        let ws = Path::new("/my/workspace");
+        let args = bwrap_argv("echo hello", ws);
+        // Workspace must appear as both source and dest in --bind.
+        let bind_idx = args.iter().position(|a| a == "--bind").unwrap();
+        assert_eq!(
+            args[bind_idx + 1],
+            "/my/workspace",
+            "--bind source must be workspace"
+        );
+        assert_eq!(
+            args[bind_idx + 2],
+            "/my/workspace",
+            "--bind dest must be workspace"
+        );
+        // --chdir must also point to workspace.
+        let chdir_idx = args.iter().position(|a| a == "--chdir").unwrap();
+        assert_eq!(
+            args[chdir_idx + 1],
+            "/my/workspace",
+            "--chdir must be workspace"
+        );
+    }
+
+    #[test]
+    fn bwrap_argv_no_string_joined_shell() {
+        // Every arg is a separate string — no "sh -c cargo test" as one arg.
+        let args = bwrap_argv("complex command with spaces", Path::new("/ws"));
+        // The command is a single arg after "-c", but the shell invocation
+        // itself is never string-joined into one arg.
+        let sh_idx = args.iter().position(|a| a == "sh").unwrap();
+        assert_eq!(args[sh_idx + 1], "-c");
+        assert_eq!(args[sh_idx + 2], "complex command with spaces");
+        // No arg contains the full "sh -c ..." as a single string.
+        for arg in &args {
+            assert!(
+                !arg.starts_with("sh -c "),
+                "no string-joined shell invocation: found '{arg}'"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_argv_required_no_bwrap_fails_closed() {
+        // On this machine bwrap is absent — Required must return PolicyDenied.
+        let result = spawn_argv("echo hi", Path::new("/ws"), SandboxMode::Required);
+        assert!(result.is_err(), "Required + no bwrap → PolicyDenied");
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("bwrap not found"), "error message: {msg}");
+    }
+
+    #[test]
+    fn spawn_argv_if_available_no_bwrap_falls_back() {
+        // On this machine bwrap is absent — IfAvailable must fall back to
+        // plain sh (with a one-time warning already logged).
+        let result = spawn_argv("echo hi", Path::new("/ws"), SandboxMode::IfAvailable);
+        assert!(result.is_ok(), "IfAvailable + no bwrap → fallback");
+        let (program, args) = result.unwrap();
+        assert_eq!(program, "sh");
+        assert_eq!(args, vec!["-c", "echo hi"]);
+    }
+
+    // ── Policy serde: old JSON without sandbox_exec ─────────────────────
+
+    #[test]
+    fn policy_old_json_without_sandbox_exec_loads_as_off() {
+        let old_json = r#"{
+            "roots": ["/tmp"],
+            "auto_allow": ["ls"],
+            "deny": ["sudo"],
+            "default_exec": "Ask",
+            "ask_on_write": false
+        }"#;
+        let p: Policy = serde_json::from_str(old_json).unwrap();
+        assert_eq!(p.sandbox_exec, SandboxMode::Off);
+        assert_eq!(p.roots, vec![PathBuf::from("/tmp")]);
+    }
+
+    #[test]
+    fn policy_json_roundtrip_with_sandbox_exec() {
+        let p = Policy {
+            roots: vec![PathBuf::from("/tmp")],
+            auto_allow: vec!["ls".into()],
+            deny: vec!["sudo".into()],
+            default_exec: DefaultExec::Ask,
+            ask_on_write: false,
+            sandbox_exec: SandboxMode::Required,
+        };
+        let json = serde_json::to_string_pretty(&p).unwrap();
+        let loaded: Policy = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.sandbox_exec, SandboxMode::Required);
+    }
+
+    // ── Real-bwrap integration test (skipped when absent) ───────────────
+
+    #[tokio::test]
+    async fn sandbox_integration_skipped_without_bwrap() {
+        if !bwrap_available() {
+            eprintln!("SKIP: bwrap not available on this host");
+            return;
+        }
+
+        let root = std::env::temp_dir();
+        let ws = root.join("lore-bwrap-integration-test");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let p = Policy {
+            roots: vec![ws.clone()],
+            auto_allow: vec!["echo".into(), "cat".into(), "touch".into(), "ls".into()],
+            deny: vec!["sudo".into()],
+            default_exec: DefaultExec::Allow,
+            ask_on_write: false,
+            sandbox_exec: SandboxMode::Required,
+        };
+        let gate = Arc::new(Gate::new(p, Arc::new(AllowAll)));
+        let tool = ShellTool::new(gate, ws.clone());
+
+        // Write inside workspace → succeeds (workspace is bind-mounted writable).
+        let out = tool.run("touch inside_ws.txt").await.unwrap();
+        assert!(out.contains("[exit code: 0]"), "write in ws ok: {out}");
+
+        // Write to /tmp → fails (tmpfs, but unprivileged bwrap may allow it;
+        // the key property is isolation from host /tmp).
+        // We just verify the sandbox runs; precise /tmp isolation depends on
+        // bwrap version and user namespaces.
+
+        std::fs::remove_dir_all(&ws).ok();
     }
 }

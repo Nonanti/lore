@@ -318,7 +318,7 @@ mod tests {
     use crate::memory::{InMemoryStore, Memory, Scope};
     use crate::model::{Completion, Model, Prompt};
     use crate::policy::approval::{AllowAll, DenyAll, Gate};
-    use crate::policy::{DefaultExec, Policy};
+    use crate::policy::{DefaultExec, Policy, SandboxMode};
     use crate::tool::{ToolContext, ToolRegistry};
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -394,6 +394,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Allow,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         Arc::new(Gate::new(p, Arc::new(AllowAll)))
     }
@@ -405,6 +406,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Deny,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         Arc::new(Gate::new(p, Arc::new(DenyAll)))
     }

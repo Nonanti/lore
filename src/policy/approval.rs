@@ -144,7 +144,7 @@ impl Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{Action, DefaultExec, Policy};
+    use crate::policy::{Action, DefaultExec, Policy, SandboxMode};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -156,6 +156,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Ask,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         }
     }
 
@@ -284,6 +285,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Ask,
             ask_on_write: true,
+            sandbox_exec: SandboxMode::Off,
         };
         let gate = Gate::new(p, Arc::new(AllowAll));
         let result = gate
@@ -302,6 +304,7 @@ mod tests {
                 deny: vec!["sudo".into()],
                 default_exec: DefaultExec::Ask,
                 ask_on_write: true,
+                sandbox_exec: SandboxMode::Off,
             },
             Arc::new(DenyAll),
         );
@@ -335,6 +338,7 @@ mod tests {
             deny: vec![],
             default_exec: DefaultExec::Ask,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         }; // Everything goes to Ask.
         let gate = Gate::new(p, Arc::new(RejectWithReason));
         let result = gate

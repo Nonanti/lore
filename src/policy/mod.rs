@@ -52,6 +52,23 @@ pub enum DefaultExec {
     Deny,
 }
 
+/// Sandbox mode for shell command execution.
+///
+/// Controls whether commands run inside a bubblewrap (bwrap) sandbox.
+/// Additive: old policy.json files without this field deserialize as `Off`
+/// via `#[serde(default)]` on the `Policy` struct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SandboxMode {
+    /// No sandbox — commands run via plain `sh -c`.
+    #[default]
+    Off,
+    /// Use bwrap if available; fall back to plain exec with a one-time
+    /// warning if not found.
+    IfAvailable,
+    /// Require bwrap — fail closed (`PolicyDenied`) if not found.
+    Required,
+}
+
 /// Policy configuration. Pure data — no I/O in evaluation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Policy {
@@ -70,6 +87,10 @@ pub struct Policy {
     pub default_exec: DefaultExec,
     /// Whether writes inside roots require approval.
     pub ask_on_write: bool,
+    /// Sandbox mode for shell exec: Off (default), IfAvailable, Required.
+    /// Additive — old policy.json without this field loads as Off.
+    #[serde(default)]
+    pub sandbox_exec: SandboxMode,
 }
 
 impl Default for Policy {
@@ -127,6 +148,7 @@ impl Policy {
             ],
             default_exec: DefaultExec::Ask,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         }
     }
 
@@ -339,6 +361,7 @@ mod tests {
             deny: vec!["sudo".into(), "rm -rf /".into()],
             default_exec: DefaultExec::Ask,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         }
     }
 
@@ -353,6 +376,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Ask,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         let v = p.evaluate(&Action::Exec {
             command: "sudo apt install something".into(),
@@ -373,6 +397,7 @@ mod tests {
             deny: vec!["su".into(), "dd".into(), "sudo".into()],
             default_exec: DefaultExec::Ask,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         let exec = |cmd: &str| {
             p.evaluate(&Action::Exec {
@@ -460,6 +485,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Ask,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         let v = p.evaluate(&Action::Exec {
             command: "some unknown command".into(),
@@ -477,6 +503,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Allow,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         let v = p.evaluate(&Action::Exec {
             command: "some unknown command".into(),
@@ -494,6 +521,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Deny,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         let v = p.evaluate(&Action::Exec {
             command: "some unknown command".into(),
@@ -512,6 +540,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Allow,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         let v = p.evaluate(&Action::Exec {
             command: "ls".into(),
@@ -544,6 +573,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Ask,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         let v = p.evaluate(&Action::Write {
             path: PathBuf::from("/etc/secret.txt"),
@@ -560,6 +590,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Ask,
             ask_on_write: true,
+            sandbox_exec: SandboxMode::Off,
         };
         let v = p.evaluate(&Action::Write {
             path: root.join("file.txt"),
@@ -586,6 +617,7 @@ mod tests {
             deny: vec!["sudo".into()],
             default_exec: DefaultExec::Allow,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         let v = p.evaluate(&Action::Write {
             path: PathBuf::from("/tmp/../etc/passwd"),
@@ -778,6 +810,7 @@ mod tests {
             deny: vec![],
             default_exec: DefaultExec::Allow,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         // default_exec = Allow → metacharacters are NOT blocked.
         let v = p.evaluate(&Action::Exec {

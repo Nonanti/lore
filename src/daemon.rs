@@ -694,6 +694,7 @@ mod tests {
     use crate::agent::{Agent, Persona};
     use crate::memory::InMemoryStore;
     use crate::model::{Completion, MockModel, Model, Prompt};
+    use crate::policy::SandboxMode;
     use crate::task::NewTask;
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -770,6 +771,7 @@ mod tests {
             deny: vec![],
             default_exec: crate::policy::DefaultExec::Allow,
             ask_on_write: false,
+            sandbox_exec: SandboxMode::Off,
         };
         policy.save(&data_dir.join("policy.json")).unwrap();
     }
