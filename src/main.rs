@@ -397,6 +397,14 @@ fn validate_agent_name(name: &str) -> anyhow::Result<()> {
     if name.contains('/') || name.contains('\\') || name.contains("..") {
         anyhow::bail!("invalid agent name '{name}': must not contain '/', '\\', or '..'");
     }
+    // Reserved: the shared team-memory store lives at memory/team.db — an
+    // agent named "team" would collide with it (personal == shared file:
+    // duplicated recalls + broken cross-agent isolation).
+    if name.eq_ignore_ascii_case("team") {
+        anyhow::bail!(
+            "'team' is a reserved agent name (conflicts with the shared team memory store)"
+        );
+    }
     Ok(())
 }
 

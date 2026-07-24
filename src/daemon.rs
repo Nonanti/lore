@@ -593,6 +593,14 @@ pub async fn run_daemon(data_dir: &Path, db_path: &Path, concurrency: usize) -> 
 /// (shared conventions) live in the team file; everything else stays
 /// personal. Both files share the offline embedder.
 fn build_agent_store(data_dir: &Path, agent_name: &str) -> Result<CompositeStore> {
+    // Defense in depth: creation paths reject the reserved name, but persona
+    // files predating that rule (or written by other tools) must not silently
+    // corrupt the shared store by opening it as their personal file.
+    if agent_name.eq_ignore_ascii_case("team") {
+        return Err(crate::error::LoreError::InvalidInput(
+            "'team' is a reserved agent name (conflicts with memory/team.db)".into(),
+        ));
+    }
     let mem_dir = data_dir.join("memory");
     std::fs::create_dir_all(&mem_dir)
         .map_err(|e| crate::error::LoreError::Storage(e.to_string()))?;
@@ -988,6 +996,49 @@ mod tests {
 
     fn cleanup(dir: &PathBuf) {
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn reserved_team_agent_name_is_rejected_by_store_builder() {
+        let data = make_temp_dir("team-reserved");
+        for name in ["team", "TEAM", "Team"] {
+            let err = match build_agent_store(&data, name) {
+                Err(e) => e,
+                Ok(_) => panic!("'{name}' must be rejected"),
+            };
+            assert!(
+                err.to_string().contains("reserved"),
+                "'{name}' must be rejected: {err}"
+            );
+        }
+        cleanup(&data);
+    }
+
+    #[tokio::test]
+    async fn no_share_flag_survives_daemon_persona_round_trip() {
+        // The daemon path: persona JSON on disk → Agent::load_from over a
+        // composite store. The share opt-out must survive that round trip.
+        let data = make_temp_dir("team-noshare");
+        let agents_dir = data.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let store: Arc<dyn crate::memory::MemoryStore> = Arc::new(InMemoryStore::new());
+        let agent = Agent::new(
+            Persona::new("loner", "worker"),
+            store,
+            Arc::new(MockModel::new()),
+        )
+        .with_share(false);
+        let path = agents_dir.join("loner.json");
+        agent.save_to(&path).unwrap();
+
+        let composite: Arc<dyn crate::memory::MemoryStore> =
+            Arc::new(build_agent_store(&data, "loner").unwrap());
+        let loaded = Agent::load_from(&path, composite, Arc::new(MockModel::new())).unwrap();
+        assert!(
+            !loaded.should_share(),
+            "no-share flag must survive the daemon persistence path"
+        );
+        cleanup(&data);
     }
 
     #[tokio::test]

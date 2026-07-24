@@ -94,7 +94,29 @@ fmt + clippy `-D warnings` (default + `neural`) + full suite green + 5×
 stress on daemon tests (new shared-file concurrency surface). Conventional
 commits, independent review at the end, push.
 
-## 6. Out of scope
+## 6. Addendum (2026-07-24): review fixes
+
+Independent review (1 critical, 2 major, 4 minor):
+
+- **Reserved name `team`** (critical): an agent literally named "team"
+  would open `memory/team.db` as its personal file — personal == shared,
+  duplicated recalls, broken isolation. Rejected at `agent create`
+  (case-insensitive) AND defensively in `build_agent_store` (persona
+  files predating the rule cannot corrupt the shared store).
+- **Merge correctness documented with proof**: per-store `limit` is
+  lossless for pure score ordering (a record cut from its store's top-L
+  has ≥L better records in the pool, so it can never make the global
+  top-L). Accepted caveats now in code + spec: per-store rerank/MMR
+  reorder locally (approximate interleave), and the graph leg's entity
+  bridging does NOT span stores — a personal record's entity cannot pull
+  a shared neighbor, and vice versa.
+- **`reinforce_many` probe cost halved**: one personal-side `get` per id;
+  the remainder goes to the shared batch whose contract already skips
+  missing ids.
+- Tests added: reserved-name rejection, `--no-share` surviving the
+  daemon persona round trip (save_to → load_from over a composite).
+
+## 7. Out of scope
 
 - Dashboard visibility of team memory (sub-project C).
 - Attribution/provenance fields (T7).

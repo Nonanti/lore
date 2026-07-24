@@ -59,9 +59,18 @@ impl MemoryStore for CompositeStore {
     async fn recall(&self, scope: &Scope, query: &Query) -> Result<Vec<Scored<Memory>>> {
         // Both sides run the full query (each store enforces `Scope::sees`
         // itself: the shared store answers with World records, the personal
-        // store with own + any local World records). Per-store finalize
-        // (rerank/MMR/graph) runs before the merge; MMR diversity is not
-        // re-applied across stores — documented tradeoff.
+        // store with Agent records — plus any legacy World records written
+        // before the composite upgrade, which stay visible to their owner).
+        //
+        // Merge correctness (plain score path): if a record was cut from its
+        // store's top-`limit`, that store holds ≥`limit` better records, all
+        // present in the merge pool — so the cut record can never belong to
+        // the global top-`limit`. Per-store `limit` is therefore lossless
+        // for pure score ordering. Caveats (accepted, per spec): per-store
+        // rerank/MMR/graph finalize reorder locally, so their cross-store
+        // interleaving is approximate; MMR diversity and the graph leg's
+        // entity bridging do not span the two stores (an entity in a
+        // personal record cannot pull a shared neighbor, and vice versa).
         let mut hits = self.personal.recall(scope, query).await?;
         hits.extend(self.shared.recall(scope, query).await?);
         hits.sort_by(|a, b| {
@@ -81,22 +90,24 @@ impl MemoryStore for CompositeStore {
     }
 
     async fn reinforce_many(&self, ids: &[MemoryId], outcome: Outcome) -> Result<()> {
-        // Split by owning store, batch each side (missing ids are skipped —
-        // same contract as the single-store implementations).
+        // One ownership probe per id (personal side only); everything not
+        // personally owned goes to the shared batch, whose own contract
+        // already skips missing ids — halves the probe cost of the naive
+        // two-sided split (review finding #3).
         let mut personal_ids = Vec::new();
-        let mut shared_ids = Vec::new();
+        let mut rest = Vec::new();
         for id in ids {
             if self.personal.get(id).await?.is_some() {
                 personal_ids.push(id.clone());
-            } else if self.shared.get(id).await?.is_some() {
-                shared_ids.push(id.clone());
+            } else {
+                rest.push(id.clone());
             }
         }
         if !personal_ids.is_empty() {
             self.personal.reinforce_many(&personal_ids, outcome).await?;
         }
-        if !shared_ids.is_empty() {
-            self.shared.reinforce_many(&shared_ids, outcome).await?;
+        if !rest.is_empty() {
+            self.shared.reinforce_many(&rest, outcome).await?;
         }
         Ok(())
     }

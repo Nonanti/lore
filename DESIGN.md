@@ -5,7 +5,7 @@
 > not tied to any external service or API; the memory engine is written from scratch in
 > native Rust, inside Lore (“Alaz from zero”).
 
-> **Status (626 tests passing + 3 ignored [live-LLM/neural], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅ + Phase E hardening ✅ + Phase E review hardening ✅ + native tool calling ✅ incl. Codex (`docs/superpowers/specs/2026-07-24-native-tool-calling-design.md`).
+> **Status (628 tests passing + 3 ignored [live-LLM/neural], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅ + Phase E hardening ✅ + Phase E review hardening ✅ + native tool calling ✅ incl. Codex (`docs/superpowers/specs/2026-07-24-native-tool-calling-design.md`).
 
 This document captures the design decisions and phased roadmap made after research
 (the 2026 “Memory in the Age of AI Agents” survey + Alaz's current architecture).
@@ -295,7 +295,7 @@ pub trait MemoryStore: Send + Sync {
 
 ## 10. Phased Roadmap (milestones)
 
-> **Status (626 tests passing + 3 ignored [live-LLM/neural], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅ + Phase E hardening ✅ + Phase E review hardening ✅ + native tool calling ✅ incl. Codex + memory deepening ✅ (D21) + team memory ✅ (D22). **Roadmap docs:** [`2026-07-24-next-roadmap.md`](../docs/superpowers/specs/2026-07-24-next-roadmap.md) (phases A–E, done) · [`2026-07-24-native-tool-calling-design.md`](../docs/superpowers/specs/2026-07-24-native-tool-calling-design.md) (done incl. the Codex addendum; streaming tool use deliberately deferred — D20).
+> **Status (628 tests passing + 3 ignored [live-LLM/neural], clippy clean, with CI):** M0–M31 ✅ + AI coworkers ✅ + code review fixes ✅ + 4-way review hardening ✅ + Phase E hardening ✅ + Phase E review hardening ✅ + native tool calling ✅ incl. Codex + memory deepening ✅ (D21) + team memory ✅ (D22). **Roadmap docs:** [`2026-07-24-next-roadmap.md`](../docs/superpowers/specs/2026-07-24-next-roadmap.md) (phases A–E, done) · [`2026-07-24-native-tool-calling-design.md`](../docs/superpowers/specs/2026-07-24-native-tool-calling-design.md) (done incl. the Codex addendum; streaming tool use deliberately deferred — D20).
 
 - ✅ **M0 — Skeleton:** crate layout, `error.rs`, `id.rs`, empty modules, `lib.rs` compiles.
 - ✅ **M1 — Memory core:** `Memory` types + `MemoryStore` trait + `InMemoryStore`
