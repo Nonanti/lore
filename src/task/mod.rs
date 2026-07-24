@@ -361,6 +361,26 @@ impl TaskStore {
         Ok(())
     }
 
+    /// CAS: Mark task Completed only if its current status matches `guard`.
+    /// Returns `Ok(true)` if the row was updated, `Ok(false)` if another
+    /// worker already changed the status (compare-and-swap failed).
+    pub fn complete_if_status(
+        &self,
+        id: &str,
+        report_json: &str,
+        guard: TaskStatus,
+    ) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE tasks SET status = 'Completed', report = ?1, updated_at = ?2 WHERE id = ?3 AND status = ?4",
+                params![report_json, now, id, guard.as_str()],
+            )
+            .map_err(sqlite_err)?;
+        Ok(changed > 0)
+    }
+
     /// Mark task Failed with a report JSON.
     pub fn fail(&self, id: &str, report_json: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
@@ -375,6 +395,21 @@ impl TaskStore {
             return Err(LoreError::NotFound(format!("task {id}")));
         }
         Ok(())
+    }
+
+    /// CAS: Mark task Failed only if its current status matches `guard`.
+    /// Returns `Ok(true)` if the row was updated, `Ok(false)` if another
+    /// worker already changed the status (compare-and-swap failed).
+    pub fn fail_if_status(&self, id: &str, report_json: &str, guard: TaskStatus) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE tasks SET status = 'Failed', report = ?1, updated_at = ?2 WHERE id = ?3 AND status = ?4",
+                params![report_json, now, id, guard.as_str()],
+            )
+            .map_err(sqlite_err)?;
+        Ok(changed > 0)
     }
 
     /// List tasks ordered by `created_at` descending, limited to `limit`.
@@ -471,6 +506,60 @@ impl TaskStore {
             parent_id: Some(parent_id.to_string()),
         };
         self.enqueue(child)
+    }
+
+    /// Atomic child enqueue: inserts a child task only if no child with the
+    /// same `agent` already exists for this parent. Returns `Ok(Some(Task))`
+    /// if inserted, `Ok(None)` if a duplicate was detected (CAS success).
+    /// This prevents two concurrent workers from enqueueing duplicate
+    /// reviewer children (C-2 fix).
+    pub fn enqueue_child_if_agent_absent(
+        &self,
+        parent_id: &str,
+        task: NewTask,
+    ) -> Result<Option<Task>> {
+        let id = ulid::Ulid::new().to_string();
+        let now = Utc::now();
+        let verify_json = serde_json::to_string(&task.verify)?;
+        let workspace_str = task.workspace.to_string_lossy().to_string();
+
+        let changed = self
+            .conn
+            .execute(
+                "INSERT INTO tasks (id, agent, goal, workspace, verify, status, created_at, updated_at, parent_id)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+                  WHERE NOT EXISTS (SELECT 1 FROM tasks WHERE parent_id = ?9 AND agent = ?2)",
+                params![
+                    id,
+                    task.agent,
+                    task.goal,
+                    workspace_str,
+                    verify_json,
+                    TaskStatus::Queued.as_str(),
+                    now.to_rfc3339(),
+                    now.to_rfc3339(),
+                    parent_id,
+                ],
+            )
+            .map_err(sqlite_err)?;
+
+        if changed == 0 {
+            // Duplicate agent child exists — CAS blocked.
+            return Ok(None);
+        }
+
+        Ok(Some(Task {
+            id,
+            agent: task.agent,
+            goal: task.goal,
+            workspace: task.workspace,
+            verify: task.verify,
+            status: TaskStatus::Queued,
+            created_at: now,
+            updated_at: now,
+            report: None,
+            parent_id: Some(parent_id.to_string()),
+        }))
     }
 
     /// Insert an approval entry for a task. Returns the approval id.
@@ -1533,5 +1622,121 @@ mod tests {
 
         // No more Queued tasks.
         assert!(store.claim_next_queued().unwrap().is_none());
+    }
+
+    // ── complete_if_status / fail_if_status (CAS guards) ──────────────
+
+    #[test]
+    fn complete_if_status_succeeds_when_guard_matches() {
+        let store = TaskStore::in_memory().unwrap();
+        let t = store.enqueue(new_task("a", "goal")).unwrap();
+        store.set_status(&t.id, TaskStatus::Running).unwrap();
+        store
+            .set_status(&t.id, TaskStatus::WaitingSubtasks)
+            .unwrap();
+
+        let report = serde_json::json!({"success": true, "answer": "done"});
+        let report_json = serde_json::to_string(&report).unwrap();
+
+        // CAS succeeds: status IS WaitingSubtasks.
+        let ok = store
+            .complete_if_status(&t.id, &report_json, TaskStatus::WaitingSubtasks)
+            .unwrap();
+        assert!(ok, "CAS should succeed when status matches guard");
+
+        let t = store.get(&t.id).unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn complete_if_status_fails_when_guard_wrong() {
+        let store = TaskStore::in_memory().unwrap();
+        let t = store.enqueue(new_task("a", "goal")).unwrap();
+        store.set_status(&t.id, TaskStatus::Running).unwrap();
+
+        let report_json = "{\"success\":true}";
+
+        // CAS fails: status is Running, not WaitingSubtasks.
+        let ok = store
+            .complete_if_status(&t.id, report_json, TaskStatus::WaitingSubtasks)
+            .unwrap();
+        assert!(!ok, "CAS should fail when status does not match guard");
+
+        // Status unchanged.
+        let t = store.get(&t.id).unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn fail_if_status_succeeds_when_guard_matches() {
+        let store = TaskStore::in_memory().unwrap();
+        let t = store.enqueue(new_task("a", "goal")).unwrap();
+        store.set_status(&t.id, TaskStatus::Running).unwrap();
+        store
+            .set_status(&t.id, TaskStatus::WaitingSubtasks)
+            .unwrap();
+
+        let report_json = "{\"success\":false}";
+        let ok = store
+            .fail_if_status(&t.id, report_json, TaskStatus::WaitingSubtasks)
+            .unwrap();
+        assert!(ok, "CAS should succeed when status matches guard");
+
+        let t = store.get(&t.id).unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn fail_if_status_fails_when_guard_wrong() {
+        let store = TaskStore::in_memory().unwrap();
+        let t = store.enqueue(new_task("a", "goal")).unwrap();
+        store.set_status(&t.id, TaskStatus::Running).unwrap();
+
+        let report_json = "{\"success\":false}";
+        let ok = store
+            .fail_if_status(&t.id, report_json, TaskStatus::WaitingSubtasks)
+            .unwrap();
+        assert!(!ok, "CAS should fail when status does not match guard");
+
+        let t = store.get(&t.id).unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Running);
+    }
+
+    // ── enqueue_child_if_agent_absent (atomic reviewer guard) ────────
+
+    #[test]
+    fn enqueue_child_if_agent_absent_inserts_when_no_duplicate() {
+        let store = TaskStore::in_memory().unwrap();
+        let parent = store.enqueue(new_task("pm", "big goal")).unwrap();
+
+        let child = store
+            .enqueue_child_if_agent_absent(&parent.id, new_task("backend", "impl feature"))
+            .unwrap();
+        assert!(child.is_some(), "first enqueue should succeed");
+        assert_eq!(child.unwrap().agent, "backend");
+    }
+
+    #[test]
+    fn enqueue_child_if_agent_absent_blocks_duplicate_agent() {
+        let store = TaskStore::in_memory().unwrap();
+        let parent = store.enqueue(new_task("pm", "big goal")).unwrap();
+
+        // First reviewer child succeeds.
+        let first = store
+            .enqueue_child_if_agent_absent(&parent.id, new_task("reviewer", "review work"))
+            .unwrap();
+        assert!(first.is_some(), "first reviewer enqueue succeeds");
+
+        // Second reviewer child is blocked (same agent).
+        let second = store
+            .enqueue_child_if_agent_absent(&parent.id, new_task("reviewer", "review again"))
+            .unwrap();
+        assert!(second.is_none(), "duplicate reviewer agent blocked");
+
+        // Different agent still succeeds.
+        let other = store
+            .enqueue_child_if_agent_absent(&parent.id, new_task("frontend", "build UI"))
+            .unwrap();
+        assert!(other.is_some(), "different agent still succeeds");
     }
 }

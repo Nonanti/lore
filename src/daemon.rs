@@ -20,8 +20,7 @@ use crate::error::{LoreError, Result};
 use crate::memory::{HashingEmbedder, MemoryStore, SqliteStore};
 use crate::model::{Model, ModelConfig};
 use crate::orchestrator::pm::{
-    build_roster, collect_child_reports, decompose_with_retry, has_review_child, has_reviewer,
-    synthesis_prompt,
+    build_roster, collect_child_reports, decompose_with_retry, has_reviewer, synthesis_prompt,
 };
 use crate::policy::approval::Gate;
 use crate::policy::Policy;
@@ -287,7 +286,7 @@ impl InFlightRegistry {
     /// Register a task as in-flight. Returns the id of an existing task
     /// sharing the same workspace (for the `tracing::warn`), or `None`.
     fn add(&self, task_id: &str, workspace: PathBuf) -> Option<String> {
-        let mut tasks = self.tasks.lock().unwrap();
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         let same_ws = tasks.iter().find(|(_, ws)| ws == &workspace);
         let warning_id = same_ws.map(|(id, _)| id.clone());
         tasks.push((task_id.to_string(), workspace));
@@ -310,7 +309,10 @@ impl InFlightRegistry {
 
     /// Remove a task from the in-flight registry.
     fn remove(&self, task_id: &str) {
-        self.tasks.lock().unwrap().retain(|(id, _)| id != task_id);
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(id, _)| id != task_id);
     }
 
     /// Peak number of tasks that were in-flight simultaneously.
@@ -390,6 +392,9 @@ async fn worker_loop(
             if let Err(e) = &result {
                 tracing::error!(worker_id, task_id = %task.id, error = %e, "PM decomposition failed");
             }
+            // Remove from in-flight registry (M-1 fix: was missing on
+            // normal completion path — only removed on shutdown).
+            in_flight.remove(&task.id);
         } else {
             // Regular task.
             let result = tokio::select! {
@@ -436,9 +441,15 @@ async fn worker_loop(
         }
 
         // After any task completion/failure, check parent.
-        if let Ok(completed) = maybe_complete_parent(&store, &task.id, &deps).await {
-            if completed {
-                tracing::info!(worker_id, child_task_id = %task.id, "parent task finalized");
+        // Log errors rather than silently discarding them (Mi-2 fix).
+        match maybe_complete_parent(&store, &task.id, &deps).await {
+            Ok(completed) => {
+                if completed {
+                    tracing::info!(worker_id, child_task_id = %task.id, "parent task finalized");
+                }
+            }
+            Err(e) => {
+                tracing::error!(worker_id, child_task_id = %task.id, error = %e, "maybe_complete_parent failed — parent may stay wedged until next daemon restart");
             }
         }
     }
@@ -450,7 +461,15 @@ async fn worker_loop(
 /// `concurrency` is clamped to 1..=8. Recovery sweeps run once at
 /// startup before workers spawn.
 pub async fn run_daemon(data_dir: &Path, db_path: &Path, concurrency: usize) -> Result<()> {
+    let original_concurrency = concurrency;
     let concurrency = concurrency.clamp(1, 8);
+    if concurrency != original_concurrency {
+        tracing::warn!(
+            original = original_concurrency,
+            adjusted = concurrency,
+            "concurrency clamped to valid range [1, 8]"
+        );
+    }
     tracing::info!(
         concurrency,
         "daemon starting — data: {}",
@@ -680,7 +699,11 @@ async fn finalize_parent_if_ready(
             answer: msg.to_string(),
             verify_log: String::new(),
         })?;
-        store.fail(parent_id, &report_json)?;
+        // CAS: only fail if still WaitingSubtasks (C-1 fix).
+        if !store.fail_if_status(parent_id, &report_json, TaskStatus::WaitingSubtasks)? {
+            // Another worker already finalized this parent.
+            return Ok(false);
+        }
         return Ok(true);
     }
 
@@ -706,7 +729,10 @@ async fn finalize_parent_if_ready(
             answer: msg,
             verify_log: String::new(),
         })?;
-        store.fail(parent_id, &report_json)?;
+        // CAS: only fail if still WaitingSubtasks (C-1 fix).
+        if !store.fail_if_status(parent_id, &report_json, TaskStatus::WaitingSubtasks)? {
+            return Ok(false);
+        }
         tracing::info!(
             parent_id,
             failed_children = non_review_failures,
@@ -716,9 +742,10 @@ async fn finalize_parent_if_ready(
     }
 
     // All children succeeded. Check if a reviewer should be enqueued.
+    // Atomic enqueue: inserts reviewer only if no reviewer child exists yet
+    // (C-2 fix — prevents duplicate reviewer under concurrent workers).
     let roster = build_roster(&deps.data_dir)?;
-    if has_reviewer(&roster) && !has_review_child(store, parent_id)? {
-        // Enqueue ONE review child.
+    if has_reviewer(&roster) {
         let children_reports = collect_child_reports(store, parent_id)?;
         let review_goal = format!(
             "Review the completed work:\n{}\nLook for gaps, contradictions, missing verification.",
@@ -732,14 +759,18 @@ async fn finalize_parent_if_ready(
                 .map(|c| c.workspace.clone())
                 .unwrap_or_else(std::env::temp_dir),
             verify: vec![],
-            parent_id: None, // enqueue_child sets this
+            parent_id: None, // enqueue_child_if_agent_absent sets this
         };
-        store.enqueue_child(parent_id, review_task)?;
-        tracing::info!(
-            parent_id,
-            "review child enqueued, parent stays WaitingSubtasks"
-        );
-        return Ok(false); // Parent still waiting (for the review child).
+        let enqueued = store.enqueue_child_if_agent_absent(parent_id, review_task)?;
+        if enqueued.is_some() {
+            tracing::info!(
+                parent_id,
+                "review child enqueued, parent stays WaitingSubtasks"
+            );
+            return Ok(false); // Parent still waiting (for the review child).
+        }
+        // Reviewer child already exists (another worker enqueued it) →
+        // fall through to synthesis.
     }
 
     // All children done + review done (or no reviewer) → PM synthesis.
@@ -766,7 +797,10 @@ async fn finalize_parent_if_ready(
                 answer: msg.clone(),
                 verify_log: String::new(),
             })?;
-            store.fail(parent_id, &report_json)?;
+            // CAS: only fail if still WaitingSubtasks (C-1 fix).
+            if !store.fail_if_status(parent_id, &report_json, TaskStatus::WaitingSubtasks)? {
+                return Ok(false);
+            }
             tracing::info!(parent_id, "parent task Failed (PM synthesis error)");
             return Ok(true);
         }
@@ -778,7 +812,12 @@ async fn finalize_parent_if_ready(
         "children_count": children.len(),
     });
     let report_json = serde_json::to_string(&combined_report)?;
-    store.complete(parent_id, &report_json)?;
+    // CAS: only complete if still WaitingSubtasks (C-1 fix).
+    // Prevents double LLM call when two workers finalize concurrently.
+    if !store.complete_if_status(parent_id, &report_json, TaskStatus::WaitingSubtasks)? {
+        // Another worker already finalized this parent.
+        return Ok(false);
+    }
     tracing::info!(
         parent_id,
         children_count = children.len(),
