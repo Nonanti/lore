@@ -40,6 +40,8 @@ pub use error::{LoreError, Result};
 pub use id::{AgentId, MemoryId};
 #[cfg(feature = "neural")]
 pub use memory::NeuralEmbedder;
+#[cfg(feature = "neural")]
+pub use memory::NeuralReranker;
 pub use memory::{
     ConsolidationReport, Embedder, FiveW, ForgetPolicy, HashingEmbedder, InMemoryStore, Memory,
 };

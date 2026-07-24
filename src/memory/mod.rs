@@ -20,6 +20,8 @@ pub use embed::{Embedder, HashingEmbedder};
 pub use evolution::ForgetPolicy;
 pub use graph::MemoryGraph;
 pub use in_memory::InMemoryStore;
+#[cfg(feature = "neural")]
+pub use rerank::NeuralReranker;
 pub use rerank::{NativeReranker, Reranker};
 pub use sqlite::SqliteStore;
 pub use types::{

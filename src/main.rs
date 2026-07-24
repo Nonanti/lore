@@ -285,6 +285,25 @@ fn build_embedder() -> Arc<dyn lore::Embedder> {
     Arc::new(HashingEmbedder::new())
 }
 
+/// Sets up the reranker: `LORE_RERANKER=neural` + `neural` feature →
+/// cross-encoder (fastembed); otherwise None — `Query.rerank` then uses the
+/// native lexical reranker (fully offline).
+fn build_reranker() -> Option<Arc<dyn lore::Reranker>> {
+    #[cfg(feature = "neural")]
+    if std::env::var("LORE_RERANKER").as_deref() == Ok("neural") {
+        match lore::NeuralReranker::new() {
+            Ok(r) => {
+                println!("🧠 Neural reranker active (cross-encoder)");
+                return Some(Arc::new(r));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "neural reranker failed to initialize; falling back to native")
+            }
+        }
+    }
+    None
+}
+
 /// Sets up persistent application state (SQLite memory + persona directory).
 /// Validates `LORE_API_KEY`: empty/whitespace keys are REJECTED.
 /// Otherwise `LORE_API_KEY=""` would leave auth as an open door — an empty `x-api-key:`
@@ -303,8 +322,11 @@ fn parse_api_key(raw: Option<String>) -> Option<String> {
 
 fn build_state(data: &str) -> anyhow::Result<AppState> {
     std::fs::create_dir_all(data)?;
-    let store: Arc<dyn MemoryStore> =
-        Arc::new(SqliteStore::open(&format!("{data}/lore.db"))?.with_embedder(build_embedder()));
+    let mut sqlite = SqliteStore::open(&format!("{data}/lore.db"))?.with_embedder(build_embedder());
+    if let Some(r) = build_reranker() {
+        sqlite = sqlite.with_reranker(r);
+    }
+    let store: Arc<dyn MemoryStore> = Arc::new(sqlite);
     // Platform tools: every agent can use these in `act`.
     let mut reg = ToolRegistry::new();
     reg.register(Arc::new(CalcTool::new()));

@@ -980,6 +980,10 @@ impl Agent {
                     // golden set: MultiHop 2/4 → 4/4, zero regression.
                     // min_importance below still floors pulled neighbors.
                     .graph()
+                    // Rerank: native lexical pass is measured-neutral and
+                    // cheap; a store-attached neural cross-encoder
+                    // (LORE_RERANKER=neural) upgrades precision in place.
+                    .rerank()
                     .min_importance(CONTEXT_MIN_IMPORTANCE),
             )
             .await?;

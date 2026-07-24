@@ -372,6 +372,80 @@ async fn retrieval_golden_set_metrics() {
     );
 }
 
+/// Neural-stack eval: same golden set, `NeuralEmbedder` (multilingual-e5)
+/// first pass. The paraphrase category — 0/7 under `HashingEmbedder`, by
+/// construction — is the number this stack must move.
+/// `LORE_EVAL_NEURAL_RERANK=1` additionally attaches the cross-encoder
+/// (`NeuralReranker`, extra model download) and turns `.rerank()` on.
+/// Run: `cargo test --features neural --test eval -- --ignored --nocapture`
+#[cfg(feature = "neural")]
+#[tokio::test]
+#[ignore = "downloads/loads the e5 model (~100MB, cached after first run)"]
+async fn retrieval_golden_set_neural_embedder() {
+    let embedder = Arc::new(lore::NeuralEmbedder::new().expect("neural embedder init"));
+    let with_rerank = std::env::var("LORE_EVAL_NEURAL_RERANK").as_deref() == Ok("1");
+    let mut store = InMemoryStore::new().with_embedder(embedder);
+    if with_rerank {
+        store = store.with_reranker(Arc::new(
+            lore::NeuralReranker::new().expect("neural reranker init"),
+        ));
+    }
+    let store = store;
+    for text in CORPUS {
+        store
+            .remember(Memory::semantic(Scope::World, *text, SemanticCat::Fact))
+            .await
+            .unwrap();
+    }
+
+    let mut hits5 = 0usize;
+    let mut para_hits = 0usize;
+    let mut para_total = 0usize;
+    let mut misses: Vec<String> = Vec::new();
+    for (q, want, cat, note) in QUERIES {
+        let mut query = Query::new(*q).semantic().graph().limit(5);
+        if with_rerank {
+            query = query.rerank();
+        }
+        let res = store.recall(&Scope::World, &query).await.unwrap();
+        let found = res
+            .iter()
+            .any(|s| s.item.searchable_text().contains(CORPUS[*want]));
+        if *cat == Cat::Paraphrase {
+            para_total += 1;
+            if found {
+                para_hits += 1;
+            }
+        }
+        if found {
+            hits5 += 1;
+        } else {
+            misses.push(format!("'{q}' [{cat:?}] ({note})"));
+        }
+    }
+    let total = QUERIES.len();
+    eprintln!(
+        "[eval-neural] hit@5 = {hits5}/{total} ({:.0}%)  paraphrase = {para_hits}/{para_total}",
+        hits5 as f64 / total as f64 * 100.0
+    );
+    if !misses.is_empty() {
+        eprintln!("[eval-neural] missed:\n{}", misses.join("\n"));
+    }
+    // Floors from measured baselines (2026-07-24, see spec addendum):
+    //   e5 embedder + graph:              hit@5 29/32 (91%) · paraphrase 6/7
+    //   + cross-encoder rerank (env=1):   hit@5 32/32 (100%) · paraphrase 7/7
+    // Floors sit under the WEAKER (no-rerank) run so both modes pass;
+    // raise them only from new measurements.
+    assert!(
+        para_hits >= 5,
+        "neural paraphrase {para_hits}/{para_total} — below measured floor"
+    );
+    assert!(
+        hits5 as f64 / total as f64 >= 0.85,
+        "neural hit@5 below floor"
+    );
+}
+
 /// Keyword-only mode: basic matches should remain solid even with semantic off.
 #[tokio::test]
 async fn retrieval_keyword_only_baseline() {

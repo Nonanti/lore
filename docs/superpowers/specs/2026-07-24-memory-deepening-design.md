@@ -117,3 +117,39 @@ through a real agent recall).
 - Dashboard/visualization (sub-project C).
 - ColBERT (M3), RAPTOR-lite without evidence (M4).
 - Embedding-space migration tooling changes (`lore reembed` untouched).
+
+## 6. Addendum (2026-07-24): measured results
+
+Golden set: 56 records / 32 categorized queries (`tests/eval.rs`).
+
+| Stack | hit@5 | MRR@5 | Exact | Morph | Paraphrase | MultiHop | Distractor |
+|-------|-------|-------|-------|-------|------------|----------|------------|
+| Hashing baseline (pre-graph) | 72% | .682 | 7/7 | 8/8 | 0/7 | 2/4 | 6/6 |
+| + graph leg (Phase 2) | **78%** | .701 | 7/7 | 8/8 | 0/7 | **4/4** | 6/6 |
+| e5 embedder + graph (opt-in) | **91%** | — | ✓ | ✓ | **6/7** | 2/4¹ | ✓ |
+| + cross-encoder rerank (Phase 4) | **100%** | — | 7/7 | 8/8 | **7/7** | **4/4** | 6/6 |
+
+¹ e5's wider candidate pool reshuffles graph seeds — exactly the precision
+gap the cross-encoder closes.
+
+Phase notes:
+
+- **Phase 2 details**: acronym entities (2–4 char ALL-CAPS raw-text tokens:
+  NAS/TLS/8TB) restored bridges the ≥4-char entity floor dropped — this
+  single rule took MultiHop from 3/4 to 4/4. Agent context injection opts
+  into `.graph()`; `Query` default stays off for API stability.
+- **Phase 3 verdict (M2 applied)**: native-rerank feature work SKIPPED with
+  evidence — rerank-on vs rerank-off measured **identical** on the golden
+  set (all lexical categories already at hit@1); IDF/proximity features had
+  nothing to move. Revisit only if a future eval exposes lexical-precision
+  misses.
+- **Phase 4 details**: `NeuralReranker` (fastembed `TextRerank`, default
+  BGE-reranker-base, `with_model` escape hatch) behind the existing
+  `neural` feature; store-attached via `with_reranker`, selected by
+  `LORE_RERANKER=neural`; fail-open (rerank error keeps first-pass order).
+  Agent context queries turn `.rerank()` on — native pass is
+  measured-neutral and cheap; the cross-encoder upgrades it in place.
+- **Phase 5 verdict (M4 applied)**: RAPTOR-lite DEFERRED with evidence —
+  after Phases 2+4 the hardened set is fully solved (100%); no
+  abstraction/cluster miss pattern remains to justify it. Revisit when an
+  eval with long-horizon summarization queries shows the gap.

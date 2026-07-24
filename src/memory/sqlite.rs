@@ -31,6 +31,7 @@ const SCHEMA_VERSION: &str = "3";
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
     embedder: Option<Arc<dyn Embedder>>,
+    reranker: Option<Arc<dyn super::rerank::Reranker>>,
     /// File path (None for in-memory) — allows consolidation to open a separate connection.
     path: Option<String>,
 }
@@ -73,8 +74,17 @@ impl SqliteStore {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             embedder: None,
+            reranker: None,
             path,
         })
+    }
+
+    /// Attaches a reranker (builder): used when `Query.rerank` is set
+    /// (default: the native lexical reranker). Runs inside the blocking
+    /// pool — the right place for cross-encoder CPU work.
+    pub fn with_reranker(mut self, reranker: Arc<dyn super::rerank::Reranker>) -> Self {
+        self.reranker = Some(reranker);
+        self
     }
 
     /// Migrates the schema to the current version (idempotent; single transaction).
@@ -720,6 +730,7 @@ impl MemoryStore for SqliteStore {
     ///    pre-filter without JSON parse cost; only candidates are fully loaded.
     async fn recall(&self, scope: &Scope, query: &Query) -> Result<Vec<Scored<Memory>>> {
         let embedder = self.embedder.clone();
+        let reranker = self.reranker.clone();
         let scope = scope.clone();
         let query = query.clone();
         self.blocking(move |conn| {
@@ -847,7 +858,7 @@ impl MemoryStore for SqliteStore {
                 }
             }
 
-            Ok(retrieval::finalize(scored, &query))
+            Ok(retrieval::finalize(scored, &query, reranker.as_deref()))
         })
         .await
     }

@@ -25,6 +25,81 @@ impl Reranker for NativeReranker {
     }
 }
 
+/// Neural cross-encoder reranker (fastembed/ONNX; compiled only with the
+/// `neural` feature). Scores query×document PAIRS jointly — true relevance
+/// ordering the bi-encoder first pass cannot see. Downloads the model on
+/// first use (then cached). Default model: BGE reranker base;
+/// [`NeuralReranker::with_model`] selects others (e.g. the multilingual
+/// Jina v2 for Turkish-heavy corpora).
+#[cfg(feature = "neural")]
+pub struct NeuralReranker {
+    model: std::sync::Mutex<fastembed::TextRerank>,
+}
+
+#[cfg(feature = "neural")]
+impl NeuralReranker {
+    /// Initializes with the default model (BGE reranker base).
+    pub fn new() -> crate::error::Result<Self> {
+        Self::with_model(fastembed::RerankerModel::BGERerankerBase)
+    }
+
+    /// Initializes with a specific fastembed reranker model.
+    pub fn with_model(model: fastembed::RerankerModel) -> crate::error::Result<Self> {
+        use fastembed::{RerankInitOptions, TextRerank};
+        let m =
+            TextRerank::try_new(RerankInitOptions::new(model).with_show_download_progress(false))
+                .map_err(|e| crate::error::LoreError::Model(e.to_string()))?;
+        Ok(Self {
+            model: std::sync::Mutex::new(m),
+        })
+    }
+}
+
+#[cfg(feature = "neural")]
+impl Reranker for NeuralReranker {
+    fn rerank(&self, query: &str, items: Vec<Scored<Memory>>) -> Vec<Scored<Memory>> {
+        if items.is_empty() || query.trim().is_empty() {
+            return items;
+        }
+        let docs: Vec<String> = items.iter().map(|s| s.item.searchable_text()).collect();
+        let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
+        // Poison recovery mirrors NeuralEmbedder: a panicked past call must
+        // not brick the reranker.
+        let m = self.model.lock().unwrap_or_else(|e| e.into_inner());
+        let results = match m.rerank(query, doc_refs, false, None) {
+            Ok(r) => r,
+            Err(e) => {
+                // Fail open: first-pass order is a valid answer; losing the
+                // whole recall to a rerank hiccup is not.
+                tracing::warn!(error = %e, "neural rerank error (keeping first-pass order)");
+                return items;
+            }
+        };
+        // fastembed returns (index, score) sorted by score — rebuild in that
+        // order, annotate the signal, keep the cross-encoder score.
+        let mut out: Vec<Scored<Memory>> = Vec::with_capacity(items.len());
+        let mut taken: Vec<Option<Scored<Memory>>> = items.into_iter().map(Some).collect();
+        for r in results {
+            if let Some(slot) = taken.get_mut(r.index) {
+                if let Some(mut s) = slot.take() {
+                    s.score = r.score;
+                    s.signals.push(Signal {
+                        name: "neural_rerank".into(),
+                        value: r.score,
+                    });
+                    out.push(s);
+                }
+            }
+        }
+        // Defensive: anything the model did not score keeps its old position
+        // at the tail (should not happen, but records must never vanish).
+        for slot in taken.into_iter().flatten() {
+            out.push(slot);
+        }
+        out
+    }
+}
+
 struct CrossFeatures {
     coverage: f32,
     phrase: f32,

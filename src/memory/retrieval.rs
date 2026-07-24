@@ -461,15 +461,23 @@ fn score_impl(
 
 /// Finalizes the candidate list: sorts by score, diversifies with MMR if
 /// `query.diverse`, otherwise truncates to limit.
-pub fn finalize(mut scored: Vec<Scored<Memory>>, query: &Query) -> Vec<Scored<Memory>> {
+pub fn finalize(
+    mut scored: Vec<Scored<Memory>>,
+    query: &Query,
+    reranker: Option<&dyn super::rerank::Reranker>,
+) -> Vec<Scored<Memory>> {
     scored.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    // Second pass: native rerank (query×doc shared features).
+    // Second pass: rerank (store-attached reranker, else the native
+    // query×doc lexical features).
     if query.rerank && !query.text.trim().is_empty() {
-        scored = super::rerank::native_rerank(&query.text, scored);
+        scored = match reranker {
+            Some(r) => r.rerank(&query.text, scored),
+            None => super::rerank::native_rerank(&query.text, scored),
+        };
     }
     if query.diverse {
         mmr(scored, 0.7, query.limit)

@@ -117,6 +117,32 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
   thread types, both providers, and all three modes; 1 new live-LLM
   ignored smoke test.
 
+### Added — memory engine deepening (spec: `2026-07-24-memory-deepening-design.md`)
+
+- **Hardened retrieval eval** — the old 15-record golden set was saturated
+  (hit@5 100%, threshold marked PLACEHOLDER). New: 56 records with
+  surface-token distractors, entity-bridged clusters and a Turkish subset;
+  32 queries across 5 categories; hit@1/hit@5/MRR@5 + per-category rates
+  as regression floors (only ever raised). Honest baseline: 72% hit@5.
+- **Graph leg in the recall hot path** (`Query.graph`) — incremental
+  entity inverted index in both stores (SQLite: `entities` table, schema
+  v3 + backfill migration; InMemory: lock-order-safe map). Top-3 seeds
+  pull ≤16 one-hop entity neighbors at a damped score (0.5×, `graph`
+  signal, all filters honored). Acronym entities (2–4 char ALL-CAPS:
+  NAS/TLS/8TB) restore bridges the ≥4-char floor dropped. Agent context
+  injection opts in. **Measured: hit@5 72→78%, MultiHop 2/4→4/4, zero
+  regression.** `Scope::sees` is now the single visibility rule.
+- **Neural cross-encoder reranker** (`neural` feature) — `NeuralReranker`
+  (fastembed TextRerank, BGE default, `with_model` escape hatch) behind
+  the `Reranker` trait; store-attached (`with_reranker`), selected via
+  `LORE_RERANKER=neural`, fail-open on rerank errors. Agent context
+  queries turn `.rerank()` on (native pass measured-neutral; the
+  cross-encoder upgrades in place). **Measured with e5 embedder: hit@5
+  91% → 100%, paraphrase 0/7 → 7/7 vs offline baseline.**
+- **Evidence-based deferrals** — native-rerank feature tuning skipped
+  (rerank on/off measured identical); RAPTOR-lite deferred (hardened set
+  fully solved, no abstraction-miss pattern); ColBERT rejected (M3).
+
 ### Fixed — native tool calling review (independent review, findings verified)
 
 - **OpenAI `content: null` deserialization (critical)**: the real API

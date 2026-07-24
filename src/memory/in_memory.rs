@@ -25,6 +25,7 @@ pub struct InMemoryStore {
     /// `deleted_at`), so no removal bookkeeping is needed.
     entity_idx: RwLock<HashMap<String, std::collections::HashSet<String>>>,
     embedder: Option<Arc<dyn Embedder>>,
+    reranker: Option<Arc<dyn super::rerank::Reranker>>,
 }
 
 impl InMemoryStore {
@@ -36,6 +37,13 @@ impl InMemoryStore {
     /// Attaches an embedder (builder): embeds on remember, enables hybrid on recall.
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
         self.embedder = Some(embedder);
+        self
+    }
+
+    /// Attaches a reranker (builder): used when `Query.rerank` is set
+    /// (default: the native lexical reranker).
+    pub fn with_reranker(mut self, reranker: Arc<dyn super::rerank::Reranker>) -> Self {
+        self.reranker = Some(reranker);
         self
     }
 
@@ -98,6 +106,7 @@ impl InMemoryStore {
             inner: RwLock::new(map),
             entity_idx: RwLock::new(idx),
             embedder: None,
+            reranker: None,
         }
     }
 
@@ -263,7 +272,7 @@ impl MemoryStore for InMemoryStore {
             retrieval::append_graph_neighbors(&mut scored, neighbors, best_seed);
         }
 
-        Ok(retrieval::finalize(scored, query))
+        Ok(retrieval::finalize(scored, query, self.reranker.as_deref()))
     }
 
     async fn reinforce(&self, id: &MemoryId, outcome: Outcome) -> Result<()> {
@@ -355,6 +364,49 @@ mod tests {
         let a = AgentId::new();
         let s = Scope::Agent(a.clone());
         (a, s)
+    }
+
+    #[tokio::test]
+    async fn store_attached_reranker_overrides_native() {
+        struct Reverser;
+        impl crate::memory::Reranker for Reverser {
+            fn rerank(&self, _q: &str, mut items: Vec<Scored<Memory>>) -> Vec<Scored<Memory>> {
+                items.reverse();
+                items
+            }
+        }
+        let store = InMemoryStore::new().with_reranker(std::sync::Arc::new(Reverser));
+        let (_a, scope) = agent_scope();
+        store
+            .remember(Memory::semantic(
+                scope.clone(),
+                "rust ownership rules",
+                SemanticCat::Fact,
+            ))
+            .await
+            .unwrap();
+        store
+            .remember(Memory::semantic(
+                scope.clone(),
+                "rust borrow checker",
+                SemanticCat::Fact,
+            ))
+            .await
+            .unwrap();
+
+        let plain = store
+            .recall(&scope, &Query::new("rust").limit(5))
+            .await
+            .unwrap();
+        let reranked = store
+            .recall(&scope, &Query::new("rust").rerank().limit(5))
+            .await
+            .unwrap();
+        assert_eq!(plain.len(), 2);
+        assert_eq!(
+            plain[0].item.id, reranked[1].item.id,
+            "attached reranker (reverser) must be used instead of the native one"
+        );
     }
 
     #[tokio::test]

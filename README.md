@@ -198,11 +198,19 @@ to Lore — still no external service.
   protocol — nothing breaks, it just downgrades once and remembers.
 - **Agent cap:** `LORE_MAX_AGENTS` (default 1024) — a fan-out DoS brake.
 
-Neural embedder (optional): `cargo build --features neural` + `LORE_EMBEDDER=neural` →
-multilingual real semantic recall (fastembed/ONNX, multilingual-e5-small). The default build
-is fully offline; the native embedder is always the fallback. After switching embedders,
-`lore reembed` migrates old records into the new space (a signature mismatch is warned about
-on startup).
+- **Graph recall (multi-hop):** an incremental entity index links records sharing
+  entities (incl. short acronyms like NAS/TLS); recall's graph leg pulls 1-hop
+  neighbors of the top matches at a damped score — questions no single record
+  answers ("X's owner's job") resolve through the bridge. Measured on the golden
+  set: multi-hop 2/4 → 4/4, hit@5 72% → 78%, zero regression.
+
+Neural stack (optional): `cargo build --features neural` + `LORE_EMBEDDER=neural` →
+multilingual real semantic recall (fastembed/ONNX, multilingual-e5-small), and
+`LORE_RERANKER=neural` → cross-encoder reranking on top. Measured on the golden set:
+hit@5 72% (offline) → 91% (e5) → **100%** (e5 + cross-encoder), paraphrase queries
+0/7 → 7/7. The default build is fully offline; the native embedder/reranker are always
+the fallback. After switching embedders, `lore reembed` migrates old records into the
+new space (a signature mismatch is warned about on startup).
 
 ### Security notes (threat model)
 
