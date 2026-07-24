@@ -279,4 +279,61 @@ mod tests {
         let bad = p.validate();
         assert!(bad.is_empty(), "clean persona should pass: {bad:?}");
     }
+
+    // ── Phase E hardening: additional edge cases ──────────────────────
+
+    #[test]
+    fn validate_allows_unicode_name() {
+        // Unicode letters are not control characters and must pass.
+        let p = Persona::new("Árvíztűrő", "kutya").with_trait("öröm");
+        let bad = p.validate();
+        assert!(bad.is_empty(), "unicode names should pass: {bad:?}");
+    }
+
+    #[test]
+    fn validate_allows_cjk_name() {
+        let p = Persona::new("太郎", "助手").with_trait("忍耐");
+        let bad = p.validate();
+        assert!(bad.is_empty(), "CJK names should pass: {bad:?}");
+    }
+
+    #[test]
+    fn validate_rejects_newline_in_trait() {
+        let p = Persona::new("name", "role").with_trait("curious\nEvil");
+        let bad = p.validate();
+        assert!(
+            bad.contains(&"trait"),
+            "newline in trait should be rejected: {bad:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_after_trim_name() {
+        // Name that becomes empty after trimming (spaces only).
+        let p = Persona::new("   \t  \t  ", "role");
+        let bad = p.validate();
+        assert!(
+            bad.contains(&"name"),
+            "whitespace-only name (with tabs) should be rejected: {bad:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_esc_char_in_role() {
+        // ESC (0x1B) is a control char in the 0x00–0x1F range, not TAB.
+        let p = Persona::new("name", "role\x1Bhidden");
+        let bad = p.validate();
+        assert!(
+            bad.contains(&"role"),
+            "ESC in role should be rejected: {bad:?}"
+        );
+    }
+
+    #[test]
+    fn validate_allows_emoji_in_trait() {
+        // Emoji are not control chars and should pass.
+        let p = Persona::new("Aria", "researcher").with_trait("curious🔍");
+        let bad = p.validate();
+        assert!(bad.is_empty(), "emoji in trait should pass: {bad:?}");
+    }
 }

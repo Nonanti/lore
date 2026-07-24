@@ -721,6 +721,75 @@ async fn create_agent_rejects_blank_name_or_role() {
     assert_eq!(v.role, "role");
 }
 
+// ── Phase E hardening: persona sanitization edge cases (server-level) ──
+
+#[tokio::test]
+async fn create_agent_rejects_control_chars_via_persona_validate() {
+    let st = state();
+    // Newline in name → server should reject (422 path via LoreError::InvalidInput).
+    let err = st.create_agent("Aria\nEvil", "role", vec![]).await;
+    assert!(err.is_err(), "newline in name should be rejected at server level");
+    if let Err(LoreError::InvalidInput(msg)) = err {
+        assert!(msg.contains("name"), "error should mention name: {msg}");
+    }
+
+    // Control char in role → server should reject.
+    let err = st.create_agent("Aria", "role\x01", vec![]).await;
+    assert!(err.is_err(), "control char in role should be rejected");
+}
+
+#[tokio::test]
+async fn create_agent_accepts_unicode_names() {
+    let st = state();
+    // Unicode names with no control chars should be accepted.
+    let v = st.create_agent("Árvíztűrő", "kutya", vec![]).await.unwrap();
+    assert_eq!(v.name, "Árvíztűrő");
+    assert_eq!(v.role, "kutya");
+}
+
+#[tokio::test]
+async fn patch_agent_rejects_control_chars_via_persona_validate() {
+    let st = state();
+    let v = st.create_agent("Aria", "role", vec![]).await.unwrap();
+    let id = AgentId::from(v.id.clone());
+
+    // PATCH with newline in name → rejected before version bump.
+    let p = PersonaPatch {
+        name: Some("New\nEvil".into()),
+        ..Default::default()
+    };
+    let err = st.update_agent(&id, p).await;
+    assert!(err.is_err(), "newline in PATCH name should be rejected");
+    // Original persona must remain unchanged (no partial update).
+    let agent_map = st.inner.agents.read().await;
+    let agent = agent_map.get(&id).unwrap();
+    assert_eq!(agent.persona.name, "Aria", "name must not change on rejected patch");
+    assert_eq!(agent.persona.version, 1, "version must not bump on rejected patch");
+}
+
+#[tokio::test]
+async fn patch_agent_rejects_newline_in_trait() {
+    let st = state();
+    let v = st.create_agent("Aria", "role", vec![]).await.unwrap();
+    let id = AgentId::from(v.id.clone());
+
+    // PATCH traits with newline → rejected.
+    let p = PersonaPatch {
+        traits: Some(vec!["curious\nEvil".into()]),
+        ..Default::default()
+    };
+    let err = st.update_agent(&id, p).await;
+    assert!(err.is_err(), "newline in PATCH trait should be rejected");
+}
+
+#[tokio::test]
+async fn create_agent_rejects_empty_after_trim_name() {
+    let st = state();
+    // Name becomes empty after trimming.
+    let err = st.create_agent("  \t  ", "role", vec![]).await;
+    assert!(err.is_err(), "whitespace-only name (with tabs) should be rejected");
+}
+
 #[tokio::test]
 async fn session_table_has_hard_cap_with_lru_eviction() {
     // Hard cap: client-controlled unlimited `session` values cannot grow the table;

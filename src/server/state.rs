@@ -704,6 +704,9 @@ impl AppState {
             let agent = guard
                 .get_mut(id)
                 .ok_or_else(|| LoreError::NotFound(format!("agent {id}")))?;
+            // Build a speculative persona to validate BEFORE mutating the live agent.
+            // This prevents partial mutations leaking into the map on reject.
+            let mut speculative = agent.persona.clone();
             let mut changed = false;
             // Same contract as create: name/role cannot be emptied; values are
             // trimmed before writing (PATCH validation cannot be bypassed).
@@ -712,7 +715,7 @@ impl AppState {
                 if n.is_empty() {
                     return Err(LoreError::InvalidInput("name cannot be empty".into()));
                 }
-                agent.persona.name = n.to_string();
+                speculative.name = n.to_string();
                 changed = true;
             }
             if let Some(r) = patch.role {
@@ -720,28 +723,31 @@ impl AppState {
                 if r.is_empty() {
                     return Err(LoreError::InvalidInput("role cannot be empty".into()));
                 }
-                agent.persona.role = r.to_string();
+                speculative.role = r.to_string();
                 changed = true;
             }
             if let Some(d) = patch.description {
-                agent.persona.description = d;
+                speculative.description = d;
                 changed = true;
             }
             if let Some(t) = patch.traits {
-                agent.persona.traits = t;
+                speculative.traits = t;
                 changed = true;
             }
             if let Some(s) = patch.system_prompt {
-                agent.persona.system_prompt = s;
+                speculative.system_prompt = s;
                 changed = true;
             }
             if changed {
                 // Sanitize: reject control chars / newlines in structural fields.
-                let bad = agent.persona.validate();
+                // Validate the speculative persona — not the live one.
+                let bad = speculative.validate();
                 if !bad.is_empty() {
                     let msg = format!("invalid persona fields: {}", bad.join(", "));
                     return Err(LoreError::InvalidInput(msg));
                 }
+                // All checks passed; apply the speculative persona to the live agent.
+                agent.persona = speculative;
                 agent.persona.version += 1;
             }
             (agent.clone(), changed)
