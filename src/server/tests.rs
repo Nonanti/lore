@@ -10,6 +10,7 @@ use crate::memory::{InMemoryStore, MemoryStore};
 use crate::model::{MockModel, Model};
 use crate::tool::ToolContext;
 use axum::http::HeaderMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 fn state() -> AppState {
@@ -1677,4 +1678,356 @@ async fn task_log_reads_file() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 404);
+}
+
+// ── Phase D: Additional edge tests ──────────────────────────────────
+
+#[tokio::test]
+async fn task_enqueue_verify_empty_vs_omitted() {
+    // POST /tasks with verify omitted (default empty) vs verify: [] — both succeed.
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Omitted verify (no key in JSON).
+    let task1: serde_json::Value = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "bot1", "goal": "no verify"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let v1 = task1["verify"].as_array().unwrap();
+    assert!(v1.is_empty(), "omitted verify defaults to empty array");
+
+    // Explicit empty verify array.
+    let task2: serde_json::Value = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "bot2", "goal": "empty verify", "verify": []}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let v2 = task2["verify"].as_array().unwrap();
+    assert!(v2.is_empty(), "explicit empty verify array accepted");
+
+    // Verify with actual commands.
+    let task3: serde_json::Value = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "bot3", "goal": "with verify", "verify": ["cargo test", "clippy"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let v3 = task3["verify"].as_array().unwrap();
+    assert_eq!(v3.len(), 2, "verify commands stored");
+    assert_eq!(v3[0], "cargo test");
+}
+
+#[tokio::test]
+async fn task_list_limit_clamping() {
+    // GET /tasks?limit=N — values are clamped to [1, 1000];
+    // limit=0 → 1, limit=999999 → 1000.
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Enqueue 3 tasks.
+    for i in 0..3 {
+        client
+            .post(format!("{base}/tasks"))
+            .json(&serde_json::json!({"agent": "bot", "goal": format!("task {i}")}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // limit=0 → clamped to 1.
+    let list0: Vec<serde_json::Value> = client
+        .get(format!("{base}/tasks?limit=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list0.len(), 1, "limit=0 clamped to 1");
+
+    // Default (no limit param) → 20.
+    let list_default: Vec<serde_json::Value> = client
+        .get(format!("{base}/tasks"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        list_default.len(),
+        3,
+        "default limit=20, only 3 tasks exist"
+    );
+
+    // limit=2 → exact.
+    let list2: Vec<serde_json::Value> = client
+        .get(format!("{base}/tasks?limit=2"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list2.len(), 2, "limit=2 returns 2");
+
+    // limit=999999 → clamped to 1000 (returns all 3 since we have fewer).
+    let list_big: Vec<serde_json::Value> = client
+        .get(format!("{base}/tasks?limit=999999"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        list_big.len(),
+        3,
+        "limit=999999 clamped to 1000, returns all 3"
+    );
+}
+
+#[tokio::test]
+async fn approval_concurrent_approve_deny_race() {
+    // Two concurrent decisions on the same approval:
+    // one must succeed (204), the loser gets 409.
+    // This tests the Conflict mapping under realistic concurrency.
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Enqueue a task + add approval.
+    let task: serde_json::Value = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "racebot", "goal": "race test"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    let store = TaskStore::open(&db_path).unwrap();
+    let approval_id = store
+        .add_approval(&task_id, "{\"cmd\":\"rm\"}", "race reason")
+        .unwrap();
+
+    // Fire approve + deny concurrently — one wins, loser gets 409.
+    let (approve_resp, deny_resp) = tokio::join!(
+        client
+            .post(format!("{base}/approvals/{approval_id}/approve"))
+            .send(),
+        client
+            .post(format!("{base}/approvals/{approval_id}/deny"))
+            .send()
+    );
+    let a_status = approve_resp.unwrap().status().as_u16();
+    let d_status = deny_resp.unwrap().status().as_u16();
+
+    // Exactly one must be 204, the other 409.
+    let wins = (a_status == 204 && d_status == 409) || (a_status == 409 && d_status == 204);
+    assert!(
+        wins,
+        "one must win (204), the other gets 409: approve={a_status}, deny={d_status}"
+    );
+}
+
+#[tokio::test]
+async fn inbox_empty_state() {
+    // GET /inbox returns empty array when no pending approvals exist.
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    let inbox: Vec<serde_json::Value> = client
+        .get(format!("{base}/inbox"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(inbox.is_empty(), "inbox starts empty");
+}
+
+#[tokio::test]
+async fn task_get_with_children_shows_subtasks() {
+    // GET /tasks/:id for a parent task includes children;
+    // a standalone task omits the children field (skip_serializing_if).
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Create a parent task via TaskStore (with parent_id requires enqueue_child).
+    let store = TaskStore::open(&db_path).unwrap();
+    let parent = store
+        .enqueue(crate::task::NewTask {
+            agent: "pm".into(),
+            goal: "big feature".into(),
+            workspace: PathBuf::from("/tmp/ws"),
+            verify: vec![],
+            parent_id: None,
+        })
+        .unwrap();
+
+    // Add two children.
+    let c1 = store
+        .enqueue_child(
+            &parent.id,
+            crate::task::NewTask {
+                agent: "backend".into(),
+                goal: "impl API".into(),
+                workspace: PathBuf::from("/tmp/ws1"),
+                verify: vec!["cargo test".into()],
+                parent_id: None,
+            },
+        )
+        .unwrap();
+    let c2 = store
+        .enqueue_child(
+            &parent.id,
+            crate::task::NewTask {
+                agent: "frontend".into(),
+                goal: "build UI".into(),
+                workspace: PathBuf::from("/tmp/ws2"),
+                verify: vec![],
+                parent_id: None,
+            },
+        )
+        .unwrap();
+
+    // GET parent: should have children array with 2 entries.
+    let full: serde_json::Value = client
+        .get(format!("{base}/tasks/{parent_id}", parent_id = parent.id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(full["task"]["id"], parent.id, "parent task id matches");
+    let children = full["children"]
+        .as_array()
+        .expect("children field present for parent");
+    assert_eq!(children.len(), 2, "parent has 2 children");
+    assert_eq!(children[0]["id"], c1.id);
+    assert_eq!(children[1]["id"], c2.id);
+
+    // GET standalone child (no children of its own) → children field absent.
+    let child_full: serde_json::Value = client
+        .get(format!("{base}/tasks/{cid}", cid = c1.id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        child_full.get("children").is_none()
+            || child_full["children"].as_array().unwrap().is_empty(),
+        "standalone task has no children field"
+    );
+}
+
+#[tokio::test]
+async fn task_log_tail_larger_than_file_returns_full() {
+    // tail=100 on a 5-line file returns the entire content.
+    let td = TaskSrvDir::new();
+    let db_path = td.0.join("tasks.db");
+    let st = task_state().with_task_store(td.0.clone(), db_path.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // Enqueue a task.
+    let task: serde_json::Value = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({"agent": "logbot", "goal": "tail edge"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let task_id = task["id"].as_str().unwrap().to_string();
+
+    // Write a 3-line log.
+    let log_path = td.0.join("logs").join(format!("{task_id}.log"));
+    std::fs::write(&log_path, "a\nb\nc").unwrap();
+
+    // tail=100 (more than file lines) → returns full content.
+    let content = client
+        .get(format!("{base}/tasks/{task_id}/log?tail=100"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        content.contains("a") && content.contains("c"),
+        "tail larger than file returns full: {content}"
+    );
+
+    // tail=1 → last line only.
+    let tail1 = client
+        .get(format!("{base}/tasks/{task_id}/log?tail=1"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        tail1.contains("c") && !tail1.contains("a"),
+        "tail=1 returns last line: {tail1}"
+    );
 }
