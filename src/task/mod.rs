@@ -216,6 +216,10 @@ impl TaskStore {
     /// Migration via `user_version` pragma.
     /// v0→v1: initial schema (CREATE IF NOT EXISTS).
     /// v1→v2: adds `parent_id TEXT` column for team task hierarchy.
+    ///
+    /// The v1→v2 step is wrapped in a single transaction (including the
+    /// `user_version` bump) so a crash mid-migration cannot leave the DB
+    /// with the column added but the version still at 1 (M8 fix).
     fn migrate(conn: &Connection) -> Result<()> {
         let ver: u32 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -226,6 +230,7 @@ impl TaskStore {
         }
 
         // v1→v2: add parent_id column (additive, idempotent via column-existence check).
+        // Wrapped in a transaction so the schema change and version bump are atomic.
         if ver < 2 {
             let has_parent_id: bool = conn
                 .query_row(
@@ -235,18 +240,25 @@ impl TaskStore {
                 )
                 .map_err(sqlite_err)?
                 > 0;
+
+            // Use execute_batch for the transaction: BEGIN + ALTER + INDEX + PRAGMA + COMMIT.
+            // PRAGMA user_version inside the transaction ensures atomicity.
             if !has_parent_id {
-                conn.execute_batch(
-                    "ALTER TABLE tasks ADD COLUMN parent_id TEXT;
-                     CREATE INDEX IF NOT EXISTS idx_task_parent ON tasks(parent_id);",
-                )
+                conn.execute_batch(&format!(
+                    "BEGIN;
+                     ALTER TABLE tasks ADD COLUMN parent_id TEXT;
+                     CREATE INDEX IF NOT EXISTS idx_task_parent ON tasks(parent_id);
+                     PRAGMA user_version = {SCHEMA_VERSION};
+                     COMMIT;"
+                ))
                 .map_err(sqlite_err)?;
                 tracing::info!(step = "v1→v2", "added parent_id column to tasks");
+            } else {
+                // Column already exists (prior partial migration) — just bump version.
+                conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
+                    .map_err(sqlite_err)?;
             }
         }
-
-        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
-            .map_err(sqlite_err)?;
 
         tracing::info!(version = SCHEMA_VERSION, "task store schema initialized");
         Ok(())
@@ -343,6 +355,21 @@ impl TaskStore {
             return Err(LoreError::NotFound(format!("task {id}")));
         }
         Ok(())
+    }
+
+    /// CAS: Set task status only if the current status matches `guard`.
+    /// Returns `Ok(true)` if the row was updated, `Ok(false)` if the
+    /// guard did not match (task already transitioned).
+    pub fn set_status_if(&self, id: &str, status: TaskStatus, guard: TaskStatus) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3 AND status = ?4",
+                params![status.as_str(), now, id, guard.as_str()],
+            )
+            .map_err(sqlite_err)?;
+        Ok(changed > 0)
     }
 
     /// Mark task Completed with a WorkReport JSON.
@@ -715,13 +742,18 @@ impl TaskStore {
         let report: Option<String> = r.get(8)?;
         let parent_id: Option<String> = r.get(9)?;
 
+        // M6: propagate unknown status instead of silently falling back.
+        let status = TaskStatus::from_str(&status_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
         Ok(Task {
             id,
             agent,
             goal,
             workspace: PathBuf::from(workspace),
             verify: serde_json::from_str(&verify_json).unwrap_or_default(),
-            status: TaskStatus::from_str(&status_str).unwrap_or(TaskStatus::Queued),
+            status,
             created_at: DateTime::parse_from_rfc3339(&created_at_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_default(),
@@ -742,12 +774,17 @@ impl TaskStore {
         let created_at_str: String = r.get(5)?;
         let decided_at: Option<String> = r.get(6)?;
 
+        // M6: propagate unknown approval status instead of silently falling back.
+        let status = ApprovalStatus::from_str(&status_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
         Ok(ApprovalEntry {
             id,
             task_id,
             action,
             reason,
-            status: ApprovalStatus::from_str(&status_str).unwrap_or(ApprovalStatus::Pending),
+            status,
             created_at: DateTime::parse_from_rfc3339(&created_at_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_default(),
@@ -1738,5 +1775,169 @@ mod tests {
             .enqueue_child_if_agent_absent(&parent.id, new_task("frontend", "build UI"))
             .unwrap();
         assert!(other.is_some(), "different agent still succeeds");
+    }
+
+    // ── set_status_if (CAS for shutdown) ──────────────────────────────
+
+    #[test]
+    fn set_status_if_guard_matches() {
+        let store = TaskStore::in_memory().unwrap();
+        let t = store.enqueue(new_task("a", "goal")).unwrap();
+        store.set_status(&t.id, TaskStatus::Running).unwrap();
+
+        let ok = store
+            .set_status_if(&t.id, TaskStatus::Queued, TaskStatus::Running)
+            .unwrap();
+        assert!(ok, "CAS should succeed when guard matches");
+
+        let loaded = store.get(&t.id).unwrap().unwrap();
+        assert_eq!(loaded.status, TaskStatus::Queued);
+    }
+
+    #[test]
+    fn set_status_if_guard_mismatch() {
+        let store = TaskStore::in_memory().unwrap();
+        let t = store.enqueue(new_task("a", "goal")).unwrap();
+        store.set_status(&t.id, TaskStatus::Running).unwrap();
+
+        // Guard is Queued but status is Running → should fail.
+        let ok = store
+            .set_status_if(&t.id, TaskStatus::Queued, TaskStatus::Queued)
+            .unwrap();
+        assert!(!ok, "CAS should fail when guard does not match");
+
+        // Status unchanged.
+        let loaded = store.get(&t.id).unwrap().unwrap();
+        assert_eq!(loaded.status, TaskStatus::Running);
+    }
+
+    // ── M6: unknown status propagates error ────────────────────────────
+
+    #[test]
+    fn unknown_task_status_propagates_error() {
+        let store = TaskStore::in_memory().unwrap();
+        // Insert a row with an invalid status directly.
+        let now = chrono::Utc::now().to_rfc3339();
+        let verify_json = serde_json::to_string(&vec!["echo ok"]).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO tasks (id, agent, goal, workspace, verify, status, created_at, updated_at)
+                 VALUES ('bad_status_1', 'a', 'goal', '/tmp', ?1, 'BogusStatus', ?2, ?3)",
+                rusqlite::params![verify_json, now, now],
+            )
+            .unwrap();
+
+        let result = store.get("bad_status_1");
+        assert!(
+            result.is_err(),
+            "unknown status should propagate as error, not silently default"
+        );
+    }
+
+    #[test]
+    fn unknown_approval_status_propagates_error() {
+        let store = TaskStore::in_memory().unwrap();
+        let t = store.enqueue(new_task("a", "goal")).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .conn
+            .execute(
+                "INSERT INTO approvals (id, task_id, action, reason, status, created_at)
+                 VALUES ('bad_appr_1', ?1, '{}', 'test', 'BogusApproval', ?2)",
+                rusqlite::params![t.id, now],
+            )
+            .unwrap();
+
+        let _result = store.pending_approvals();
+        // The bogus row has status != 'Pending' so it won't appear in pending_approvals.
+        // Instead, test via a direct query that loads all approvals.
+        let result = store.conn.query_row(
+            "SELECT id, task_id, action, reason, status, created_at, decided_at FROM approvals WHERE id = 'bad_appr_1'",
+            [],
+            |r| store.read_approval_row(r),
+        );
+        assert!(
+            result.is_err(),
+            "unknown approval status should propagate as error"
+        );
+    }
+
+    // ── M8: atomic migration v1→v2 with user_version in transaction ──
+
+    #[test]
+    fn migration_v1_to_v2_atomic_includes_user_version() {
+        let db = TmpDb::new();
+
+        // Create a v1 schema DB.
+        {
+            let conn = Connection::open(db.path()).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS tasks (
+                    id          TEXT PRIMARY KEY,
+                    agent       TEXT NOT NULL,
+                    goal        TEXT NOT NULL,
+                    workspace   TEXT NOT NULL,
+                    verify      TEXT NOT NULL,
+                    status      TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL,
+                    report      TEXT
+                );
+                CREATE TABLE IF NOT EXISTS approvals (
+                    id          TEXT PRIMARY KEY,
+                    task_id     TEXT NOT NULL,
+                    action      TEXT NOT NULL,
+                    reason      TEXT NOT NULL,
+                    status      TEXT NOT NULL,
+                    created_at  TEXT NOT NULL,
+                    decided_at  TEXT
+                );
+                PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+
+        // Open with TaskStore → triggers atomic v1→v2 migration.
+        let store = TaskStore::open(db.path()).unwrap();
+
+        // Verify user_version is now 2.
+        let ver: u32 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 2, "user_version should be 2 after migration");
+
+        // Verify parent_id column exists.
+        let has_parent_id: bool = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'parent_id'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0;
+        assert!(
+            has_parent_id,
+            "parent_id column should exist after migration"
+        );
+
+        // Verify idx_task_parent index exists.
+        let has_index: bool = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_task_parent'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0;
+        assert!(
+            has_index,
+            "idx_task_parent index should exist after migration"
+        );
     }
 }

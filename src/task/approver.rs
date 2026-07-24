@@ -59,19 +59,18 @@ impl Approver for QueueApprover {
         let task_id = self.task_id.clone();
         let poll_interval = self.poll_interval;
 
+        // Open a single connection for the entire decide flow (minor:
+        // avoids re-opening per poll tick).
+        let store = self.open_store()?;
+
         // Phase 1: insert approval entry + mark task WaitingApproval.
-        let approval_id = {
-            let store = self.open_store()?;
-            let id = store.add_approval(&task_id, &action_json, &reason)?;
-            store.set_status(&task_id, crate::task::TaskStatus::WaitingApproval)?;
-            id
-        };
+        let approval_id = store.add_approval(&task_id, &action_json, &reason)?;
+        store.set_status(&task_id, crate::task::TaskStatus::WaitingApproval)?;
 
         // Phase 2: poll until a decision is written (by CLI or another process).
         loop {
             tokio::time::sleep(poll_interval).await;
 
-            let store = self.open_store()?;
             let status = store
                 .approval_status(&approval_id)?
                 .ok_or_else(|| LoreError::NotFound(format!("approval {approval_id}")))?;

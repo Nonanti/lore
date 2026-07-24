@@ -10,6 +10,7 @@
 //! being run directly. After each child completes/fails, `maybe_complete_parent`
 //! checks whether the parent can transition to Completed or Failed.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,6 +33,20 @@ use crate::tool::{
 
 /// Idle sleep between next_queued polls (seconds).
 const IDLE_POLL_SECS: u64 = 2;
+
+/// Sanitize control characters in a string for safe logging.
+/// Replaces chars where `is_control()` is true (except common whitespace) with `?`.
+fn sanitize_for_log(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() && c != ' ' && c != '\t' {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
 
 /// Simple per-task log appender. Writes lines to `<data>/logs/<task_id>.log`.
 /// Not behind a new logging dependency — plain `std::fs::OpenOptions`.
@@ -81,13 +96,18 @@ pub async fn run_task(store: &TaskStore, task_id: &str, deps: &TaskDeps) -> Resu
 
     let mut log = TaskLog::open(&deps.data_dir, task_id)?;
 
+    // Sanitize agent/goal for log output to prevent control-char injection.
+    let safe_agent = sanitize_for_log(&task.agent);
+    let safe_goal = sanitize_for_log(&task.goal);
+
     log.write_line(&format!(
         "[daemon] task {} started — agent: {}, goal: {}",
-        task.id, task.agent, task.goal
+        task.id, safe_agent, safe_goal
     ));
 
-    // Build per-task model: agent record's ModelConfig if present, else env fallback.
-    let model = build_per_task_model(&deps.data_dir, &task.agent, &deps.model)?;
+    // Use deps.model directly — worker_loop resolves per-agent models
+    // via the model cache (M9). Direct callers (tests) set deps.model.
+    let model = deps.model.clone();
 
     // Load agent persona from <data>/agents/<name>.json.
     let persona_path = deps
@@ -324,6 +344,10 @@ impl InFlightRegistry {
 
 /// Single worker loop: claim → run → repeat. Each worker owns its own
 /// `TaskStore` connection (WAL permits concurrent access).
+///
+/// Per-worker model cache: agent name → resolved model. Avoids repeated
+/// file I/O and model construction across tasks. Config changes require
+/// a daemon restart to take effect (M9).
 async fn worker_loop(
     worker_id: usize,
     data_dir: PathBuf,
@@ -333,11 +357,9 @@ async fn worker_loop(
     in_flight: Arc<InFlightRegistry>,
 ) -> Result<()> {
     let store = TaskStore::open(&db_path)?;
-    let deps = TaskDeps {
-        data_dir,
-        model,
-        db_path,
-    };
+    // M9: per-worker model cache — avoids re-reading persona files and
+    // re-constructing models for agents seen more than once.
+    let mut model_cache: HashMap<String, Arc<dyn Model>> = HashMap::new();
 
     tracing::info!(worker_id, "worker started");
 
@@ -363,7 +385,10 @@ async fn worker_loop(
         }
 
         let task = task.expect("checked above");
-        tracing::info!(worker_id, task_id = %task.id, agent = %task.agent, "claimed task");
+        // Sanitize agent/goal for tracing to prevent control-char injection.
+        let safe_agent = sanitize_for_log(&task.agent);
+        let safe_goal = sanitize_for_log(&task.goal);
+        tracing::info!(worker_id, task_id = %task.id, agent = %safe_agent, goal = %safe_goal, "claimed task");
 
         // Register in-flight + same-workspace check.
         if let Some(existing_id) = in_flight.add(&task.id, task.workspace.clone()) {
@@ -376,34 +401,59 @@ async fn worker_loop(
             );
         }
 
+        // Resolve per-task model via cache (M9).
+        let task_model = if let Some(m) = model_cache.get(&task.agent) {
+            m.clone()
+        } else {
+            let m = build_per_task_model(&data_dir, &task.agent, &model)?;
+            model_cache.insert(task.agent.clone(), m.clone());
+            m
+        };
+        let deps = TaskDeps {
+            data_dir: data_dir.clone(),
+            model: task_model,
+            db_path: db_path.clone(),
+        };
+
+        // Stash parent_id before task execution (minor: avoids a DB get later).
+        let parent_id = task.parent_id.clone();
+
         // Team task: PM agent decomposes goal into subtasks.
         let is_team = task.agent == "pm";
         if is_team {
             let result = tokio::select! {
                 r = decompose_team_task(&store, &task.id, &deps) => r,
                 _ = shutdown_rx.changed() => {
-                    tracing::warn!(worker_id, task_id = %task.id, "shutdown mid-run (team) — re-queuing");
-                    store.set_status(&task.id, TaskStatus::Queued)?;
-                    store.deny_pending_approvals_for_task(&task.id)?;
+                    // M4: CAS shutdown — only re-queue if still Running.
                     in_flight.remove(&task.id);
+                    if store.set_status_if(&task.id, TaskStatus::Queued, TaskStatus::Running)? {
+                        tracing::warn!(worker_id, task_id = %task.id, "shutdown mid-run (team) — re-queued");
+                        store.deny_pending_approvals_for_task(&task.id)?;
+                    } else {
+                        tracing::info!(worker_id, task_id = %task.id, "shutdown mid-run (team) — task already terminal, skip re-queue");
+                    }
                     return Ok(());
                 }
             };
             if let Err(e) = &result {
                 tracing::error!(worker_id, task_id = %task.id, error = %e, "PM decomposition failed");
             }
-            // Remove from in-flight registry (M-1 fix: was missing on
-            // normal completion path — only removed on shutdown).
+            // Remove from in-flight registry.
             in_flight.remove(&task.id);
         } else {
             // Regular task.
             let result = tokio::select! {
                 r = run_task(&store, &task.id, &deps) => r,
                 _ = shutdown_rx.changed() => {
-                    tracing::warn!(worker_id, task_id = %task.id, "shutdown mid-run — re-queuing");
-                    store.set_status(&task.id, TaskStatus::Queued)?;
-                    store.deny_pending_approvals_for_task(&task.id)?;
+                    // Minor: in_flight.remove always runs (before any ? returns).
                     in_flight.remove(&task.id);
+                    // M4: CAS shutdown — only re-queue if still Running.
+                    if store.set_status_if(&task.id, TaskStatus::Queued, TaskStatus::Running)? {
+                        tracing::warn!(worker_id, task_id = %task.id, "shutdown mid-run — re-queued");
+                        store.deny_pending_approvals_for_task(&task.id)?;
+                    } else {
+                        tracing::info!(worker_id, task_id = %task.id, "shutdown mid-run — task already terminal, skip re-queue");
+                    }
                     return Ok(());
                 }
             };
@@ -441,8 +491,9 @@ async fn worker_loop(
         }
 
         // After any task completion/failure, check parent.
+        // Minor: pass parent_id directly to skip a wasted DB get.
         // Log errors rather than silently discarding them (Mi-2 fix).
-        match maybe_complete_parent(&store, &task.id, &deps).await {
+        match maybe_complete_parent(&store, &task.id, parent_id.as_deref(), &deps).await {
             Ok(completed) => {
                 if completed {
                     tracing::info!(worker_id, child_task_id = %task.id, "parent task finalized");
@@ -650,21 +701,21 @@ pub async fn decompose_team_task(store: &TaskStore, task_id: &str, deps: &TaskDe
 
 /// After a child task completes/fails, check if the parent can transition.
 /// Returns true if the parent was finalized (Completed or Failed).
+///
+/// `parent_id` is passed directly to skip a redundant `get` call for
+/// standalone tasks (minor: caller already knows the parent_id).
 pub async fn maybe_complete_parent(
     store: &TaskStore,
-    child_task_id: &str,
+    _child_task_id: &str,
+    parent_id: Option<&str>,
     deps: &TaskDeps,
 ) -> Result<bool> {
-    let child = store
-        .get(child_task_id)?
-        .ok_or_else(|| LoreError::NotFound(format!("task {child_task_id}")))?;
-
-    let parent_id = match child.parent_id {
+    let parent_id = match parent_id {
         Some(pid) => pid,
         None => return Ok(false), // No parent — standalone task.
     };
 
-    finalize_parent_if_ready(store, &parent_id, deps).await
+    finalize_parent_if_ready(store, parent_id, deps).await
 }
 
 /// Check if a `WaitingSubtasks` parent can be finalized (Completed or Failed).
@@ -769,11 +820,18 @@ async fn finalize_parent_if_ready(
             );
             return Ok(false); // Parent still waiting (for the review child).
         }
-        // Reviewer child already exists (another worker enqueued it) →
-        // fall through to synthesis.
+        // M3: Reviewer child already exists (another worker enqueued it).
+        // Re-check whether all children (including the reviewer) are done.
+        // If the reviewer is still Queued/Running, we must keep waiting.
+        if !store.all_children_done(parent_id)? {
+            return Ok(false); // Reviewer not yet terminal — keep waiting.
+        }
     }
 
     // All children done + review done (or no reviewer) → PM synthesis.
+    // Minor: reuse the children list we already fetched (refresh to get
+    // reviewer child status if it was just completed).
+    let children = store.children_of(parent_id)?;
     let pm_model = build_per_task_model(&deps.data_dir, "pm", &deps.model)?;
     let children_reports = collect_child_reports(store, parent_id)?;
     let synth_text = synthesis_prompt(&children_reports);
@@ -1247,7 +1305,9 @@ mod tests {
             db_path: db.path().to_path_buf(),
         };
 
-        let completed = maybe_complete_parent(&store, &c2.id, &deps).await.unwrap();
+        let completed = maybe_complete_parent(&store, &c2.id, Some(&parent.id), &deps)
+            .await
+            .unwrap();
         assert!(completed, "parent should be finalized");
 
         let parent_loaded = store.get(&parent.id).unwrap().unwrap();
@@ -1316,7 +1376,9 @@ mod tests {
         };
 
         // First call: review child enqueued, parent stays WaitingSubtasks.
-        let completed = maybe_complete_parent(&store, &c1.id, &deps).await.unwrap();
+        let completed = maybe_complete_parent(&store, &c1.id, Some(&parent.id), &deps)
+            .await
+            .unwrap();
         assert!(
             !completed,
             "parent not finalized yet — review child enqueued"
@@ -1327,7 +1389,9 @@ mod tests {
         assert_eq!(review_children, 1, "exactly one review child enqueued");
 
         // Second call: review already enqueued — does NOT create another.
-        let completed2 = maybe_complete_parent(&store, &c1.id, &deps).await.unwrap();
+        let completed2 = maybe_complete_parent(&store, &c1.id, Some(&parent.id), &deps)
+            .await
+            .unwrap();
         assert!(
             !completed2,
             "parent not finalized — review still in progress"
@@ -1359,9 +1423,10 @@ mod tests {
             db_path: db.path().to_path_buf(),
         };
 
-        let completed3 = maybe_complete_parent(&store, &review_child.id, &synth_deps)
-            .await
-            .unwrap();
+        let completed3 =
+            maybe_complete_parent(&store, &review_child.id, Some(&parent.id), &synth_deps)
+                .await
+                .unwrap();
         assert!(completed3, "parent finalized after review");
 
         let parent_loaded = store.get(&parent.id).unwrap().unwrap();
@@ -1436,7 +1501,9 @@ mod tests {
             db_path: db.path().to_path_buf(),
         };
 
-        let completed = maybe_complete_parent(&store, &c2.id, &deps).await.unwrap();
+        let completed = maybe_complete_parent(&store, &c2.id, Some(&parent.id), &deps)
+            .await
+            .unwrap();
         assert!(completed, "parent should be Failed");
 
         let parent_loaded = store.get(&parent.id).unwrap().unwrap();
@@ -1502,7 +1569,9 @@ mod tests {
             db_path: db.path().to_path_buf(),
         };
 
-        let completed = maybe_complete_parent(&store, &c1.id, &deps).await.unwrap();
+        let completed = maybe_complete_parent(&store, &c1.id, Some(&parent.id), &deps)
+            .await
+            .unwrap();
         assert!(completed, "parent should finalize after child completes");
 
         let parent_loaded = store.get(&parent.id).unwrap().unwrap();
@@ -1576,7 +1645,9 @@ mod tests {
         };
 
         // First maybe_complete_parent: reviewer exists → review child enqueued.
-        let completed1 = maybe_complete_parent(&store, &c1.id, &deps).await.unwrap();
+        let completed1 = maybe_complete_parent(&store, &c1.id, Some(&parent.id), &deps)
+            .await
+            .unwrap();
         assert!(
             !completed1,
             "review child enqueued, parent stays WaitingSubtasks"
@@ -1608,9 +1679,10 @@ mod tests {
             db_path: db.path().to_path_buf(),
         };
 
-        let completed2 = maybe_complete_parent(&store, &review_child.id, &synth_deps)
-            .await
-            .unwrap();
+        let completed2 =
+            maybe_complete_parent(&store, &review_child.id, Some(&parent.id), &synth_deps)
+                .await
+                .unwrap();
         assert!(
             completed2,
             "parent should complete even though review child failed"
@@ -1774,7 +1846,9 @@ mod tests {
             db_path: db.path().to_path_buf(),
         };
 
-        let completed = maybe_complete_parent(&store, &c1.id, &deps).await.unwrap();
+        let completed = maybe_complete_parent(&store, &c1.id, Some(&parent.id), &deps)
+            .await
+            .unwrap();
         assert!(
             completed,
             "parent should be finalized even on synthesis error"
@@ -2529,5 +2603,124 @@ mod tests {
         }
 
         cleanup(&workspace);
+    }
+
+    // ── M3: reviewer race — reviewer exists but Queued → parent NOT finalized ──
+
+    #[tokio::test]
+    async fn reviewer_race_queued_reviewer_keeps_parent_waiting() {
+        let store = TaskStore::in_memory().unwrap();
+        let db = TmpDb::new("m3-reviewer-race");
+
+        // Create reviewer persona.
+        let agents_dir = db.data_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        let persona = Persona::new("reviewer", "code reviewer");
+        let mem_store: Arc<dyn crate::memory::MemoryStore> = Arc::new(InMemoryStore::new());
+        let agent = Agent::new(persona, mem_store, Arc::new(MockModel::new()));
+        agent.save_to(agents_dir.join("reviewer.json")).unwrap();
+        save_persona(db.data_dir(), "pm");
+
+        let parent = store
+            .enqueue(NewTask {
+                agent: "pm".to_string(),
+                goal: "build app".to_string(),
+                workspace: PathBuf::from("/tmp"),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+        store
+            .set_status(&parent.id, TaskStatus::WaitingSubtasks)
+            .unwrap();
+
+        // Worker child: completed.
+        let c1 = store
+            .enqueue_child(
+                &parent.id,
+                NewTask {
+                    agent: "backend".to_string(),
+                    goal: "impl API".to_string(),
+                    workspace: PathBuf::from("/tmp"),
+                    verify: vec![],
+                    parent_id: None,
+                },
+            )
+            .unwrap();
+        store
+            .complete(
+                &c1.id,
+                &serde_json::to_string(&serde_json::json!({"success":true,"answer":"done"}))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let model = Arc::new(MockModel::new());
+        let deps = TaskDeps {
+            data_dir: db.data_dir().to_path_buf(),
+            model: model.clone(),
+            db_path: db.path().to_path_buf(),
+        };
+
+        // First call: review child enqueued.
+        let completed = maybe_complete_parent(&store, &c1.id, Some(&parent.id), &deps)
+            .await
+            .unwrap();
+        assert!(!completed, "review child enqueued, parent stays waiting");
+
+        // Verify reviewer child is Queued (not yet terminal).
+        let children = store.children_of(&parent.id).unwrap();
+        let reviewer = children.iter().find(|c| c.agent == "reviewer").unwrap();
+        assert_eq!(reviewer.status, TaskStatus::Queued);
+
+        // Second call: reviewer exists but still Queued.
+        // M3 fix: parent should NOT be finalized (no premature synthesis).
+        let completed2 = maybe_complete_parent(&store, &c1.id, Some(&parent.id), &deps)
+            .await
+            .unwrap();
+        assert!(
+            !completed2,
+            "M3: reviewer still Queued — parent must NOT be finalized"
+        );
+
+        let parent_loaded = store.get(&parent.id).unwrap().unwrap();
+        assert_eq!(
+            parent_loaded.status,
+            TaskStatus::WaitingSubtasks,
+            "parent still waiting for reviewer"
+        );
+    }
+
+    // ── M4: shutdown CAS — set_status_if guard/mismatch ─────────────
+
+    #[test]
+    fn set_status_if_guard_match_and_mismatch() {
+        let store = TaskStore::in_memory().unwrap();
+        let t = store
+            .enqueue(NewTask {
+                agent: "a".to_string(),
+                goal: "goal".to_string(),
+                workspace: PathBuf::from("/tmp"),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+        store.set_status(&t.id, TaskStatus::Running).unwrap();
+
+        // Guard matches: Running → Queued.
+        let ok = store
+            .set_status_if(&t.id, TaskStatus::Queued, TaskStatus::Running)
+            .unwrap();
+        assert!(ok, "CAS should succeed when guard matches");
+        let loaded = store.get(&t.id).unwrap().unwrap();
+        assert_eq!(loaded.status, TaskStatus::Queued);
+
+        // Guard mismatch: guard=Running but status=Queued.
+        let ok = store
+            .set_status_if(&t.id, TaskStatus::Failed, TaskStatus::Running)
+            .unwrap();
+        assert!(!ok, "CAS should fail when guard mismatches");
+        let loaded = store.get(&t.id).unwrap().unwrap();
+        assert_eq!(loaded.status, TaskStatus::Queued, "status unchanged");
     }
 }
