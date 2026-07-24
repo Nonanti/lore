@@ -18,7 +18,7 @@ use crate::id::AgentId;
 use axum::{
     extract::ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
     extract::{DefaultBodyLimit, MatchedPath, Path, Query as AxQuery, Request, State},
-    http::{HeaderValue, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::sse::{Event, Sse},
     response::{IntoResponse, Response},
@@ -82,6 +82,10 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/ready", get(ready_h))
         .route("/openapi.json", get(openapi_h))
+        // Dashboard shell: static, embedded, secret-free — public like
+        // /health. Every DATA call it makes goes through the protected
+        // routes above with the user-supplied Bearer key (spec U2).
+        .route("/ui", get(ui_h))
         .merge(protected)
         .layer(middleware::from_fn_with_state(state.clone(), request_mw))
         .with_state(state)
@@ -203,6 +207,16 @@ async fn request_mw(State(st): State<AppState>, req: Request, next: Next) -> Res
 }
 
 // --- Handlers (thin wrappers) ---
+
+/// Embedded dashboard (single self-contained HTML file, zero external
+/// assets — the "everything lives inside the binary" rule applies to the
+/// UI too). Static + secret-free, hence outside the auth wall.
+async fn ui_h() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("assets/dashboard.html"),
+    )
+}
 
 async fn health() -> &'static str {
     "ok"

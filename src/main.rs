@@ -296,7 +296,7 @@ fn build_reranker() -> Option<Arc<dyn lore::Reranker>> {
     if std::env::var("LORE_RERANKER").as_deref() == Ok("neural") {
         match lore::NeuralReranker::new() {
             Ok(r) => {
-                println!("🧠 Neural reranker active (cross-encoder)");
+                println!("Neural reranker active (cross-encoder)");
                 return Some(Arc::new(r));
             }
             Err(e) => {
@@ -754,6 +754,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Serve { addr } => {
             let st = build_state(&cli.data)?;
             println!("🌐 Lore HTTP service: http://{addr}  (data: {}/)", cli.data);
+            println!("Dashboard: http://{addr}/ui");
             lore::server::serve(&addr, st).await?;
         }
         Cmd::NewAgent { name, role, traits } => {

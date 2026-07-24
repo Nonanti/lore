@@ -517,6 +517,48 @@ async fn observability_request_id_ready_and_histogram() {
 }
 
 #[tokio::test]
+async fn dashboard_shell_is_public_and_self_contained() {
+    // Even with an API key configured, the static shell serves without
+    // auth (spec U2) — it contains no secrets, and every data call it
+    // makes hits the protected routes with the user's Bearer key.
+    let st = state().with_api_key("secret");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(st);
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+
+    let res = client
+        .get(format!("http://{addr}/ui"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200, "shell must not require auth");
+    let ct = res
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(ct.starts_with("text/html"), "content-type: {ct}");
+    let body = res.text().await.unwrap();
+    assert!(body.contains("Lore Dashboard"), "shell marker present");
+    // Self-containment (spec U1): no external asset can creep in — the
+    // binary IS the dashboard. Any http(s):// reference is a regression.
+    assert!(
+        !body.contains("http://") && !body.contains("https://"),
+        "shell must reference no external URLs"
+    );
+    assert!(
+        !body.contains("secret"),
+        "shell must not embed server-side secrets"
+    );
+}
+
+#[tokio::test]
 async fn http_auth_and_rate_limit() {
     // Server with API key + low rate limit.
     let st = state().with_api_key("secret").with_rate_limit(2, 60);

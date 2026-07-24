@@ -299,6 +299,7 @@ lore task log <task-id> --tail 20
 | `GET  /health` | liveness (open) |
 | `GET  /ready` | readiness — verifies store is reachable (open) |
 | `GET  /openapi.json` | OpenAPI 3.1 spec (open) |
+| `GET  /ui` | embedded web dashboard — task board, approval inbox, agents + memory search (open shell; data calls use your API key) |
 | `GET  /metrics` | Prometheus-style metrics (**behind auth when `LORE_API_KEY` is set**) |
 | `POST /agents` | create an agent (`{name, role, traits}`) |
 | `GET  /agents` | list agents |

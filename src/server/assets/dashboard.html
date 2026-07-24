@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lore Dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1c2129; --border: #2d333b;
+    --fg: #e6edf3; --dim: #8b949e; --accent: #58a6ff; --ok: #3fb950;
+    --warn: #d29922; --err: #f85149; --run: #a371f7;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 16px; font-weight: 600; }
+  header h1 span { color: var(--accent); }
+  #conn { width: 9px; height: 9px; border-radius: 50%; background: var(--err); display: inline-block; }
+  #conn.ok { background: var(--ok); }
+  header input {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 10px; width: 230px; font-size: 13px;
+  }
+  nav { display: flex; gap: 4px; margin-left: auto; }
+  nav button {
+    background: none; border: 1px solid transparent; color: var(--dim);
+    padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+  }
+  nav button.active { background: var(--panel2); color: var(--fg); border-color: var(--border); }
+  nav button:hover { color: var(--fg); }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; margin-bottom: 14px; overflow: hidden;
+  }
+  .card .hd {
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    border-bottom: 1px solid var(--border); font-weight: 600; font-size: 13px;
+  }
+  .card .bd { padding: 12px 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--dim); font-weight: 500; padding: 6px 10px; }
+  td { padding: 7px 10px; border-top: 1px solid var(--border); vertical-align: top; }
+  tr.row:hover { background: var(--panel2); cursor: pointer; }
+  .badge {
+    display: inline-block; padding: 1px 9px; border-radius: 10px;
+    font-size: 11.5px; font-weight: 600; white-space: nowrap;
+  }
+  .b-Queued { background: #30363d; color: var(--fg); }
+  .b-Running { background: rgba(163,113,247,.15); color: var(--run); }
+  .b-WaitingApproval { background: rgba(210,153,34,.15); color: var(--warn); }
+  .b-WaitingSubtasks { background: rgba(210,153,34,.12); color: var(--warn); }
+  .b-Completed { background: rgba(63,185,80,.15); color: var(--ok); }
+  .b-Failed { background: rgba(248,81,73,.15); color: var(--err); }
+  .b-Pending { background: rgba(210,153,34,.15); color: var(--warn); }
+  button.act {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 12.5px;
+  }
+  button.act:hover { border-color: var(--accent); }
+  button.act.ok:hover { border-color: var(--ok); color: var(--ok); }
+  button.act.danger:hover { border-color: var(--err); color: var(--err); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  .dim { color: var(--dim); }
+  .small { font-size: 12px; }
+  pre {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px; overflow: auto; max-height: 340px; white-space: pre-wrap;
+    word-break: break-word; font-size: 12px;
+  }
+  .empty { color: var(--dim); padding: 18px; text-align: center; }
+  form.newtask { display: grid; grid-template-columns: 1fr 2fr 1fr 1fr auto; gap: 8px; }
+  form.newtask input {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font-size: 13px; width: 100%;
+  }
+  .agentgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+  .searchrow { display: flex; gap: 8px; margin-bottom: 8px; }
+  .searchrow input {
+    flex: 1; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 13px;
+  }
+  .mem { border-top: 1px solid var(--border); padding: 6px 2px; font-size: 12.5px; }
+  .mem .score { color: var(--accent); font-weight: 600; margin-right: 8px; }
+  #toast {
+    position: fixed; bottom: 18px; right: 18px; display: flex;
+    flex-direction: column; gap: 8px; z-index: 99;
+  }
+  #toast div {
+    background: var(--panel2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 6px; padding: 9px 14px; font-size: 13px; max-width: 380px;
+  }
+  #toast div.err { border-left-color: var(--err); }
+  .drawer td { background: var(--bg); }
+  label.chk { color: var(--dim); font-size: 12.5px; display: flex; align-items: center; gap: 5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Lore <span id="conn" title="connection"></span></h1>
+  <input id="key" type="password" placeholder="API key (Bearer) — empty if auth off" autocomplete="off">
+  <label class="chk"><input type="checkbox" id="autorefresh" checked> auto-refresh</label>
+  <nav>
+    <button data-tab="tasks" class="active">Tasks</button>
+    <button data-tab="inbox">Inbox <span id="inboxN" class="dim"></span></button>
+    <button data-tab="agents">Agents</button>
+  </nav>
+</header>
+<main>
+  <section id="tab-tasks">
+    <div class="card">
+      <div class="hd">New task</div>
+      <div class="bd">
+        <form class="newtask" id="taskForm">
+          <input id="tAgent" placeholder="agent" required>
+          <input id="tGoal" placeholder="goal" required>
+          <input id="tWs" placeholder="workspace (optional)">
+          <input id="tVerify" placeholder="verify cmd (optional)">
+          <button class="act" type="submit">Enqueue</button>
+        </form>
+      </div>
+    </div>
+    <div class="card">
+      <div class="hd">Tasks <span class="dim small" id="taskCount"></span></div>
+      <div class="bd" id="tasks"><div class="empty">loading…</div></div>
+    </div>
+  </section>
+
+  <section id="tab-inbox" hidden>
+    <div class="card">
+      <div class="hd">Pending approvals</div>
+      <div class="bd" id="inbox"><div class="empty">loading…</div></div>
+    </div>
+  </section>
+
+  <section id="tab-agents" hidden>
+    <div class="agentgrid" id="agents"><div class="empty">loading…</div></div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = (s, el) => (el || document).querySelector(s);
+const $$ = (s, el) => Array.from((el || document).querySelectorAll(s));
+const keyEl = $("#key");
+keyEl.value = localStorage.getItem("lore_key") || "";
+keyEl.addEventListener("change", () => { localStorage.setItem("lore_key", keyEl.value); refresh(); });
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+function toast(msg, isErr) {
+  const d = document.createElement("div");
+  if (isErr) d.className = "err";
+  d.textContent = msg;
+  $("#toast").appendChild(d);
+  setTimeout(() => d.remove(), 4200);
+}
+async function api(path, opts) {
+  const headers = Object.assign({ "Content-Type": "application/json" }, (opts && opts.headers) || {});
+  if (keyEl.value) headers["Authorization"] = "Bearer " + keyEl.value;
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
+  if (!res.ok) {
+    let msg = res.status + "";
+    try { msg += ": " + ((await res.json()).error || ""); } catch (_e) { /* body not json */ }
+    throw new Error(msg);
+  }
+  const ct = res.headers.get("content-type") || "";
+  return ct.includes("json") ? res.json() : res.text();
+}
+
+// ── tabs ────────────────────────────────────────────────────────────
+$$("nav button").forEach(b => b.addEventListener("click", () => {
+  $$("nav button").forEach(x => x.classList.toggle("active", x === b));
+  ["tasks", "inbox", "agents"].forEach(t => { $("#tab-" + t).hidden = t !== b.dataset.tab; });
+  refresh();
+}));
+const activeTab = () => $("nav button.active").dataset.tab;
+
+// ── connection probe ────────────────────────────────────────────────
+async function probe() {
+  try { await api("/health"); $("#conn").classList.add("ok"); }
+  catch (_e) { $("#conn").classList.remove("ok"); }
+}
+
+// ── tasks ───────────────────────────────────────────────────────────
+const openDetails = new Set();
+function fmtTime(t) { return new Date(t).toLocaleString(); }
+function shortId(id) { return id.length > 10 ? id.slice(0, 10) + "…" : id; }
+
+async function loadTasks() {
+  try {
+    const tasks = await api("/tasks");
+    $("#taskCount").textContent = tasks.length + " total";
+    if (!tasks.length) { $("#tasks").innerHTML = '<div class="empty">no tasks yet</div>'; return; }
+    const rows = tasks.map(t => `
+      <tr class="row" data-id="${esc(t.id)}">
+        <td class="mono" title="${esc(t.id)}">${esc(shortId(t.id))}</td>
+        <td>${esc(t.agent)}</td>
+        <td>${esc(t.goal)}</td>
+        <td><span class="badge b-${esc(String(t.status))}">${esc(String(t.status))}</span></td>
+        <td class="dim small">${esc(fmtTime(t.updated_at))}</td>
+      </tr>
+      <tr class="drawer" data-for="${esc(t.id)}" hidden><td colspan="5"><pre>loading…</pre></td></tr>`);
+    $("#tasks").innerHTML = `<table>
+      <thead><tr><th>id</th><th>agent</th><th>goal</th><th>status</th><th>updated</th></tr></thead>
+      <tbody>${rows.join("")}</tbody></table>`;
+    $$("#tasks tr.row").forEach(tr => tr.addEventListener("click", () => toggleTask(tr.dataset.id)));
+    for (const id of openDetails) fillDetail(id);
+  } catch (e) { $("#tasks").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+function toggleTask(id) {
+  const drawer = $(`tr.drawer[data-for="${CSS.escape(id)}"]`);
+  if (!drawer) return;
+  drawer.hidden = !drawer.hidden;
+  if (!drawer.hidden) { openDetails.add(id); fillDetail(id); } else { openDetails.delete(id); }
+}
+async function fillDetail(id) {
+  const drawer = $(`tr.drawer[data-for="${CSS.escape(id)}"]`);
+  if (!drawer || drawer.hidden) return;
+  try {
+    const [full, log] = await Promise.all([
+      api("/tasks/" + encodeURIComponent(id)),
+      api("/tasks/" + encodeURIComponent(id) + "/log").catch(() => "")
+    ]);
+    const t = full.task;
+    let report = "";
+    if (t.report) { try { report = JSON.stringify(JSON.parse(t.report), null, 2); } catch (_e) { report = t.report; } }
+    const kids = (full.children || []).map(c =>
+      `<div class="small">↳ <span class="mono">${esc(shortId(c.id))}</span> ${esc(c.agent)} — ` +
+      `<span class="badge b-${esc(String(c.status))}">${esc(String(c.status))}</span> ${esc(c.goal)}</div>`).join("");
+    drawer.firstElementChild.innerHTML =
+      `<div class="small dim">workspace: <span class="mono">${esc(t.workspace)}</span>` +
+      ` · verify: <span class="mono">${esc((t.verify || []).join(" && ") || "—")}</span></div>` +
+      (kids ? `<div style="margin:6px 0">${kids}</div>` : "") +
+      (report ? `<div class="small dim" style="margin-top:6px">report</div><pre>${esc(report)}</pre>` : "") +
+      (log ? `<div class="small dim" style="margin-top:6px">log</div><pre>${esc(log)}</pre>` : "");
+  } catch (e) {
+    drawer.firstElementChild.innerHTML = `<pre>${esc(e.message)}</pre>`;
+  }
+}
+$("#taskForm").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const verify = $("#tVerify").value.trim();
+  try {
+    const body = {
+      agent: $("#tAgent").value.trim(),
+      goal: $("#tGoal").value.trim(),
+      verify: verify ? [verify] : []
+    };
+    const ws = $("#tWs").value.trim();
+    if (ws) body.workspace = ws;
+    await api("/tasks", { method: "POST", body: JSON.stringify(body) });
+    toast("task enqueued");
+    $("#tGoal").value = "";
+    loadTasks();
+  } catch (e) { toast("enqueue failed — " + e.message, true); }
+});
+
+// ── inbox ───────────────────────────────────────────────────────────
+async function loadInbox() {
+  try {
+    const items = await api("/inbox");
+    $("#inboxN").textContent = items.length ? "(" + items.length + ")" : "";
+    if (!items.length) { $("#inbox").innerHTML = '<div class="empty">no pending approvals</div>'; return; }
+    $("#inbox").innerHTML = items.map(a => {
+      let action = a.action;
+      try { action = JSON.stringify(JSON.parse(a.action), null, 2); } catch (_e) { /* keep raw */ }
+      return `<div class="card" style="margin:0 0 10px">
+        <div class="hd"><span class="mono">${esc(shortId(a.id))}</span>
+          <span class="dim small">task ${esc(shortId(a.task_id))} · ${esc(fmtTime(a.created_at))}</span>
+          <span style="margin-left:auto"></span>
+          <button class="act ok" data-dec="approve" data-id="${esc(a.id)}">Approve</button>
+          <button class="act danger" data-dec="deny" data-id="${esc(a.id)}">Deny</button>
+        </div>
+        <div class="bd"><div class="small" style="margin-bottom:6px">${esc(a.reason)}</div>
+        <pre>${esc(action)}</pre></div></div>`;
+    }).join("");
+    $$("#inbox button.act").forEach(b => b.addEventListener("click", async () => {
+      try {
+        await api("/approvals/" + encodeURIComponent(b.dataset.id) + "/" + b.dataset.dec, { method: "POST" });
+        toast(b.dataset.dec + "d");
+        loadInbox(); loadTasks();
+      } catch (e) { toast(b.dataset.dec + " failed — " + e.message, true); }
+    }));
+  } catch (e) { $("#inbox").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+
+// ── agents ──────────────────────────────────────────────────────────
+async function loadAgents() {
+  try {
+    const agents = await api("/agents");
+    if (!agents.length) { $("#agents").innerHTML = '<div class="empty">no agents</div>'; return; }
+    $("#agents").innerHTML = agents.map(a => `
+      <div class="card" style="margin:0">
+        <div class="hd">${esc(a.name)} <span class="dim small">· ${esc(a.role)} · v${esc(String(a.version))}</span></div>
+        <div class="bd">
+          <div class="dim small" style="margin-bottom:8px">${esc((a.traits || []).join(" · ") || "no traits")}</div>
+          <div class="searchrow">
+            <input placeholder="search memory…" data-recall="${esc(a.id)}">
+            <button class="act" data-go="${esc(a.id)}">Recall</button>
+          </div>
+          <div data-mem="${esc(a.id)}"></div>
+        </div>
+      </div>`).join("");
+    $$("#agents [data-go]").forEach(b => b.addEventListener("click", () => recall(b.dataset.go)));
+    $$("#agents [data-recall]").forEach(inp => inp.addEventListener("keydown", ev => {
+      if (ev.key === "Enter") recall(inp.dataset.recall);
+    }));
+  } catch (e) { $("#agents").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+async function recall(id) {
+  const q = $(`[data-recall="${CSS.escape(id)}"]`).value.trim();
+  const out = $(`[data-mem="${CSS.escape(id)}"]`);
+  if (!q) { out.innerHTML = ""; return; }
+  out.innerHTML = '<div class="empty">searching…</div>';
+  try {
+    const mems = await api("/agents/" + encodeURIComponent(id) +
+      "/recall?semantic=true&limit=8&q=" + encodeURIComponent(q));
+    out.innerHTML = mems.length
+      ? mems.map(m => `<div class="mem"><span class="score">${Number(m.score).toFixed(2)}</span>${esc(m.summary)}</div>`).join("")
+      : '<div class="empty">no matches</div>';
+  } catch (e) { out.innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+}
+
+// ── refresh loop ────────────────────────────────────────────────────
+function refresh() {
+  probe();
+  const t = activeTab();
+  if (t === "tasks") { loadTasks(); loadInbox(); }
+  else if (t === "inbox") { loadInbox(); loadTasks(); }
+  else loadAgents();
+}
+setInterval(() => { if ($("#autorefresh").checked) refresh(); }, 4000);
+refresh();
+</script>
+</body>
+</html>

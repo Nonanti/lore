@@ -117,6 +117,20 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
   thread types, both providers, and all three modes; 1 new live-LLM
   ignored smoke test.
 
+### Added — web dashboard (spec: `2026-07-24-dashboard-design.md`)
+
+- **`GET /ui`** — a single self-contained embedded HTML dashboard (inline
+  CSS/JS, system fonts, zero CDN/npm/build step — the binary IS the UI):
+  task board with status badges + detail drawer (report, children, log)
+  + enqueue form; approval inbox with approve/deny; agents grid with
+  per-agent memory search (semantic recall) — team-memory records
+  included via World scope. API key entered in the UI (localStorage,
+  `Authorization: Bearer`); 4s polling, auto-refresh toggle. The shell
+  is static and secret-free, so it sits in the public route group like
+  `/health`; every data call goes through the existing auth wall. Tests
+  pin publicness, content-type, and self-containment (no external URLs
+  can creep into the shell).
+
 ### Added — team memory (spec: `2026-07-24-team-memory-design.md`)
 
 - **Agents learn together** — distilled **conventions and constraints**
