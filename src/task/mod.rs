@@ -1494,4 +1494,44 @@ mod tests {
         assert!(conn1.claim_next_queued().unwrap().is_none());
         assert!(conn2.claim_next_queued().unwrap().is_none());
     }
+
+    #[test]
+    fn claim_next_queued_skips_non_queued() {
+        // claim_next_queued only picks up Queued tasks; Running/Completed/Failed/
+        // WaitingApproval/WaitingSubtasks are all skipped.
+        let store = TaskStore::in_memory().unwrap();
+
+        let t1 = store.enqueue(new_task("a1", "running goal")).unwrap();
+        store.set_status(&t1.id, TaskStatus::Running).unwrap();
+
+        let t2 = store.enqueue(new_task("a2", "completed goal")).unwrap();
+        store.set_status(&t2.id, TaskStatus::Completed).unwrap();
+
+        let t3 = store.enqueue(new_task("a3", "failed goal")).unwrap();
+        store.set_status(&t3.id, TaskStatus::Failed).unwrap();
+
+        let t4 = store.enqueue(new_task("a4", "waiting goal")).unwrap();
+        store
+            .set_status(&t4.id, TaskStatus::WaitingApproval)
+            .unwrap();
+
+        let t5 = store.enqueue(new_task("a5", "subtasks goal")).unwrap();
+        store
+            .set_status(&t5.id, TaskStatus::WaitingSubtasks)
+            .unwrap();
+
+        // Enqueue one more that stays Queued.
+        let t_queued = store.enqueue(new_task("a6", "queued goal")).unwrap();
+
+        let claimed = store.claim_next_queued().unwrap().unwrap();
+        assert_eq!(claimed.id, t_queued.id, "only the Queued task is claimed");
+        assert_eq!(
+            claimed.status,
+            TaskStatus::Running,
+            "claimed task status set to Running"
+        );
+
+        // No more Queued tasks.
+        assert!(store.claim_next_queued().unwrap().is_none());
+    }
 }

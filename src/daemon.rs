@@ -2187,4 +2187,298 @@ mod tests {
 
         cleanup(&workspace);
     }
+
+    // ── InFlightRegistry: add / remove / peak / same-workspace ───────────
+
+    #[test]
+    fn in_flight_registry_add_remove_peak_same_workspace() {
+        let registry = InFlightRegistry::new();
+        let ws_a = PathBuf::from("/tmp/ws-a");
+        let ws_b = PathBuf::from("/tmp/ws-b");
+
+        // Add first task → no same-workspace warning.
+        let warning = registry.add("t1", ws_a.clone());
+        assert!(warning.is_none(), "no same-workspace for first task");
+        assert_eq!(registry.peak(), 1);
+
+        // Add second task with same workspace → warning fires.
+        let warning = registry.add("t2", ws_a.clone());
+        assert_eq!(
+            warning,
+            Some("t1".to_string()),
+            "same workspace warning returns first task id"
+        );
+        assert_eq!(registry.peak(), 2);
+
+        // Add third task with different workspace → no warning.
+        let warning = registry.add("t3", ws_b.clone());
+        assert!(warning.is_none(), "different workspace, no warning");
+        assert_eq!(registry.peak(), 3);
+
+        // Remove t2 → peak stays at 3 (peak never decreases).
+        registry.remove("t2");
+        assert_eq!(registry.peak(), 3, "peak stays at historical max");
+
+        // Add another task to ws_a → warning about t1 (t2 was removed).
+        let warning = registry.add("t4", ws_a.clone());
+        assert_eq!(
+            warning,
+            Some("t1".to_string()),
+            "warning still fires for remaining same-ws task"
+        );
+
+        // Remove all → peak unchanged.
+        registry.remove("t1");
+        registry.remove("t3");
+        registry.remove("t4");
+        assert_eq!(registry.peak(), 3, "peak unchanged after all removed");
+
+        // Re-add after empty → peak updates to 1.
+        // Actually peak=3 > 1, so peak stays at 3.
+        registry.add("t5", ws_b.clone());
+        assert_eq!(
+            registry.peak(),
+            3,
+            "peak stays at historical max even after re-add"
+        );
+    }
+
+    #[test]
+    fn in_flight_registry_remove_nonexistent_is_noop() {
+        let registry = InFlightRegistry::new();
+        registry.remove("nonexistent");
+        // No panic, no error.
+        assert_eq!(registry.peak(), 0);
+    }
+
+    // ── concurrency=1: sequential FIFO (same as old daemon loop) ────────
+
+    #[tokio::test]
+    async fn concurrency_1_processes_tasks_fifo_like_sequential_loop() {
+        let db = TmpDb::new("seq-1");
+        let workspace = make_temp_dir("seq-1-ws");
+
+        save_persona(db.data_dir(), "seqbot");
+        save_permissive_policy(db.data_dir());
+
+        let store = TaskStore::open(db.path()).unwrap();
+
+        // Enqueue 3 tasks.
+        let t1 = store
+            .enqueue(NewTask {
+                agent: "seqbot".to_string(),
+                goal: "first task".to_string(),
+                workspace: workspace.clone(),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+        let t2 = store
+            .enqueue(NewTask {
+                agent: "seqbot".to_string(),
+                goal: "second task".to_string(),
+                workspace: workspace.clone(),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+        let t3 = store
+            .enqueue(NewTask {
+                agent: "seqbot".to_string(),
+                goal: "third task".to_string(),
+                workspace: workspace.clone(),
+                verify: vec![],
+                parent_id: None,
+            })
+            .unwrap();
+
+        let model = std::sync::Arc::new(ScriptedModel::new(&[
+            "first done",
+            "second done",
+            "third done",
+        ]));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let in_flight = std::sync::Arc::new(InFlightRegistry::new());
+
+        // Single worker (concurrency=1).
+        let rx = shutdown_rx.clone();
+        let inf = in_flight.clone();
+        let m = model.clone();
+        let dd = db.data_dir().to_path_buf();
+        let dp = db.path().to_path_buf();
+        let worker_thread = std::thread::spawn(move || {
+            let worker_rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("worker runtime init");
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&worker_rt, worker_loop(0, dd, dp, m, rx, inf))
+        });
+
+        // Wait for all 3 tasks to complete.
+        let start = std::time::Instant::now();
+        loop {
+            let all = store.list(100).unwrap();
+            let all_done = all
+                .iter()
+                .all(|t| t.status == TaskStatus::Completed || t.status == TaskStatus::Failed);
+            if all_done {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(30) {
+                panic!("timeout waiting for sequential tasks");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // Verify FIFO order: t1 completed before t2 before t3.
+        // (Check via updated_at timestamps — t1's updated_at < t2's < t3's.)
+        let loaded1 = store.get(&t1.id).unwrap().unwrap();
+        let loaded2 = store.get(&t2.id).unwrap().unwrap();
+        let loaded3 = store.get(&t3.id).unwrap().unwrap();
+
+        assert_eq!(loaded1.status, TaskStatus::Completed);
+        assert_eq!(loaded2.status, TaskStatus::Completed);
+        assert_eq!(loaded3.status, TaskStatus::Completed);
+
+        // FIFO: t1 finished before t2 (updated_at monotonic).
+        assert!(
+            loaded1.updated_at <= loaded2.updated_at,
+            "t1 finished before t2 (FIFO)"
+        );
+        assert!(
+            loaded2.updated_at <= loaded3.updated_at,
+            "t2 finished before t3 (FIFO)"
+        );
+
+        // Peak should be 1 (single worker, never overlapping).
+        assert_eq!(in_flight.peak(), 1, "single worker peak is always 1");
+
+        shutdown_tx.send(true).unwrap();
+        worker_thread.join().unwrap().unwrap();
+
+        cleanup(&workspace);
+    }
+
+    // ── Stress: 20 tasks, concurrency 4 → all Completed exactly once ───────
+
+    #[tokio::test]
+    async fn stress_20_tasks_concurrency_4_all_completed_once() {
+        let db = TmpDb::new("stress-20");
+        let workspace = make_temp_dir("stress-20-ws");
+
+        save_persona(db.data_dir(), "stressbot");
+        save_permissive_policy(db.data_dir());
+
+        let store = TaskStore::open(db.path()).unwrap();
+
+        // Enqueue 20 tasks with explicit verify ("exit 0" always passes).
+        let task_ids: Vec<String> = (0..20)
+            .map(|i| {
+                store
+                    .enqueue(NewTask {
+                        agent: "stressbot".to_string(),
+                        goal: format!("stress task {i}"),
+                        workspace: workspace.clone(),
+                        verify: vec!["exit 0".to_string()],
+                        parent_id: None,
+                    })
+                    .unwrap()
+                    .id
+            })
+            .collect();
+
+        let concurrent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Short delay to force overlap but keep test fast.
+        let model = std::sync::Arc::new(CountingModel::new(
+            concurrent.clone(),
+            peak.clone(),
+            Duration::from_millis(100),
+        ));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let in_flight = std::sync::Arc::new(InFlightRegistry::new());
+
+        let mut worker_threads = Vec::new();
+        for i in 0..4 {
+            let rx = shutdown_rx.clone();
+            let inf = in_flight.clone();
+            let m = model.clone();
+            let dd = db.data_dir().to_path_buf();
+            let dp = db.path().to_path_buf();
+            worker_threads.push(std::thread::spawn(move || {
+                let worker_rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("worker runtime init");
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&worker_rt, worker_loop(i, dd, dp, m, rx, inf))
+            }));
+        }
+
+        // Wait for all 20 tasks to complete.
+        let start = std::time::Instant::now();
+        loop {
+            let all = store.list(100).unwrap();
+            let all_done = all
+                .iter()
+                .all(|t| t.status == TaskStatus::Completed || t.status == TaskStatus::Failed);
+            if all_done {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(60) {
+                let pending = all
+                    .iter()
+                    .filter(|t| t.status != TaskStatus::Completed && t.status != TaskStatus::Failed)
+                    .collect::<Vec<_>>();
+                panic!(
+                    "timeout — {}/20 done, pending: {:?}",
+                    all.iter()
+                        .filter(|t| t.status == TaskStatus::Completed)
+                        .count(),
+                    pending
+                        .iter()
+                        .map(|t| format!("{} ({})", t.id, t.status.as_str()))
+                        .collect::<Vec<_>>()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+
+        // Verify: all 20 Completed exactly once.
+        let all = store.list(100).unwrap();
+        assert_eq!(all.len(), 20, "exactly 20 tasks exist");
+        let completed = all
+            .iter()
+            .filter(|t| t.status == TaskStatus::Completed)
+            .count();
+        assert_eq!(completed, 20, "all 20 tasks Completed");
+
+        // Verify each original task_id is present.
+        for id in &task_ids {
+            let t = store.get(id).unwrap().unwrap();
+            assert_eq!(
+                t.status,
+                TaskStatus::Completed,
+                "task {} should be Completed",
+                id
+            );
+        }
+
+        // Verify overlap: peak >= 2 with 4 workers and 50ms delay.
+        let peak_val = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak_val >= 2,
+            "at least 2 tasks overlapped (peak={peak_val})"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        for t in worker_threads {
+            t.join().unwrap().unwrap();
+        }
+
+        cleanup(&workspace);
+    }
 }
