@@ -1496,4 +1496,47 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         writer.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn load_by_ids_chunking_with_over_500_ids() {
+        // Edge test: >500 ids triggers chunking — all results returned in
+        // input order, missing ids silently skipped.
+        let store = SqliteStore::in_memory().unwrap();
+        let s = scope();
+        // Insert 503 records.
+        let mut ids: Vec<String> = Vec::with_capacity(503);
+        for i in 0..503 {
+            let id = store
+                .remember(Memory::semantic(
+                    s.clone(),
+                    format!("item {i}"),
+                    SemanticCat::Fact,
+                ))
+                .await
+                .unwrap();
+            ids.push(id.to_string());
+        }
+        // Shuffle: put a missing id at position 0, reverse the rest.
+        let mut request_ids: Vec<String> = vec![MemoryId::new().to_string()];
+        request_ids.extend(ids.iter().rev().cloned());
+
+        let conn = store.conn.lock().unwrap();
+        let loaded = SqliteStore::load_by_ids(&conn, &request_ids).unwrap();
+        assert_eq!(
+            loaded.len(),
+            503,
+            "all 503 live records returned, missing skipped"
+        );
+        // Verify ordering: should follow request_ids, skipping the missing one.
+        assert_eq!(
+            loaded[0].id.to_string(),
+            ids[502],
+            "first = last inserted (reversed)"
+        );
+        assert_eq!(
+            loaded[502].id.to_string(),
+            ids[0],
+            "last = first inserted (reversed)"
+        );
+    }
 }

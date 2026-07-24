@@ -700,6 +700,7 @@ mod score_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::types::{Scope, SemanticCat};
 
     #[test]
     fn tokenize_lowercases_splits_and_filters_short() {
@@ -755,5 +756,25 @@ mod tests {
         assert!(partial > none);
         assert_eq!(none, 0.0);
         assert!(full <= 1.0);
+    }
+
+    #[test]
+    fn recency_clamps_future_last_access_to_zero_age() {
+        // Edge test: if last_access is in the future (clock skew),
+        // (now - last_access) would be negative. The .max(0) clamp must
+        // produce age=0 → recency_score(0) ≈ 1.0 (freshest possible).
+        let now = Utc::now();
+        let mut future_mem = Memory::semantic(Scope::World, "clock-skewed", SemanticCat::Fact);
+        future_mem.last_access = now + chrono::Duration::seconds(300); // 5 min in future
+
+        let q = Query::new("").limit(10); // browse mode
+        let (s_future, _) = score(&future_mem, &q, None, now);
+        let (s_now, _) = {
+            let mut fresh = Memory::semantic(Scope::World, "fresh now", SemanticCat::Fact);
+            fresh.last_access = now;
+            score(&fresh, &q, None, now)
+        }; // age=0
+        assert!((s_future - s_now).abs() < 1e-6,
+            "future last_access should be clamped to age=0, same score as now: {s_future} vs {s_now}");
     }
 }

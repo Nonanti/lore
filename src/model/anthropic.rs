@@ -490,4 +490,36 @@ mod tests {
             errs[0]
         );
     }
+
+    #[tokio::test]
+    async fn stream_premature_close_before_any_token() {
+        // Edge test: server sends zero deltas then closes — error, no tokens.
+        use axum::{routing::post, Router};
+
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|| async { ([("content-type", "text/event-stream")], "") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let m = AnthropicModel::new("test", AnthropicAuth::ApiKey("k".into()))
+            .with_base_url(format!("http://{addr}"));
+        let p = prompt();
+        let mut s = m.complete_stream(&p).await.unwrap();
+        let mut toks = Vec::new();
+        let mut errs = Vec::new();
+        while let Some(r) = s.next().await {
+            match r {
+                Ok(t) => toks.push(t),
+                Err(e) => errs.push(e.to_string()),
+            }
+        }
+        assert!(toks.is_empty(), "no tokens from empty body: {toks:?}");
+        assert_eq!(errs.len(), 1, "empty body produces an error");
+        assert!(errs[0].contains("terminal event"), "error: {}", errs[0]);
+    }
 }
