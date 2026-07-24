@@ -98,7 +98,14 @@ impl SqliteStore {
             return Ok(());
         }
 
-        let tx = conn.transaction().map_err(sqlite_err)?;
+        // BEGIN IMMEDIATE: two tasks on the same agent can open the store
+        // concurrently (parallel daemon workers); a deferred transaction
+        // would fail outright with SQLITE_BUSY_SNAPSHOT on the read→write
+        // upgrade (busy_timeout cannot help). IMMEDIATE acquires the write
+        // lock upfront and waits via busy_timeout instead.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlite_err)?;
         if !has_col(&tx, "search_text")? {
             tx.execute_batch(
                 "ALTER TABLE memories ADD COLUMN search_text TEXT NOT NULL DEFAULT ''",

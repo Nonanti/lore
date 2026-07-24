@@ -2090,9 +2090,19 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
 
-        // Verify all completed.
+        // Verify all completed (include the failure report on mismatch —
+        // a Failed task here means an execution error, not a test bug).
         let tasks = store.list(100).unwrap();
         assert_eq!(tasks.len(), 3);
+        for t in &tasks {
+            assert_eq!(
+                t.status,
+                TaskStatus::Completed,
+                "task {} should be Completed — report: {:?}",
+                t.id,
+                t.report
+            );
+        }
         for t in &tasks {
             assert_eq!(
                 t.status,

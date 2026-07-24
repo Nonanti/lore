@@ -41,11 +41,29 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
   automatically. Failed tasks skip semantic distillation (no wrong
   conventions learned); the daemon consolidates memory after each task;
   `--no-distill` opts out per agent.
+- **OS sandbox for shell exec (opt-in)** — `Policy.sandbox_exec`
+  (`Off`/`IfAvailable`/`Required`): commands run under bubblewrap
+  (`--ro-bind / /`, fresh `/dev`+`/proc`, tmpfs `/tmp`, workspace the only
+  rw mount, `--die-with-parent`). `Required` without bwrap fails closed;
+  `IfAvailable` warns and runs plain. argv-built, never string-joined.
+- **Parallel daemon** — `lore daemon --concurrency N` (1–8, default 1).
+  Atomic `claim_next_queued` (single `UPDATE…RETURNING`; two workers can
+  never take the same task), worker threads with per-worker connections,
+  watch-channel graceful shutdown with in-flight re-queue, same-workspace
+  overlap warning. Team finalization is compare-and-swap
+  (`complete_if_status`/`fail_if_status`) and the reviewer child enqueues
+  via atomic `INSERT…WHERE NOT EXISTS` — no double synthesis, no
+  duplicate reviewers under parallel children.
 - `examples/hands_demo.rs` — end-to-end demo: gate prompts, deny-list
   refusal, sandbox escape rejection, and a live agent (any
   OpenAI-compatible endpoint) writing + verifying files through the tools.
 
 ### Fixed
+- **Concurrent store opens no longer fail with SQLITE_BUSY_SNAPSHOT**:
+  memory-store migrations now use BEGIN IMMEDIATE (write lock upfront,
+  waits via busy_timeout) — two parallel daemon workers opening the same
+  agent's store used to race the deferred migration transaction and fail
+  the whole task with "database is locked".
 - **Failed tasks now teach negative lessons instead of nothing**:
   `distill_work` runs for failed tasks too, but the prompt asks ONLY for
   avoid-X lessons and every item is forced to `SemanticCat::Constraint`
