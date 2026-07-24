@@ -45,7 +45,11 @@ pub(crate) fn extract_entities(mem: &Memory) -> HashSet<String> {
     // Short ALL-CAPS acronyms (NAS, TLS, GPU, 8TB…) are high-value entities
     // the ≥4-char floor would drop — they are exactly the tokens that bridge
     // technical records. Detected on the RAW text (case carries the signal),
-    // stored lowercased like every other entity.
+    // stored lowercased like every other entity. Tradeoff: the 2-char floor
+    // also admits high-collision acronyms (US, AI, DB); the damped graph
+    // score (0.5×) and the neighbor cap bound the blast radius, and the
+    // golden set shows no distractor regression — revisit only with eval
+    // evidence.
     for raw in text.split(|c: char| !c.is_alphanumeric()) {
         let n = raw.chars().count();
         if (2..=4).contains(&n)

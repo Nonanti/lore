@@ -700,21 +700,32 @@ impl MemoryStore for SqliteStore {
                 }
             }
             let id = mem.id.clone();
-            Self::upsert(conn, &mem)?;
+            // One transaction for row + entity refresh: a crash between the
+            // DELETE and the INSERTs would otherwise sever this record's
+            // entity links PERMANENTLY (schema is already v3, so the
+            // backfill never re-runs). Review finding #1.
+            // IMMEDIATE: parallel daemon workers write to the same agent DB;
+            // a deferred read→write upgrade fails with SQLITE_BUSY(_SNAPSHOT)
+            // instead of waiting on busy_timeout — same lesson as `migrate`.
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sqlite_err)?;
+            Self::upsert(&tx, &mem)?;
             // Refresh the entity index for this record (remember may overwrite
             // an existing id). Reinforce paths skip this — text never changes.
-            conn.execute(
+            tx.execute(
                 "DELETE FROM entities WHERE memory_id = ?1",
                 params![id.to_string()],
             )
             .map_err(sqlite_err)?;
             for ent in super::graph::extract_entities(&mem) {
-                conn.execute(
+                tx.execute(
                     "INSERT OR IGNORE INTO entities (memory_id, entity) VALUES (?1, ?2)",
                     params![id.to_string(), ent],
                 )
                 .map_err(sqlite_err)?;
             }
+            tx.commit().map_err(sqlite_err)?;
             Ok(id)
         })
         .await
@@ -804,8 +815,12 @@ impl MemoryStore for SqliteStore {
                     seed_entities.extend(super::graph::extract_entities(&s.item));
                 }
                 if !seed_entities.is_empty() {
-                    // Entities of ≤3 records stay far below the 500-param
-                    // SQLite ceiling; truncate defensively regardless.
+                    // Entities of ≤3 records (~30–60 terms) stay far below
+                    // SQLITE_MAX_VARIABLE_NUMBER (999 default; 32766 on
+                    // ≥3.32); truncate defensively regardless. Per-recall
+                    // statement compilation is an accepted tradeoff at this
+                    // size — revisit with a temp-table join if graph recall
+                    // ever shows up in profiles.
                     let mut ents: Vec<String> = seed_entities.into_iter().collect();
                     ents.sort();
                     ents.truncate(400);

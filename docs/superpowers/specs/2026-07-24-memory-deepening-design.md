@@ -126,8 +126,8 @@ Golden set: 56 records / 32 categorized queries (`tests/eval.rs`).
 |-------|-------|-------|-------|-------|------------|----------|------------|
 | Hashing baseline (pre-graph) | 72% | .682 | 7/7 | 8/8 | 0/7 | 2/4 | 6/6 |
 | + graph leg (Phase 2) | **78%** | .701 | 7/7 | 8/8 | 0/7 | **4/4** | 6/6 |
-| e5 embedder + graph (opt-in) | **91%** | — | ✓ | ✓ | **6/7** | 2/4¹ | ✓ |
-| + cross-encoder rerank (Phase 4) | **100%** | — | 7/7 | 8/8 | **7/7** | **4/4** | 6/6 |
+| e5 embedder + graph (opt-in) | **91%** | .854 | ✓ | ✓ | **6/7** | 2/4¹ | ✓ |
+| + cross-encoder rerank (Phase 4) | **100%** | .899 | 7/7 | 8/8 | **7/7** | **4/4** | 6/6 |
 
 ¹ e5's wider candidate pool reshuffles graph seeds — exactly the precision
 gap the cross-encoder closes.

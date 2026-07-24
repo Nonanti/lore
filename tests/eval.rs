@@ -398,7 +398,9 @@ async fn retrieval_golden_set_neural_embedder() {
             .unwrap();
     }
 
+    let mut hits1 = 0usize;
     let mut hits5 = 0usize;
+    let mut mrr = 0.0f64;
     let mut para_hits = 0usize;
     let mut para_total = 0usize;
     let mut misses: Vec<String> = Vec::new();
@@ -408,25 +410,33 @@ async fn retrieval_golden_set_neural_embedder() {
             query = query.rerank();
         }
         let res = store.recall(&Scope::World, &query).await.unwrap();
-        let found = res
+        let rank = res
             .iter()
-            .any(|s| s.item.searchable_text().contains(CORPUS[*want]));
+            .position(|s| s.item.searchable_text().contains(CORPUS[*want]));
+        let found = rank.is_some();
+        if let Some(r) = rank {
+            hits5 += 1;
+            mrr += 1.0 / (r as f64 + 1.0);
+            if r == 0 {
+                hits1 += 1;
+            }
+        }
         if *cat == Cat::Paraphrase {
             para_total += 1;
             if found {
                 para_hits += 1;
             }
         }
-        if found {
-            hits5 += 1;
-        } else {
+        if !found {
             misses.push(format!("'{q}' [{cat:?}] ({note})"));
         }
     }
     let total = QUERIES.len();
     eprintln!(
-        "[eval-neural] hit@5 = {hits5}/{total} ({:.0}%)  paraphrase = {para_hits}/{para_total}",
-        hits5 as f64 / total as f64 * 100.0
+        "[eval-neural] hit@1 = {hits1}/{total} ({:.0}%)  hit@5 = {hits5}/{total} ({:.0}%)  MRR@5 = {:.3}  paraphrase = {para_hits}/{para_total}",
+        hits1 as f64 / total as f64 * 100.0,
+        hits5 as f64 / total as f64 * 100.0,
+        mrr / total as f64
     );
     if !misses.is_empty() {
         eprintln!("[eval-neural] missed:\n{}", misses.join("\n"));

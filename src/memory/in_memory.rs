@@ -42,6 +42,11 @@ impl InMemoryStore {
 
     /// Attaches a reranker (builder): used when `Query.rerank` is set
     /// (default: the native lexical reranker).
+    ///
+    /// NOTE: `InMemoryStore::recall` runs on the calling async thread — a
+    /// CPU-heavy reranker (e.g. `NeuralReranker`) will block it. For
+    /// cross-encoder workloads prefer `SqliteStore`, whose recall runs in
+    /// the blocking pool.
     pub fn with_reranker(mut self, reranker: Arc<dyn super::rerank::Reranker>) -> Self {
         self.reranker = Some(reranker);
         self
@@ -149,6 +154,9 @@ impl MemoryStore for InMemoryStore {
         // Lock discipline: recall nests inner.read → entity.read, so remember
         // must NEVER hold both locks at once (inverse nesting would deadlock).
         // Entities are extracted first; the two writes are sequential.
+        // Accepted window: a recall between the two writes finds the record
+        // by first-pass scan but cannot yet use it as a graph seed source —
+        // resolved by the very next entity_idx write.
         let ents = super::graph::extract_entities(&mem);
         self.inner.write().await.insert(id.to_string(), mem);
         {
@@ -470,6 +478,70 @@ mod tests {
         assert!(!with_graph
             .iter()
             .any(|s| s.item.searchable_text().contains("fence")));
+    }
+
+    #[tokio::test]
+    async fn graph_leg_respects_agent_scope_isolation() {
+        // Agent A's query must not pull Agent B's records through a shared
+        // entity bridge — scope isolation survives the graph leg.
+        let store = InMemoryStore::new();
+        let (_a, scope_a) = agent_scope();
+        let (_b, scope_b) = agent_scope();
+        store
+            .remember(Memory::semantic(
+                scope_a.clone(),
+                "Aylin adopted a tabby cat and named it Paspas",
+                SemanticCat::Fact,
+            ))
+            .await
+            .unwrap();
+        store
+            .remember(Memory::semantic(
+                scope_b.clone(),
+                "Paspas was vaccinated at the veterinary clinic",
+                SemanticCat::Fact,
+            ))
+            .await
+            .unwrap();
+
+        let res = store
+            .recall(&scope_a, &Query::new("aylin cat").graph().limit(5))
+            .await
+            .unwrap();
+        assert!(
+            !res.iter()
+                .any(|s| s.item.searchable_text().contains("vaccinated")),
+            "another agent's record must never arrive through the graph leg"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_leg_survives_snapshot_round_trip() {
+        // from_memories must rebuild the entity index — restored stores keep
+        // multi-hop recall.
+        let (_a, scope) = agent_scope();
+        let mems = vec![
+            Memory::semantic(
+                scope.clone(),
+                "Aylin adopted a tabby cat and named it Paspas",
+                SemanticCat::Fact,
+            ),
+            Memory::semantic(
+                scope.clone(),
+                "Paspas was vaccinated at the veterinary clinic",
+                SemanticCat::Fact,
+            ),
+        ];
+        let store = InMemoryStore::from_memories(mems);
+        let res = store
+            .recall(&scope, &Query::new("aylin cat").graph().limit(5))
+            .await
+            .unwrap();
+        assert!(
+            res.iter()
+                .any(|s| s.item.searchable_text().contains("vaccinated")),
+            "restored store must still bridge via entities"
+        );
     }
 
     #[tokio::test]
