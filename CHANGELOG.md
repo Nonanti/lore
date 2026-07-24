@@ -117,6 +117,25 @@ During the 0.x series, minor bumps may contain breaking changes; all are marked 
   thread types, both providers, and all three modes; 1 new live-LLM
   ignored smoke test.
 
+### Added — team memory (spec: `2026-07-24-team-memory-design.md`)
+
+- **Agents learn together** — distilled **conventions and constraints**
+  now land in `Scope::World` (team scope; no new enum variant, no
+  migration) and reach every teammate's next task. Facts and procedures
+  stay personal (per-agent Wilson stats must not mix). Failed-task
+  constraint lessons DO share — "don't do X" is exactly what a teammate
+  needs. Opt-out: `lore agent create --no-share` / `with_share(false)`;
+  old agent records load unchanged (absent = sharing on).
+- **`CompositeStore`** — personal + shared stores behind one
+  `MemoryStore`: writes route by scope, recalls merge (score-sorted,
+  limit honored), get/reinforce/forget resolve the owning store,
+  count/export/consolidate aggregate. The daemon composes every agent's
+  personal `<agent>.db` with the shared `memory/team.db` (same WAL +
+  IMMEDIATE posture as `tasks.db`); single-store setups degrade
+  gracefully (World records stay visible to their writer).
+- `Agent::remember`'s own-scope stamping guard is preserved — the
+  distill write is the one reviewed direct-store exception.
+
 ### Added — memory engine deepening (spec: `2026-07-24-memory-deepening-design.md`)
 
 - **Hardened retrieval eval** — the old 15-record golden set was saturated

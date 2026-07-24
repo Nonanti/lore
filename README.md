@@ -198,6 +198,11 @@ to Lore — still no external service.
   protocol — nothing breaks, it just downgrades once and remembers.
 - **Agent cap:** `LORE_MAX_AGENTS` (default 1024) — a fan-out DoS brake.
 
+- **Team memory:** distilled conventions/constraints go to the shared `World` scope
+  and reach every teammate's next task automatically — in the daemon, agents' private
+  DBs are composed with a shared `memory/team.db` (`CompositeStore`), so the backend
+  agent's "tests run with cargo nextest" lesson is already known to the frontend agent.
+  Facts and procedures stay personal; opt out per agent with `--no-share`.
 - **Graph recall (multi-hop):** an incremental entity index links records sharing
   entities (incl. short acronyms like NAS/TLS); recall's graph leg pulls 1-hop
   neighbors of the top matches at a damped score — questions no single record
