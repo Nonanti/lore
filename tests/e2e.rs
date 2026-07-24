@@ -174,6 +174,11 @@ async fn serve_e2e_auth_persistence_and_kill_restart() {
                 .env("LORE_DATA", data)
                 .env("LORE_API_KEY", "secret-key")
                 .env("LORE_LOG", "error")
+                .env("LORE_PROVIDER", "mock") // force MockModel — hermetic, no real LLM
+                .env_remove("LORE_LLM_BASE") // remove OpenAiCompat fallback
+                .env_remove("LORE_LLM_KEY")
+                .env_remove("ANTHROPIC_API_KEY")
+                .env_remove("OPENAI_API_KEY")
                 .process_group(0)
                 .args(["serve", "--addr", &format!("127.0.0.1:{port}")])
                 .stdout(Stdio::null())
@@ -358,10 +363,12 @@ fn wait_daemon_ready(data: &str, daemon: &mut KillOnDrop, timeout: Duration) {
     panic!("daemon not ready within {timeout:?}");
 }
 
-/// Spawn the daemon as a background process (MockModel — no LORE_PROVIDER or
-/// LORE_LLM_BASE env vars). Uses `process_group(0)` so the daemon and all
-/// its subprocesses share a single pgid — KillOnDrop can `kill(-pgid, SIGKILL)`
-/// to clean up the whole tree, preventing zombie shell processes.
+/// Spawn the daemon as a background process. Forces `LORE_PROVIDER=mock` and
+/// removes all LLM env vars to ensure hermetic MockModel usage — no real LLM
+/// calls, no network, no billing charges, regardless of host environment.
+/// Uses `process_group(0)` so the daemon and all its subprocesses share a
+/// single pgid — KillOnDrop can `kill(-pgid, SIGKILL)` to clean up the whole
+/// tree, preventing zombie shell processes.
 /// Daemon stderr is redirected to `{data}/daemon.log` for debugging.
 fn spawn_daemon(data: &str) -> KillOnDrop {
     let log_path = std::path::Path::new(data).join("daemon.log");
@@ -370,7 +377,11 @@ fn spawn_daemon(data: &str) -> KillOnDrop {
         Command::new(BIN)
             .env("LORE_DATA", data)
             .env("LORE_LOG", "info") // debug logging for flake diagnosis
-            // No LORE_PROVIDER / LORE_LLM_BASE → MockModel (no network, deterministic).
+            .env("LORE_PROVIDER", "mock") // force MockModel — hermetic, no real LLM
+            .env_remove("LORE_LLM_BASE") // remove OpenAiCompat fallback
+            .env_remove("LORE_LLM_KEY") // remove API keys
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("OPENAI_API_KEY")
             .process_group(0) // New process group — pgid == child PID.
             .args(["daemon"])
             .stdout(Stdio::null())
@@ -492,20 +503,38 @@ fn daemon_e2e_sigkill_restart_recovery() {
     );
     let task_id = extract_task_id(&output);
 
-    // Wait briefly so the daemon can claim the task (set status = Running).
-    // Use polling: check task status until it's no longer Queued.
+    // Poll until task reaches Running — confirming the daemon claimed it.
+    // This ensures the SIGKILL hits while the task is actively being worked,
+    // so the recovery sweep has an orphaned Running task to re-queue.
+    // If Running is never observed, the recovery code path is never exercised,
+    // so we fail the test rather than silently degrading to a non-recovery scenario.
     let claim_timeout = Duration::from_secs(5);
     let start = std::time::Instant::now();
+    let mut saw_running = false;
     while start.elapsed() < claim_timeout {
         let (ok, stdout, _) = cli_allow_fail(d, &["task", "status", &task_id]);
         if ok {
             let status = extract_task_status(&stdout);
-            if status != "Queued" {
-                break; // Task claimed (Running/Completed/etc).
+            match status.as_str() {
+                "Running" => {
+                    saw_running = true;
+                    break;
+                }
+                "Completed" => {
+                    // Task finished before our SIGKILL — valid, test passes
+                    // without exercising recovery (task completed normally).
+                    return;
+                }
+                "Queued" => continue,
+                _ => break, // unexpected state — proceed to kill anyway
             }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    assert!(
+        saw_running,
+        "task must reach Running before SIGKILL — recovery code path not exercised if task was still Queued"
+    );
 
     // SIGKILL the daemon's process group (kills daemon + any shell subprocesses).
     let pgid = daemon1.0.id() as i32;
@@ -604,8 +633,8 @@ fn team_e2e_decomposition_failure_with_mock_model() {
     // Verify the failure message is clear about decomposition.
     let full = cli(d, &["task", "status", &task_id]);
     assert!(
-        full.contains("PM decomposition failed") || full.contains("decomposition"),
-        "failure message should mention decomposition: {full}"
+        full.contains("PM decomposition failed"),
+        "failure message should mention 'PM decomposition failed': {full}"
     );
 }
 
